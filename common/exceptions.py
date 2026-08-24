@@ -1,0 +1,129 @@
+"""Uniform error envelope.
+
+Every failure - validation, auth, domain rule, or crash - comes back as:
+
+    {"error": {"code": "...", "message": "...", "details": {...},
+               "requestId": "..."}}
+
+so the client has one shape to branch on. Onboarding never dead-ends the user
+(PRD §9), so the client can always retry on anything 5xx.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, Optional
+
+from rest_framework import status
+from rest_framework.response import Response
+
+logger = logging.getLogger(__name__)
+
+
+class DomainError(Exception):
+    """A rule this service enforces, as opposed to a transport or input error."""
+
+    code = "domain_error"
+    status_code = status.HTTP_400_BAD_REQUEST
+    message = "Request could not be completed."
+
+    def __init__(
+        self,
+        message: Optional[str] = None,
+        *,
+        code: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        status_code: Optional[int] = None,
+    ) -> None:
+        self.message = message or self.message
+        self.code = code or self.code
+        self.details = details or {}
+        self.status_code = status_code or self.status_code
+        super().__init__(self.message)
+
+
+class NotFoundError(DomainError):
+    code = "not_found"
+    status_code = status.HTTP_404_NOT_FOUND
+    message = "Resource not found."
+
+
+class ProfileRequiredError(DomainError):
+    code = "profile_required"
+    status_code = status.HTTP_409_CONFLICT
+    message = "Complete the profile step before generating a plan."
+
+
+class AgeBelowMinimumError(DomainError):
+    """PRD §9 - account creation is blocked below the minimum age."""
+
+    code = "age_below_minimum"
+    status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+    message = "You must meet the minimum age to use CaloryX."
+
+
+class ConflictError(DomainError):
+    code = "conflict"
+    status_code = status.HTTP_409_CONFLICT
+    message = "Conflicting state."
+
+
+class UpstreamUnavailableError(DomainError):
+    code = "upstream_unavailable"
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    message = "A dependency is unavailable. Please retry."
+
+
+def error_body(
+    code: str,
+    message: str,
+    details: Optional[Dict[str, Any]] = None,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {"error": {"code": code, "message": message}}
+    if details:
+        body["error"]["details"] = details
+    if request_id:
+        body["error"]["requestId"] = request_id
+    return body
+
+
+def api_exception_handler(exc, context):
+    # Imported here, not at module scope: `rest_framework.views` resolves
+    # DEFAULT_AUTHENTICATION_CLASSES on import, which imports authx, which
+    # imports this module.
+    from rest_framework.views import exception_handler as drf_exception_handler
+
+    request = context.get("request")
+    request_id = getattr(request, "request_id", None)
+
+    if isinstance(exc, DomainError):
+        return Response(
+            error_body(exc.code, exc.message, exc.details, request_id),
+            status=exc.status_code,
+        )
+
+    response = drf_exception_handler(exc, context)
+    if response is None:
+        logger.exception("unhandled error in %s", context.get("view"))
+        return Response(
+            error_body(
+                "internal_error",
+                "Something went wrong on our end. Please retry.",
+                request_id=request_id,
+            ),
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    detail = response.data
+    if isinstance(detail, dict) and "detail" in detail and len(detail) == 1:
+        code = getattr(detail["detail"], "code", None) or "error"
+        response.data = error_body(code, str(detail["detail"]), request_id=request_id)
+    else:
+        # Field-level validation errors keep their per-field shape under `details`.
+        response.data = error_body(
+            "validation_error",
+            "Some fields need attention.",
+            details=detail if isinstance(detail, dict) else {"errors": detail},
+            request_id=request_id,
+        )
+    return response

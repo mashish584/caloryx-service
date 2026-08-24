@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: caloryx
+      POSTGRES_PASSWORD: caloryx
+      POSTGRES_DB: caloryx
+    ports:
+      - "5432:5432"
+    volumes:
+      - caloryx-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U caloryx"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  caloryx-pgdata:

@@ -1,0 +1,9 @@
+# Ranges rather than exact pins; generate a lockfile (pip-compile / uv lock)
+# before deploying so builds are reproducible.
+Django>=5.2,<5.3           # 5.2 is the current LTS
+djangorestframework>=3.15,<4.0
+django-cors-headers>=4.7,<5.0
+prisma>=0.15,<0.16         # prisma-client-py
+PyJWT[crypto]>=2.10,<3.0
+python-dotenv>=1.0,<2.0
+gunicorn>=23.0,<24.0

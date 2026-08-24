@@ -1,0 +1,145 @@
+// CaloryX — onboarding data model.
+// PRD §7. Extended with Clerk identity, guest claiming, and server-side engine config (§10).
+
+generator client {
+  provider             = "prisma-client-py"
+  interface            = "sync"
+  recursive_type_depth = 5
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum SexAtBirth {
+  MALE
+  FEMALE
+  UNSPECIFIED // defensive-only value (§6.4); onboarding v7 never writes it
+}
+
+enum Goal {
+  LOSE
+  MAINTAIN
+  GAIN
+}
+
+enum ActivityLevel {
+  SEDENTARY
+  LIGHT
+  MODERATE
+  VERY
+  EXTREME
+}
+
+enum UnitSystem {
+  METRIC
+  IMPERIAL
+}
+
+enum AuthProvider {
+  GUEST
+  CLERK
+}
+
+model User {
+  id           String       @id @default(cuid())
+  // Clerk owns Google / Apple / any future provider on the client. We store the
+  // stable Clerk user id; the underlying provider is recorded for analytics only.
+  clerkUserId  String?      @unique
+  authProvider AuthProvider @default(GUEST)
+  // Which social provider Clerk used ("oauth_google", "oauth_apple", ...). Nullable
+  // for guests. Apple private-relay addresses land in `email` unchanged.
+  externalProvider String?
+  email        String?
+  isGuest      Boolean      @default(true)
+  // Set when a guest record is merged into a Clerk identity (§5.1 claiming).
+  claimedAt    DateTime?
+  claimedFrom  String?      @unique
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  lastSeenAt   DateTime     @default(now())
+  profile      Profile?
+
+  @@index([isGuest, createdAt])
+}
+
+model Profile {
+  id             String        @id @default(cuid())
+  userId         String        @unique
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sexAtBirth     SexAtBirth // onboarding v7 writes MALE or FEMALE
+  age            Int
+  weightKg       Float // stored metric; imperial is a display concern (§5.2)
+  heightCm       Float
+  targetWeightKg Float?
+  goal           Goal
+  activityLevel  ActivityLevel
+  preferredUnits UnitSystem    @default(METRIC)
+  onboardedAt    DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  plan           Plan?
+}
+
+model Plan {
+  id           String   @id @default(cuid())
+  profileId    String   @unique
+  profile      Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  caloriesKcal Int
+  proteinG     Int
+  carbsG       Int
+  fatG         Int
+  fiberG       Int // informational; never part of the energy total (§5.5)
+  bmr          Float
+  tdee         Float
+  clamped      Boolean  @default(false)
+  isEstimate   Boolean  @default(false) // true only via the §6.4 defensive fallback
+  // Rationale derives from the *effective* adjustment, which differs from the
+  // configured one whenever the safety floor clamps the target (§6.2).
+  adjustmentKcal Int
+  weeklyChangeKg Float
+  // Which config produced these numbers, so a plan stays explainable after a retune.
+  engineConfigId String?
+  engineConfig   EngineConfig? @relation(fields: [engineConfigId], references: [id])
+  computedAt     DateTime      @default(now())
+}
+
+/// Server-configurable engine constants (§5.3, §5.4, §6.3, §10). Exactly one row
+/// should have isActive = true; code falls back to compiled defaults if none does.
+model EngineConfig {
+  id       String  @id @default(cuid())
+  name     String  @unique
+  isActive Boolean @default(false)
+
+  // Goal adjustments (kcal)
+  loseAdjustmentKcal Int @default(-400)
+  gainAdjustmentKcal Int @default(400)
+
+  // Activity multipliers
+  sedentaryMultiplier Float @default(1.2)
+  lightMultiplier     Float @default(1.375)
+  moderateMultiplier  Float @default(1.55)
+  veryMultiplier      Float @default(1.725)
+  extremeMultiplier   Float @default(1.9)
+
+  // Macro ratios
+  proteinPerKg      Float @default(1.8)
+  fatPct            Float @default(0.25)
+  fiberGPer1000Kcal Float @default(15.0)
+
+  // Safety floors (§6.2)
+  floorMaleKcal        Int @default(1500)
+  floorFemaleKcal      Int @default(1200)
+  floorUnspecifiedKcal Int @default(1500)
+
+  // Rounding + rationale
+  targetRoundingKcal Int   @default(10)
+  kcalPerKgBodyMass  Float @default(7700.0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  plans     Plan[]
+
+  @@index([isActive])
+}
