@@ -41,6 +41,7 @@ INSTALLED_APPS = [
     "django.contrib.auth",
     "corsheaders",
     "rest_framework",
+    "drf_spectacular",
     "common",
     "authx",
     "onboarding",
@@ -88,6 +89,7 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
     "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "EXCEPTION_HANDLER": "common.exceptions.api_exception_handler",
     # Django's AnonymousUser would drag in the auth app's DB tables; we never
     # need it because permissions run off our own actor object.
@@ -100,6 +102,19 @@ REST_FRAMEWORK = {
         # endpoint worth rate-limiting out of the box.
         "guest_create": env("GUEST_CREATE_RATE", "20/hour"),
     },
+}
+
+# --- API schema (drf-spectacular) ------------------------------------------
+# Source of truth for FE type generation: `manage.py spectacular --file schema.yaml`
+# (see scripts/export_openapi_schema.sh).
+SPECTACULAR_SETTINGS = {
+    "TITLE": "CaloryX API",
+    "DESCRIPTION": "Onboarding, auth, and engine-config endpoints for the CaloryX client.",
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    # Per-operation security is derived from each view's authentication_classes
+    # via authx.schema.BearerAuthenticationScheme.
+    "SCHEMA_PATH_PREFIX": "/api/v1",
 }
 
 # --- CORS -----------------------------------------------------------------

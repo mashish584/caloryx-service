@@ -2,13 +2,25 @@ from __future__ import annotations
 
 import logging
 
+from drf_spectacular.utils import OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from common.serializers import ErrorResponseSerializer
+
 from . import repository, services
-from .serializers import ProfileUpsertSerializer, serialize_profile
+from .serializers import (
+    CompleteResponseSerializer,
+    EngineConfigResponseSerializer,
+    PlanResponseSerializer,
+    ProfileStateResponseSerializer,
+    ProfileUpsertResponseSerializer,
+    ProfileUpsertSerializer,
+    StoredPlanResponseSerializer,
+    serialize_profile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -16,12 +28,17 @@ logger = logging.getLogger(__name__)
 class ProfileView(APIView):
     """POST /api/v1/onboarding/profile - upsert the collected inputs (steps 1-3)."""
 
+    @extend_schema(
+        request=ProfileUpsertSerializer,
+        responses={200: ProfileUpsertResponseSerializer},
+    )
     def post(self, request):
         serializer = ProfileUpsertSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         payload = services.save_profile(request.user.user_id, serializer.validated_data)
         return Response(payload, status=status.HTTP_200_OK)
 
+    @extend_schema(responses={200: ProfileStateResponseSerializer})
     def get(self, request):
         profile = repository.get_profile(request.user.user_id)
         if profile is None:
@@ -39,9 +56,18 @@ class PlanView(APIView):
     """POST computes and persists the authoritative plan; GET returns the stored
     one for the plan screen and for resuming a half-finished flow (PRD §4)."""
 
+    @extend_schema(request=None, responses={200: PlanResponseSerializer})
     def post(self, request):
         return Response(services.generate_plan(request.user.user_id))
 
+    @extend_schema(
+        responses={
+            200: StoredPlanResponseSerializer,
+            404: OpenApiResponse(
+                ErrorResponseSerializer, description="No plan has been generated yet."
+            ),
+        }
+    )
     def get(self, request):
         plan = services.fetch_plan(request.user.user_id)
         if plan is None:
@@ -60,6 +86,7 @@ class PlanView(APIView):
 class CompleteView(APIView):
     """POST /api/v1/onboarding/complete - stamp `onboardedAt` and finalise."""
 
+    @extend_schema(request=None, responses={200: CompleteResponseSerializer})
     def post(self, request):
         return Response(services.complete_onboarding(request.user.user_id))
 
@@ -76,5 +103,6 @@ class EngineConfigView(APIView):
     authentication_classes = []
     permission_classes = [AllowAny]
 
+    @extend_schema(responses={200: EngineConfigResponseSerializer})
     def get(self, request):
         return Response(repository.get_active_engine_config().to_public_dict())

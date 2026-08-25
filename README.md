@@ -182,6 +182,35 @@ auto-corrects:
 | `calories_clamped_to_floor` | Target was clamped up to the safety floor |
 | `weight_out_of_typical_range` · `height_out_of_typical_range` | Plausible but unusual input |
 
+### API schema & frontend types
+
+The API is documented with [drf-spectacular](https://drf-spectacular.readthedocs.io/),
+generated from the DRF serializers rather than hand-maintained, so it can't
+drift from what the endpoints actually return.
+
+```
+GET /api/schema        raw OpenAPI 3 document (no auth required)
+GET /api/schema/docs   Swagger UI
+GET /api/schema/redoc  ReDoc
+```
+
+To export the schema to a file (used to generate frontend types):
+
+```bash
+scripts/export_openapi_schema.sh schema.yaml
+```
+
+Then generate TypeScript types on the frontend with
+[openapi-typescript](https://openapi-ts.dev/):
+
+```bash
+npx openapi-typescript schema.yaml -o src/api/schema.d.ts
+```
+
+Re-run both steps whenever a serializer or view response shape changes — the
+schema is not committed (`schema.yaml` is gitignored) since it's a build
+artifact, not a source file.
+
 ---
 
 ## The engine (§6)

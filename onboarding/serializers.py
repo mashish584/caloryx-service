@@ -111,6 +111,140 @@ def serialize_profile(profile: Any) -> Dict[str, Any]:
     }
 
 
+class AdvisoryOptionSerializer(serializers.Serializer):
+    """One-tap correction offered by an advisory (see engine.advisories)."""
+
+    id = serializers.CharField()
+    label = serializers.CharField()
+    patch = serializers.DictField()
+
+
+class AdvisorySerializer(serializers.Serializer):
+    code = serializers.CharField()
+    message = serializers.CharField()
+    field = serializers.CharField(required=False)
+    severity = serializers.CharField()
+    options = AdvisoryOptionSerializer(many=True, required=False)
+
+
+class ProfileSerializer(serializers.Serializer):
+    """Mirrors `serialize_profile`."""
+
+    id = serializers.CharField()
+    sexAtBirth = serializers.ChoiceField(choices=[s.value for s in SexAtBirth])
+    age = serializers.IntegerField()
+    weightKg = serializers.FloatField()
+    heightCm = serializers.FloatField()
+    targetWeightKg = serializers.FloatField(allow_null=True)
+    goal = serializers.ChoiceField(choices=[g.value for g in Goal])
+    activityLevel = serializers.ChoiceField(choices=[a.value for a in ActivityLevel])
+    preferredUnits = serializers.ChoiceField(choices=[u.value for u in UnitSystem])
+    onboardedAt = serializers.DateTimeField(allow_null=True)
+    updatedAt = serializers.DateTimeField()
+
+
+class ProfileStateResponseSerializer(serializers.Serializer):
+    """GET /onboarding/profile when no profile exists yet."""
+
+    profile = ProfileSerializer(allow_null=True)
+    advisories = AdvisorySerializer(many=True)
+
+
+class ProfileUpsertResponseSerializer(serializers.Serializer):
+    """POST /onboarding/profile. `services.save_profile` always has a profile,
+    unlike the GET above where it may be None before onboarding starts."""
+
+    profile = ProfileSerializer()
+    advisories = AdvisorySerializer(many=True)
+
+
+class MacrosSerializer(serializers.Serializer):
+    proteinG = serializers.IntegerField()
+    carbsG = serializers.IntegerField()
+    fatG = serializers.IntegerField()
+    fiberG = serializers.IntegerField()
+
+
+class MacroEnergyKcalSerializer(serializers.Serializer):
+    protein = serializers.IntegerField()
+    carbs = serializers.IntegerField()
+    fat = serializers.IntegerField()
+    total = serializers.IntegerField()
+
+
+class PlanRationaleSerializer(serializers.Serializer):
+    """POST /onboarding/plan. See `PlanResult.to_response`."""
+
+    adjustmentKcal = serializers.IntegerField()
+    weeklyChangeKg = serializers.FloatField()
+    clamped = serializers.BooleanField()
+    safetyFloorKcal = serializers.IntegerField()
+    requestedAdjustmentKcal = serializers.IntegerField()
+
+
+class StoredPlanRationaleSerializer(serializers.Serializer):
+    """GET /onboarding/plan. `serialize_stored_plan` does not persist
+    `safetyFloorKcal` / `requestedAdjustmentKcal`, so this is intentionally
+    narrower than `PlanRationaleSerializer` above."""
+
+    adjustmentKcal = serializers.IntegerField()
+    weeklyChangeKg = serializers.FloatField()
+    clamped = serializers.BooleanField()
+
+
+class PlanResponseSerializer(serializers.Serializer):
+    """POST /onboarding/plan."""
+
+    calories = serializers.IntegerField()
+    macros = MacrosSerializer()
+    macroEnergyKcal = MacroEnergyKcalSerializer()
+    rationale = PlanRationaleSerializer()
+    isEstimate = serializers.BooleanField()
+    bmr = serializers.FloatField()
+    tdee = serializers.FloatField()
+    advisories = AdvisorySerializer(many=True)
+
+
+class StoredPlanResponseSerializer(serializers.Serializer):
+    """GET /onboarding/plan."""
+
+    calories = serializers.IntegerField()
+    macros = MacrosSerializer()
+    macroEnergyKcal = MacroEnergyKcalSerializer()
+    rationale = StoredPlanRationaleSerializer()
+    isEstimate = serializers.BooleanField()
+    bmr = serializers.FloatField()
+    tdee = serializers.FloatField()
+    computedAt = serializers.DateTimeField()
+    advisories = AdvisorySerializer(many=True)
+
+
+class CompleteResponseSerializer(serializers.Serializer):
+    profile = ProfileSerializer()
+
+
+class EngineConfigMacrosSerializer(serializers.Serializer):
+    proteinPerKg = serializers.FloatField()
+    fatPct = serializers.FloatField()
+    fiberGPer1000Kcal = serializers.FloatField()
+
+
+class EngineConfigResponseSerializer(serializers.Serializer):
+    """GET /onboarding/config. See `EngineConfig.to_public_dict`.
+
+    The three keyed-by-enum dicts (goal, activity level, sex) vary by config
+    row, not by request, so they're typed as records rather than fixed fields.
+    """
+
+    configName = serializers.CharField()
+    goalAdjustmentsKcal = serializers.DictField(child=serializers.IntegerField())
+    activityMultipliers = serializers.DictField(child=serializers.FloatField())
+    macros = EngineConfigMacrosSerializer()
+    safetyFloorsKcal = serializers.DictField(child=serializers.IntegerField())
+    targetRoundingKcal = serializers.IntegerField()
+    kcalPerKgBodyMass = serializers.FloatField()
+
+
 def serialize_stored_plan(plan: Any) -> Dict[str, Any]:
     """Render a persisted Plan row in the same shape the calculator returns, so
     GET /onboarding/plan and POST /onboarding/plan are interchangeable to the client."""

@@ -4,6 +4,8 @@ from typing import Any, Dict, Optional
 
 from rest_framework import serializers
 
+from engine.enums import AuthProvider
+
 from .actor import Actor
 
 
@@ -11,6 +13,51 @@ class ClaimGuestRequestSerializer(serializers.Serializer):
     guestToken = serializers.CharField(
         help_text="The guest bearer token whose onboarding data should move to this account."
     )
+
+
+class UserSerializer(serializers.Serializer):
+    """Mirrors `serialize_user` - the persisted User row."""
+
+    id = serializers.CharField()
+    isGuest = serializers.BooleanField()
+    authProvider = serializers.ChoiceField(choices=[p.value for p in AuthProvider])
+    externalProvider = serializers.CharField(allow_null=True, required=False)
+    email = serializers.CharField(allow_null=True)
+    claimedAt = serializers.DateTimeField(allow_null=True)
+    createdAt = serializers.DateTimeField()
+
+
+class ActorSerializer(serializers.Serializer):
+    """Mirrors `serialize_actor` - the authenticated request identity, which is
+    cheaper than `UserSerializer` because it never re-reads the DB row."""
+
+    id = serializers.CharField()
+    isGuest = serializers.BooleanField()
+    authProvider = serializers.ChoiceField(choices=[p.value for p in AuthProvider])
+    email = serializers.CharField(allow_null=True)
+
+
+class OnboardingStateSerializer(serializers.Serializer):
+    hasProfile = serializers.BooleanField()
+    hasPlan = serializers.BooleanField()
+    onboardedAt = serializers.DateTimeField(allow_null=True)
+
+
+class GuestSessionResponseSerializer(serializers.Serializer):
+    token = serializers.CharField()
+    expiresAt = serializers.DateTimeField()
+    user = UserSerializer()
+    onboarding = OnboardingStateSerializer()
+
+
+class SessionResponseSerializer(serializers.Serializer):
+    user = ActorSerializer()
+    onboarding = OnboardingStateSerializer()
+
+
+class ClaimResponseSerializer(serializers.Serializer):
+    user = UserSerializer()
+    onboarding = OnboardingStateSerializer()
 
 
 def serialize_user(user: Any) -> Dict[str, Any]:

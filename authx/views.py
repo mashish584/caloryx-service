@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 
+from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
@@ -21,6 +22,9 @@ from . import repository
 from .permissions import IsRegisteredActor
 from .serializers import (
     ClaimGuestRequestSerializer,
+    ClaimResponseSerializer,
+    GuestSessionResponseSerializer,
+    SessionResponseSerializer,
     serialize_actor,
     serialize_onboarding_state,
     serialize_user,
@@ -41,6 +45,7 @@ class GuestSessionView(APIView):
     permission_classes = [AllowAny]
     throttle_scope_guest_create = True
 
+    @extend_schema(request=None, responses={201: GuestSessionResponseSerializer})
     def post(self, request):
         user = repository.create_guest_user()
         token = issue_guest_token(user.id)
@@ -63,9 +68,11 @@ class SessionView(APIView):
     refreshes the Clerk-backed user row. GET is the cheap resume check.
     """
 
+    @extend_schema(responses={200: SessionResponseSerializer})
     def get(self, request):
         return self._session_response(request)
 
+    @extend_schema(request=None, responses={200: SessionResponseSerializer})
     def post(self, request):
         return self._session_response(request)
 
@@ -89,6 +96,9 @@ class ClaimGuestView(APIView):
 
     permission_classes = [IsRegisteredActor]
 
+    @extend_schema(
+        request=ClaimGuestRequestSerializer, responses={200: ClaimResponseSerializer}
+    )
     def post(self, request):
         serializer = ClaimGuestRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
