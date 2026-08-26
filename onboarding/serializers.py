@@ -182,16 +182,6 @@ class PlanRationaleSerializer(serializers.Serializer):
     requestedAdjustmentKcal = serializers.IntegerField()
 
 
-class StoredPlanRationaleSerializer(serializers.Serializer):
-    """GET /onboarding/plan. `serialize_stored_plan` does not persist
-    `safetyFloorKcal` / `requestedAdjustmentKcal`, so this is intentionally
-    narrower than `PlanRationaleSerializer` above."""
-
-    adjustmentKcal = serializers.IntegerField()
-    weeklyChangeKg = serializers.FloatField()
-    clamped = serializers.BooleanField()
-
-
 class PlanResponseSerializer(serializers.Serializer):
     """POST /onboarding/plan."""
 
@@ -206,12 +196,17 @@ class PlanResponseSerializer(serializers.Serializer):
 
 
 class StoredPlanResponseSerializer(serializers.Serializer):
-    """GET /onboarding/plan."""
+    """GET /onboarding/plan: the POST shape plus `computedAt`.
+
+    `rationale` is deliberately the *same* serializer the POST response uses. The
+    two drifted once (the stored one was missing the clamp fields), which cost a
+    resumed plan its §6.2 explanation; sharing the schema makes that impossible.
+    """
 
     calories = serializers.IntegerField()
     macros = MacrosSerializer()
     macroEnergyKcal = MacroEnergyKcalSerializer()
-    rationale = StoredPlanRationaleSerializer()
+    rationale = PlanRationaleSerializer()
     isEstimate = serializers.BooleanField()
     bmr = serializers.FloatField()
     tdee = serializers.FloatField()
@@ -246,8 +241,9 @@ class EngineConfigResponseSerializer(serializers.Serializer):
 
 
 def serialize_stored_plan(plan: Any) -> Dict[str, Any]:
-    """Render a persisted Plan row in the same shape the calculator returns, so
-    GET /onboarding/plan and POST /onboarding/plan are interchangeable to the client."""
+    """Render a persisted Plan row in the shape the calculator returns, so GET
+    /onboarding/plan matches POST field for field apart from the extra
+    `computedAt`. Keep `rationale` in step with `PlanResult.to_response`."""
     protein_kcal = plan.proteinG * 4
     carbs_kcal = plan.carbsG * 4
     fat_kcal = plan.fatG * 9
@@ -269,6 +265,10 @@ def serialize_stored_plan(plan: Any) -> Dict[str, Any]:
             "adjustmentKcal": plan.adjustmentKcal,
             "weeklyChangeKg": plan.weeklyChangeKg,
             "clamped": plan.clamped,
+            # Null on rows written before these columns existed; `fetch_plan`
+            # fills them in rather than handing the client a missing key.
+            "safetyFloorKcal": plan.safetyFloorKcal,
+            "requestedAdjustmentKcal": plan.requestedAdjustmentKcal,
         },
         "isEstimate": plan.isEstimate,
         "bmr": plan.bmr,

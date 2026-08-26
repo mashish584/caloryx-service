@@ -1,13 +1,18 @@
 """Input validation - PRD §5.2 and §9."""
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from rest_framework.exceptions import ValidationError
 
 from common.exceptions import AgeBelowMinimumError
-from onboarding.serializers import ProfileUpsertSerializer
+from onboarding.serializers import (
+    PlanRationaleSerializer,
+    ProfileUpsertSerializer,
+    serialize_stored_plan,
+)
 
 VALID = {
     "sexAtBirth": "MALE",
@@ -116,3 +121,36 @@ def test_unusual_but_plausible_values_are_accepted():
     """Soft-range concerns come back as advisories, not rejections."""
     serializer = ProfileUpsertSerializer(data=dict(VALID, weightKg=260.0))
     assert serializer.is_valid(), serializer.errors
+
+
+STORED_PLAN = SimpleNamespace(
+    caloriesKcal=1200,
+    proteinG=81,
+    carbsG=113,
+    fatG=33,
+    fiberG=18,
+    bmr=926.5,
+    tdee=1111.8,
+    clamped=True,
+    isEstimate=False,
+    adjustmentKcal=88,
+    weeklyChangeKg=0.1,
+    safetyFloorKcal=1200,
+    requestedAdjustmentKcal=-400,
+    computedAt=datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc),
+)
+
+
+def test_stored_plan_rationale_matches_the_declared_schema():
+    """GET and POST share `PlanRationaleSerializer`; if a field is added to the
+    schema without being read off the row, the resume path silently returns null."""
+    rationale = serialize_stored_plan(STORED_PLAN)["rationale"]
+    assert set(rationale) == set(PlanRationaleSerializer().fields)
+
+
+def test_stored_plan_carries_the_clamp_fields():
+    """§6.2 - the floor is what the clamped advisory interpolates."""
+    rationale = serialize_stored_plan(STORED_PLAN)["rationale"]
+    assert rationale["safetyFloorKcal"] == 1200
+    assert rationale["requestedAdjustmentKcal"] == -400
+    assert rationale["clamped"] is True

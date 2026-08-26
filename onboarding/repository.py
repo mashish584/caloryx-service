@@ -108,6 +108,8 @@ def upsert_plan(profile_id: str, result: PlanResult) -> Any:
         "isEstimate": result.is_estimate,
         "adjustmentKcal": result.adjustment_kcal,
         "weeklyChangeKg": result.weekly_change_kg,
+        "safetyFloorKcal": result.safety_floor_kcal,
+        "requestedAdjustmentKcal": result.requested_adjustment_kcal,
         "computedAt": _now(),
     }
     if result.config.id:

@@ -6,11 +6,12 @@ combines the engine with persistence lives here.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from common.exceptions import ProfileRequiredError
 from engine import (
     Advisory,
+    EngineConfig,
     Goal,
     PlanInput,
     PlanResult,
@@ -48,6 +49,31 @@ def profile_advisories(profile: Any) -> List[Advisory]:
     )
 
 
+def plan_advisories(
+    profile: Any, *, clamped: bool, safety_floor_kcal: int
+) -> List[Advisory]:
+    """Profile hints plus the §6.2 clamp explanation.
+
+    Computing a plan and resuming one both go through here. They used to assemble
+    this list separately, and the resume path forgot the clamp advisory - so a
+    user held at the floor saw the explanation once and never again.
+    """
+    advisories = profile_advisories(profile)
+    if clamped:
+        advisories.insert(0, clamped_advisory(safety_floor_kcal))
+    return advisories
+
+
+def derive_stored_rationale(profile: Any, config: EngineConfig) -> Tuple[int, int]:
+    """Safety floor and requested adjustment for a Plan row that predates those
+    columns. Shared with the `backfill_plan_rationale` command so the healed value
+    and the backfilled value are always derived the same way."""
+    return (
+        config.floor_for(SexAtBirth(profile.sexAtBirth)),
+        config.adjustment_for(Goal(profile.goal)),
+    )
+
+
 def save_profile(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     """Upsert the step 1-3 inputs and hand back any inline hints."""
     payload = dict(data)
@@ -74,9 +100,9 @@ def generate_plan(user_id: str) -> Dict[str, Any]:
     result: PlanResult = calculate_plan(_to_plan_input(profile), config)
     repository.upsert_plan(profile.id, result)
 
-    advisories = profile_advisories(profile)
-    if result.clamped:
-        advisories.insert(0, clamped_advisory(result.safety_floor_kcal))
+    advisories = plan_advisories(
+        profile, clamped=result.clamped, safety_floor_kcal=result.safety_floor_kcal
+    )
 
     logger.info(
         "plan generated user=%s calories=%s goal=%s activity=%s clamped=%s estimate=%s",
@@ -102,7 +128,28 @@ def fetch_plan(user_id: str) -> Optional[Dict[str, Any]]:
         return None
 
     payload = serialize_stored_plan(plan)
-    payload["advisories"] = [a.to_dict() for a in profile_advisories(profile)]
+    rationale = payload["rationale"]
+    if rationale["safetyFloorKcal"] is None or rationale["requestedAdjustmentKcal"] is None:
+        # Written before the columns existed. `backfill_plan_rationale` is what
+        # actually clears these; healing here keeps the response well-formed in
+        # the meantime, at the cost of using today's config rather than the one
+        # that produced the plan.
+        floor, requested = derive_stored_rationale(
+            profile, repository.get_active_engine_config()
+        )
+        if rationale["safetyFloorKcal"] is None:
+            rationale["safetyFloorKcal"] = floor
+        if rationale["requestedAdjustmentKcal"] is None:
+            rationale["requestedAdjustmentKcal"] = requested
+
+    payload["advisories"] = [
+        a.to_dict()
+        for a in plan_advisories(
+            profile,
+            clamped=plan.clamped,
+            safety_floor_kcal=rationale["safetyFloorKcal"],
+        )
+    ]
     return payload
 
 

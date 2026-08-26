@@ -92,6 +92,15 @@ migrations so changes are reviewable and replayable:
 prisma migrate dev --name init --schema prisma/schema.prisma
 ```
 
+If the database already held plans before `Plan.safetyFloorKcal` /
+`Plan.requestedAdjustmentKcal` were added, backfill them once. Those rows cannot
+explain a §6.2 clamp until you do:
+
+```bash
+python manage.py backfill_plan_rationale --dry-run
+python manage.py backfill_plan_rationale
+```
+
 Verify configuration, then run:
 
 ```bash

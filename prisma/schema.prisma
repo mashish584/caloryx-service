@@ -99,6 +99,12 @@ model Plan {
   // configured one whenever the safety floor clamps the target (§6.2).
   adjustmentKcal Int
   weeklyChangeKg Float
+  // The §6.2 floor that produced this target and the goal adjustment it overrode,
+  // so a resumed plan explains itself without re-deriving from a config that may
+  // since have been retuned. Nullable only for rows written before these columns
+  // existed; `manage.py backfill_plan_rationale` clears them.
+  safetyFloorKcal         Int?
+  requestedAdjustmentKcal Int?
   // Which config produced these numbers, so a plan stays explainable after a retune.
   engineConfigId String?
   engineConfig   EngineConfig? @relation(fields: [engineConfigId], references: [id])
