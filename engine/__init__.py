@@ -16,7 +16,15 @@ from .calculator import (
     calculate_plan,
 )
 from .config import DEFAULT_CONFIG, EngineConfig, config_from_row
-from .enums import ActivityLevel, AuthProvider, Goal, SexAtBirth, UnitSystem
+from .enums import (
+    ActivityLevel,
+    AuthProvider,
+    Goal,
+    HeightUnit,
+    SexAtBirth,
+    UnitSystem,
+    WeightUnit,
+)
 
 __all__ = [
     "Advisory",
@@ -26,12 +34,14 @@ __all__ = [
     "EngineConfig",
     "EngineError",
     "Goal",
+    "HeightUnit",
     "Macros",
     "PlanInput",
     "PlanReconciliationError",
     "PlanResult",
     "SexAtBirth",
     "UnitSystem",
+    "WeightUnit",
     "bmi",
     "calculate_bmr",
     "calculate_plan",

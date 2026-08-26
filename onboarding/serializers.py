@@ -13,7 +13,7 @@ from django.conf import settings
 from rest_framework import serializers
 
 from common.exceptions import AgeBelowMinimumError
-from engine.enums import ActivityLevel, Goal, SexAtBirth, UnitSystem
+from engine.enums import ActivityLevel, Goal, HeightUnit, SexAtBirth, WeightUnit
 
 # Hard physiological bounds. Outside these we reject; inside but unusual is a
 # warning only (engine.advisories.SOFT_*).
@@ -28,6 +28,26 @@ ONBOARDING_SEX_CHOICES = [SexAtBirth.MALE.value, SexAtBirth.FEMALE.value]
 def _age_from_dob(dob: date, today: Optional[date] = None) -> int:
     today = today or date.today()
     return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
+
+class PreferredUnitsSerializer(serializers.Serializer):
+    """How the client renders measurements (§5.2).
+
+    Display only: values on the wire and in the database are always kg and cm,
+    and the client converts at its own boundary. Two units rather than one
+    system, because kg + ft/in is a real choice a single METRIC/IMPERIAL flag
+    could not represent. Weight covers current and target weight alike - they
+    are never shown in different units.
+    """
+
+    weight = serializers.ChoiceField(choices=[u.value for u in WeightUnit])
+    height = serializers.ChoiceField(choices=[u.value for u in HeightUnit])
+
+
+DEFAULT_PREFERRED_UNITS = {
+    "weight": WeightUnit.KG.value,
+    "height": HeightUnit.CM.value,
+}
 
 
 class ProfileUpsertSerializer(serializers.Serializer):
@@ -57,9 +77,7 @@ class ProfileUpsertSerializer(serializers.Serializer):
     )
     goal = serializers.ChoiceField(choices=[g.value for g in Goal])
     activityLevel = serializers.ChoiceField(choices=[a.value for a in ActivityLevel])
-    preferredUnits = serializers.ChoiceField(
-        choices=[u.value for u in UnitSystem], default=UnitSystem.METRIC.value
-    )
+    preferredUnits = PreferredUnitsSerializer(default=DEFAULT_PREFERRED_UNITS)
 
     def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
         age = attrs.get("age")
@@ -105,7 +123,10 @@ def serialize_profile(profile: Any) -> Dict[str, Any]:
         "targetWeightKg": profile.targetWeightKg,
         "goal": profile.goal,
         "activityLevel": profile.activityLevel,
-        "preferredUnits": profile.preferredUnits,
+        "preferredUnits": {
+            "weight": profile.weightUnit,
+            "height": profile.heightUnit,
+        },
         "onboardedAt": profile.onboardedAt.isoformat() if profile.onboardedAt else None,
         "updatedAt": profile.updatedAt.isoformat(),
     }
@@ -138,7 +159,7 @@ class ProfileSerializer(serializers.Serializer):
     targetWeightKg = serializers.FloatField(allow_null=True)
     goal = serializers.ChoiceField(choices=[g.value for g in Goal])
     activityLevel = serializers.ChoiceField(choices=[a.value for a in ActivityLevel])
-    preferredUnits = serializers.ChoiceField(choices=[u.value for u in UnitSystem])
+    preferredUnits = PreferredUnitsSerializer()
     onboardedAt = serializers.DateTimeField(allow_null=True)
     updatedAt = serializers.DateTimeField()
 

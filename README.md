@@ -101,6 +101,16 @@ python manage.py backfill_plan_rationale --dry-run
 python manage.py backfill_plan_rationale
 ```
 
+Likewise, `Profile.preferredUnits` was replaced by `weightUnit` + `heightUnit`
+(a single METRIC/IMPERIAL flag cannot express kg + ft/in). The new columns carry
+defaults, so a push silently lands existing IMPERIAL users on KG/CM. Backfill
+before dropping the old column:
+
+```bash
+python manage.py backfill_unit_preferences --dry-run
+python manage.py backfill_unit_preferences
+```
+
 Verify configuration, then run:
 
 ```bash

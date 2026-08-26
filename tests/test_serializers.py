@@ -9,8 +9,10 @@ from rest_framework.exceptions import ValidationError
 
 from common.exceptions import AgeBelowMinimumError
 from onboarding.serializers import (
+    DEFAULT_PREFERRED_UNITS,
     PlanRationaleSerializer,
     ProfileUpsertSerializer,
+    serialize_profile,
     serialize_stored_plan,
 )
 
@@ -35,7 +37,10 @@ def validated(**overrides):
 
 def test_valid_payload_defaults_to_metric():
     data = validated()
-    assert data["preferredUnits"] == "METRIC"
+    assert data["preferredUnits"] == DEFAULT_PREFERRED_UNITS == {
+        "weight": "KG",
+        "height": "CM",
+    }
     assert data["age"] == 30
 
 
@@ -154,3 +159,62 @@ def test_stored_plan_carries_the_clamp_fields():
     assert rationale["safetyFloorKcal"] == 1200
     assert rationale["requestedAdjustmentKcal"] == -400
     assert rationale["clamped"] is True
+
+
+# -- display units (§5.2) --------------------------------------------------
+
+
+def test_a_full_imperial_pair_round_trips():
+    units = {"weight": "LB", "height": "FT_IN"}
+    assert validated(preferredUnits=units)["preferredUnits"] == units
+
+
+def test_a_mixed_pair_round_trips():
+    """The case the old single METRIC/IMPERIAL flag could not represent: someone
+    who thinks in kilograms but in feet and inches."""
+    units = {"weight": "KG", "height": "FT_IN"}
+    assert validated(preferredUnits=units)["preferredUnits"] == units
+
+
+def test_the_other_mixed_pair_round_trips():
+    units = {"weight": "LB", "height": "CM"}
+    assert validated(preferredUnits=units)["preferredUnits"] == units
+
+
+@pytest.mark.parametrize(
+    "units",
+    [
+        {"weight": "STONE", "height": "CM"},
+        {"weight": "KG", "height": "INCHES"},
+        {"weight": "KG"},
+        {"height": "CM"},
+        {},
+        "METRIC",  # the retired flat form
+    ],
+)
+def test_malformed_unit_preferences_are_rejected(units):
+    serializer = ProfileUpsertSerializer(data=dict(VALID, preferredUnits=units))
+    assert not serializer.is_valid()
+    assert "preferredUnits" in serializer.errors
+
+
+def test_serialize_profile_emits_the_nested_pair():
+    """Columns are flat; the wire shape is nested."""
+    profile = SimpleNamespace(
+        id="p1",
+        sexAtBirth="FEMALE",
+        age=30,
+        weightKg=68.0,
+        heightCm=165.0,
+        targetWeightKg=None,
+        goal="LOSE",
+        activityLevel="MODERATE",
+        weightUnit="KG",
+        heightUnit="FT_IN",
+        onboardedAt=None,
+        updatedAt=datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc),
+    )
+    assert serialize_profile(profile)["preferredUnits"] == {
+        "weight": "KG",
+        "height": "FT_IN",
+    }

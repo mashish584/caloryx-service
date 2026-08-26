@@ -32,9 +32,24 @@ enum ActivityLevel {
   EXTREME
 }
 
+/// DEPRECATED - superseded by WeightUnit + HeightUnit, which can express the
+/// mixed choices (kg + ft/in, lb + cm) a single system cannot. Kept only until
+/// `backfill_unit_preferences` has run everywhere; drop with the column.
 enum UnitSystem {
   METRIC
   IMPERIAL
+}
+
+/// Display units (§5.2). Values are always stored metric; these record only how
+/// the client renders them. Weight covers current and target weight alike.
+enum WeightUnit {
+  KG
+  LB
+}
+
+enum HeightUnit {
+  CM
+  FT_IN
 }
 
 enum AuthProvider {
@@ -75,6 +90,9 @@ model Profile {
   targetWeightKg Float?
   goal           Goal
   activityLevel  ActivityLevel
+  weightUnit     WeightUnit    @default(KG)
+  heightUnit     HeightUnit    @default(CM)
+  // DEPRECATED - read only by `backfill_unit_preferences`; drop once it has run.
   preferredUnits UnitSystem    @default(METRIC)
   onboardedAt    DateTime?
   createdAt      DateTime      @default(now())

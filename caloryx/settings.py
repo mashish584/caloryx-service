@@ -115,6 +115,13 @@ SPECTACULAR_SETTINGS = {
     # Per-operation security is derived from each view's authentication_classes
     # via authx.schema.BearerAuthenticationScheme.
     "SCHEMA_PATH_PREFIX": "/api/v1",
+    # `PreferredUnits.weight` / `.height` are *units*, not measurements. Without
+    # this the generated client would carry a `WeightEnum` sitting next to
+    # `weightKg`, which reads as the weight itself.
+    "ENUM_NAME_OVERRIDES": {
+        "WeightUnitEnum": "engine.enums.WeightUnit",
+        "HeightUnitEnum": "engine.enums.HeightUnit",
+    },
 }
 
 # --- CORS -----------------------------------------------------------------

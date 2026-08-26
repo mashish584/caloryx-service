@@ -34,8 +34,26 @@ class ActivityLevel(StrEnum):
 
 
 class UnitSystem(StrEnum):
+    """DEPRECATED - superseded by WeightUnit + HeightUnit. Retained only so
+    `backfill_unit_preferences` can read the old column."""
+
     METRIC = "METRIC"
     IMPERIAL = "IMPERIAL"
+
+
+class WeightUnit(StrEnum):
+    """Display unit for current and target weight (§5.2). Never a storage unit -
+    the wire and the database are always kg."""
+
+    KG = "KG"
+    LB = "LB"
+
+
+class HeightUnit(StrEnum):
+    """Display unit for height (§5.2). Storage is always cm."""
+
+    CM = "CM"
+    FT_IN = "FT_IN"
 
 
 class AuthProvider(StrEnum):

@@ -23,7 +23,11 @@ from engine import (
 from engine.enums import ActivityLevel
 
 from . import repository
-from .serializers import serialize_profile, serialize_stored_plan
+from .serializers import (
+    DEFAULT_PREFERRED_UNITS,
+    serialize_profile,
+    serialize_stored_plan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +82,12 @@ def save_profile(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     """Upsert the step 1-3 inputs and hand back any inline hints."""
     payload = dict(data)
     payload.setdefault("targetWeightKg", None)
+    # `preferredUnits` is nested on the wire but two columns in the database, and
+    # `upsert_profile` spreads this payload straight into Prisma. Flatten here so
+    # the repository stays a blind pass-through.
+    units = payload.pop("preferredUnits", None) or DEFAULT_PREFERRED_UNITS
+    payload["weightUnit"] = units["weight"]
+    payload["heightUnit"] = units["height"]
     profile = repository.upsert_profile(user_id, payload)
     advisories = profile_advisories(profile)
     return {
