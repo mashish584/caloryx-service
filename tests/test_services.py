@@ -8,7 +8,7 @@ Prisma is never reached; `onboarding.repository` is the seam (see tests/settings
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -16,12 +16,13 @@ import pytest
 from engine import DEFAULT_CONFIG
 from onboarding import repository, services
 from onboarding.serializers import PlanRationaleSerializer, PlanResponseSerializer
+from tests.support import dob_for_age
 
 # The §6.2 fixture from test_engine.py: TDEE 1,111.8, a -400 deficit lands at
 # 711.8, and the female floor pulls the target back up to 1,200.
 CLAMPED = {
     "sexAtBirth": "FEMALE",
-    "age": 60,
+    "dateOfBirth": dob_for_age(60),
     "weightKg": 45.0,
     "heightCm": 150.0,
     "targetWeightKg": None,
@@ -32,7 +33,7 @@ COMPUTED_AT = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
 
 UNCLAMPED = {
     "sexAtBirth": "MALE",
-    "age": 30,
+    "dateOfBirth": dob_for_age(30),
     "weightKg": 90.0,
     "heightCm": 180.0,
     "targetWeightKg": 82.0,
@@ -211,3 +212,37 @@ def test_the_plan_payload_matches_the_declared_schema(seam):
     computed = services.generate_plan("user-1")
 
     assert set(computed) == set(PlanResponseSerializer().fields)
+
+
+# -- age is derived, never remembered (§9) ----------------------------------
+
+
+def test_the_engine_gets_an_age_derived_from_the_birth_date(seam):
+    """The §6.2 fixture only clamps because the user is 60; if the derivation
+    were wrong these numbers would quietly change."""
+    seam.profile = make_profile(CLAMPED)
+    computed = services.generate_plan("user-1")
+
+    assert computed["calories"] == 1200
+    assert computed["rationale"]["safetyFloorKcal"] == 1200
+    assert computed["bmr"] == pytest.approx(926.5)
+
+
+def test_a_row_predating_the_column_falls_back_to_the_stored_age(seam):
+    """Until `backfill_date_of_birth` runs, `dateOfBirth` is null and the legacy
+    integer still has to drive the engine."""
+    legacy = dict(CLAMPED)
+    legacy.pop("dateOfBirth")
+    seam.profile = make_profile(dict(legacy, age=60, dateOfBirth=None))
+
+    assert services.generate_plan("user-1")["bmr"] == pytest.approx(926.5)
+
+
+def test_the_derived_age_advances_with_the_calendar():
+    """The whole point: a stored integer freezes, a birth date does not."""
+    from onboarding.serializers import age_from_dob
+
+    dob = date(1996, 3, 14)
+    assert age_from_dob(dob, today=date(2026, 3, 14)) == 30
+    assert age_from_dob(dob, today=date(2027, 3, 14)) == 31
+    assert age_from_dob(dob, today=date(2036, 3, 14)) == 40

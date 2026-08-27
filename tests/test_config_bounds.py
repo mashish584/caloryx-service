@@ -14,10 +14,11 @@ from django.test import Client, override_settings
 from engine import DEFAULT_CONFIG
 from engine.advisories import SOFT_HEIGHT_CM, SOFT_WEIGHT_KG
 from onboarding.serializers import ProfileUpsertSerializer, validation_bounds
+from tests.support import dob_str
 
 VALID = {
     "sexAtBirth": "MALE",
-    "age": 30,
+    "dateOfBirth": dob_str(30),
     "weightKg": 90.0,
     "heightCm": 180.0,
     "goal": "LOSE",

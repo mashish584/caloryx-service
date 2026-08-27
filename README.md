@@ -111,6 +111,17 @@ python manage.py backfill_unit_preferences --dry-run
 python manage.py backfill_unit_preferences
 ```
 
+`Profile.age` was likewise replaced by `dateOfBirth`, from which age is derived
+on every read (§9). Old rows only ever stored the integer, so their date has to
+be reconstructed — approximately — before `age` can be dropped:
+
+```bash
+python manage.py backfill_date_of_birth --dry-run
+python manage.py backfill_date_of_birth
+```
+
+Both `age` and `preferredUnits` are then droppable in a single contract-phase push.
+
 Verify configuration, then run:
 
 ```bash

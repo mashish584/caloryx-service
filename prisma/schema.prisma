@@ -84,6 +84,11 @@ model Profile {
   userId         String        @unique
   user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   sexAtBirth     SexAtBirth // onboarding v7 writes MALE or FEMALE
+  /// The user's date of birth (§9). Age is derived from this on every read and
+  /// never stored, so it advances with the calendar instead of freezing at
+  /// signup. A pure date: only ever used for year arithmetic.
+  dateOfBirth    DateTime?     @db.Date
+  // DEPRECATED - read only by `backfill_date_of_birth`; drop once it has run.
   age            Int
   weightKg       Float // stored metric; imperial is a display concern (§5.2)
   heightCm       Float

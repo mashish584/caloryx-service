@@ -38,6 +38,10 @@ def validation_bounds() -> Dict[str, Any]:
 
     Soft bounds do not reject: inside the hard caps but outside these, the API
     accepts the value and returns an advisory (engine/advisories.py).
+
+    `age` bounds apply to the age *derived* from `dateOfBirth` (§9). A client
+    constrains its date picker from them rather than hardcoding a range:
+    maxDate = today - age.min years, minDate = today - age.max years.
     """
     return {
         "age": {
@@ -59,7 +63,13 @@ def validation_bounds() -> Dict[str, Any]:
     }
 
 
-def _age_from_dob(dob: date, today: Optional[date] = None) -> int:
+def age_from_dob(dob: date, today: Optional[date] = None) -> int:
+    """Whole years elapsed, the way a birthday works.
+
+    The tuple comparison is the whole point: someone born in December is still
+    the younger age until December comes round again. Age is derived here on
+    every read rather than stored, so it never goes stale.
+    """
     today = today or date.today()
     return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
 
@@ -92,11 +102,9 @@ class ProfileUpsertSerializer(serializers.Serializer):
     """
 
     sexAtBirth = serializers.ChoiceField(choices=ONBOARDING_SEX_CHOICES)
-    # PRD §9 asks for a real date entry rather than a tickbox. Clients may send
-    # the date and let the server derive the age, which keeps the check
-    # authoritative; `age` remains accepted for offline-computed submissions.
-    age = serializers.IntegerField(required=False)
-    dateOfBirth = serializers.DateField(required=False)
+    # PRD §9: a real date entry, not a tickbox and not a self-reported integer.
+    # Age is derived from this and never stored, so it cannot freeze at signup.
+    dateOfBirth = serializers.DateField()
     weightKg = serializers.FloatField(
         min_value=WEIGHT_KG_RANGE[0], max_value=WEIGHT_KG_RANGE[1]
     )
@@ -114,16 +122,18 @@ class ProfileUpsertSerializer(serializers.Serializer):
     preferredUnits = PreferredUnitsSerializer(default=DEFAULT_PREFERRED_UNITS)
 
     def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
-        age = attrs.get("age")
-        dob = attrs.pop("dateOfBirth", None)
+        # `dateOfBirth` stays in attrs: it is what gets persisted. Age is derived
+        # for the §9 gate here, and again on every read - it is never stored.
+        dob = attrs["dateOfBirth"]
 
-        if dob is not None:
-            # The date wins when a client sends both: it cannot go stale.
-            age = _age_from_dob(dob)
-        if age is None:
+        if dob > date.today():
+            # Would otherwise fall through as a negative age and trip the
+            # under-18 gate, whose copy makes no sense for a future date.
             raise serializers.ValidationError(
-                {"age": "Provide either `age` or `dateOfBirth`."}
+                {"dateOfBirth": "Date of birth cannot be in the future."}
             )
+
+        age = age_from_dob(dob)
 
         if age < settings.MINIMUM_AGE_YEARS:
             # §9: below the minimum age we block rather than warn. Distinct code
@@ -136,9 +146,16 @@ class ProfileUpsertSerializer(serializers.Serializer):
             )
         if age > settings.MAXIMUM_AGE_YEARS:
             raise serializers.ValidationError(
-                {"age": "Age must be {} or below.".format(settings.MAXIMUM_AGE_YEARS)}
+                {
+                    "dateOfBirth": "Age must be {} or below.".format(
+                        settings.MAXIMUM_AGE_YEARS
+                    )
+                }
             )
 
+        # TRANSITIONAL - `Profile.age` is still NOT NULL until the contract-phase
+        # push drops it. Nothing reads it: age comes from `dateOfBirth` on every
+        # read. Delete this line with the column.
         attrs["age"] = age
         return attrs
 
@@ -151,7 +168,7 @@ def serialize_profile(profile: Any) -> Dict[str, Any]:
     return {
         "id": profile.id,
         "sexAtBirth": profile.sexAtBirth,
-        "age": profile.age,
+        "dateOfBirth": profile.dateOfBirth.isoformat() if profile.dateOfBirth else None,
         "weightKg": profile.weightKg,
         "heightCm": profile.heightCm,
         "targetWeightKg": profile.targetWeightKg,
@@ -187,7 +204,8 @@ class ProfileSerializer(serializers.Serializer):
 
     id = serializers.CharField()
     sexAtBirth = serializers.ChoiceField(choices=[s.value for s in SexAtBirth])
-    age = serializers.IntegerField()
+    # The client derives the age it displays; the server never stores one.
+    dateOfBirth = serializers.DateField(allow_null=True)
     weightKg = serializers.FloatField()
     heightCm = serializers.FloatField()
     targetWeightKg = serializers.FloatField(allow_null=True)

@@ -13,10 +13,11 @@ import pytest
 from common.management.commands.backfill_unit_preferences import UNIT_SYSTEM_TO_PAIR
 from engine.enums import HeightUnit, UnitSystem, WeightUnit
 from onboarding import repository, services
+from tests.support import dob_for_age
 
 PROFILE = {
     "sexAtBirth": "FEMALE",
-    "age": 30,
+    "dateOfBirth": dob_for_age(30),
     "weightKg": 68.0,
     "heightCm": 165.0,
     "goal": "LOSE",

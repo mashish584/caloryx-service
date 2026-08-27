@@ -8,8 +8,11 @@ import pytest
 from rest_framework.exceptions import ValidationError
 
 from common.exceptions import AgeBelowMinimumError
+from common.management.commands.backfill_date_of_birth import dob_from_age
+from tests.support import dob_for_age, dob_str
 from onboarding.serializers import (
     DEFAULT_PREFERRED_UNITS,
+    age_from_dob,
     PlanRationaleSerializer,
     ProfileUpsertSerializer,
     serialize_profile,
@@ -18,7 +21,7 @@ from onboarding.serializers import (
 
 VALID = {
     "sexAtBirth": "MALE",
-    "age": 30,
+    "dateOfBirth": dob_str(30),
     "weightKg": 90.0,
     "heightCm": 180.0,
     "targetWeightKg": 82.0,
@@ -63,38 +66,71 @@ def test_unspecified_body_basis_is_rejected_over_the_api():
 def test_age_below_the_minimum_is_blocked_with_a_dedicated_code():
     """§9 - block, don't warn, and give the client its own code to branch on."""
     with pytest.raises(AgeBelowMinimumError) as exc:
-        validated(age=17)
+        validated(dateOfBirth=dob_str(17))
 
     assert exc.value.code == "age_below_minimum"
     assert exc.value.status_code == 422
     assert exc.value.details["minimumAge"] == 18
+    assert exc.value.details["age"] == 17
 
 
-def test_age_can_be_derived_from_a_real_date_of_birth():
-    """§9 asks for a real date entry rather than a Y/N tickbox."""
-    dob = date.today() - timedelta(days=365 * 30 + 8)
-    data = validated(dateOfBirth=dob.isoformat())
-    assert data["age"] == 30
-    assert "dateOfBirth" not in data  # derived, not stored
+def test_the_birth_date_is_kept_not_consumed():
+    """It is the stored value now; age is derived from it on every read."""
+    data = validated(dateOfBirth=dob_str(30))
+    assert data["dateOfBirth"] == dob_for_age(30)
 
 
-def test_date_of_birth_wins_over_a_supplied_age():
-    dob = date.today() - timedelta(days=365 * 45 + 12)
-    assert validated(age=22, dateOfBirth=dob.isoformat())["age"] == 45
-
-
-def test_a_just_under_18_date_of_birth_is_blocked():
-    dob = date.today() - timedelta(days=365 * 17)
-    with pytest.raises(AgeBelowMinimumError):
-        validated(dateOfBirth=dob.isoformat())
-
-
-def test_either_age_or_date_of_birth_must_be_present():
+def test_a_birth_date_is_required():
     payload = dict(VALID)
-    payload.pop("age")
+    payload.pop("dateOfBirth")
     serializer = ProfileUpsertSerializer(data=payload)
-    with pytest.raises(ValidationError):
-        serializer.is_valid(raise_exception=True)
+
+    assert not serializer.is_valid()
+    assert "dateOfBirth" in serializer.errors
+
+
+def test_a_supplied_age_is_ignored():
+    """`age` left the request contract; sending one must not resurrect it."""
+    assert validated(age=99)["dateOfBirth"] == dob_for_age(30)
+
+
+def test_a_future_birth_date_is_a_field_error_not_an_age_error():
+    """It would otherwise derive a negative age and trip the under-18 gate,
+    whose copy makes no sense for a date that has not happened."""
+    serializer = ProfileUpsertSerializer(
+        data=dict(VALID, dateOfBirth=(date.today() + timedelta(days=1)).isoformat())
+    )
+
+    assert not serializer.is_valid()
+    assert "dateOfBirth" in serializer.errors
+
+
+# -- age derivation (§9) ----------------------------------------------------
+
+
+def test_the_exact_eighteenth_birthday_is_allowed():
+    """The boundary the gate turns on - only expressible now a date is the
+    input, where an integer age rounded it away."""
+    assert validated(dateOfBirth=dob_str(18))
+
+
+def test_one_day_short_of_eighteen_is_blocked():
+    just_short = dob_for_age(18) + timedelta(days=1)
+    with pytest.raises(AgeBelowMinimumError):
+        validated(dateOfBirth=just_short.isoformat())
+
+
+def test_a_birthday_later_this_year_has_not_happened_yet():
+    """The tuple comparison in `age_from_dob` exists for exactly this."""
+    today = date(2026, 6, 15)
+    assert age_from_dob(date(1996, 12, 25), today=today) == 29
+    assert age_from_dob(date(1996, 1, 5), today=today) == 30
+    assert age_from_dob(date(1996, 6, 15), today=today) == 30  # birthday today
+
+
+def test_a_leap_day_birth_date_derives_in_a_non_leap_year():
+    assert age_from_dob(date(2000, 2, 29), today=date(2026, 2, 28)) == 25
+    assert age_from_dob(date(2000, 2, 29), today=date(2026, 3, 1)) == 26
 
 
 @pytest.mark.parametrize("weight", [5.0, 900.0])
@@ -203,7 +239,7 @@ def test_serialize_profile_emits_the_nested_pair():
     profile = SimpleNamespace(
         id="p1",
         sexAtBirth="FEMALE",
-        age=30,
+        dateOfBirth=date(1996, 3, 14),
         weightKg=68.0,
         heightCm=165.0,
         targetWeightKg=None,
@@ -218,3 +254,18 @@ def test_serialize_profile_emits_the_nested_pair():
         "weight": "KG",
         "height": "FT_IN",
     }
+
+
+# -- backfill of pre-existing rows ------------------------------------------
+
+
+def test_a_reconstructed_birth_date_derives_back_to_the_stored_age():
+    declared_on = date(2026, 8, 27)
+    assert age_from_dob(dob_from_age(30, declared_on), today=declared_on) == 30
+    assert age_from_dob(dob_from_age(18, declared_on), today=declared_on) == 18
+
+
+def test_a_leap_day_declaration_falls_back_to_the_28th():
+    """29 Feb minus a non-leap number of years has no such date."""
+    assert dob_from_age(25, date(2024, 2, 29)) == date(1999, 2, 28)
+    assert dob_from_age(24, date(2024, 2, 29)) == date(2000, 2, 29)  # leap target

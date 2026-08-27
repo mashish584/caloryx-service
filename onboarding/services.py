@@ -25,6 +25,7 @@ from engine.enums import ActivityLevel
 from . import repository
 from .serializers import (
     DEFAULT_PREFERRED_UNITS,
+    age_from_dob,
     serialize_profile,
     serialize_stored_plan,
 )
@@ -32,10 +33,21 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 
+def _profile_age(profile: Any) -> int:
+    """Age at this moment, derived rather than remembered (§9).
+
+    Falls back to the legacy `age` column for rows written before `dateOfBirth`
+    existed; `backfill_date_of_birth` clears those, and the fallback goes with
+    the column.
+    """
+    dob = getattr(profile, "dateOfBirth", None)
+    return age_from_dob(dob) if dob is not None else profile.age
+
+
 def _to_plan_input(profile: Any) -> PlanInput:
     return PlanInput(
         sex_at_birth=SexAtBirth(profile.sexAtBirth),
-        age=profile.age,
+        age=_profile_age(profile),
         weight_kg=profile.weightKg,
         height_cm=profile.heightCm,
         goal=Goal(profile.goal),
