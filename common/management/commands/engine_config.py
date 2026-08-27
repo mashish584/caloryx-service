@@ -18,6 +18,7 @@ from django.core.management.base import BaseCommand, CommandError
 from common.db import get_client
 from engine.config import COLUMN_TO_FIELD, DEFAULT_CONFIG, config_from_row
 from onboarding.repository import invalidate_engine_config_cache
+from onboarding.serializers import validation_bounds
 
 _INT_COLUMNS = {
     "loseAdjustmentKcal",
@@ -71,7 +72,9 @@ class Command(BaseCommand):
             config = config_from_row(row) if row else DEFAULT_CONFIG
             source = "database row '{}'".format(row.name) if row else "compiled defaults"
             self.stdout.write("source: {}".format(source))
-            self.stdout.write(json.dumps(config.to_public_dict(), indent=2))
+            self.stdout.write(
+                json.dumps(config.to_public_dict(validation_bounds()), indent=2)
+            )
             return
 
         updates: Dict[str, Any] = {}
@@ -111,4 +114,8 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS("activated config {!r}".format(name)))
 
         invalidate_engine_config_cache()
-        self.stdout.write(json.dumps(config_from_row(row).to_public_dict(), indent=2))
+        self.stdout.write(
+            json.dumps(
+                config_from_row(row).to_public_dict(validation_bounds()), indent=2
+            )
+        )

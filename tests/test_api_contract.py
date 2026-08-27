@@ -52,6 +52,11 @@ def test_engine_config_is_public_so_the_client_preview_can_match(client):
         "fiberGPer1000Kcal": 15.0,
     }
     assert body["safetyFloorsKcal"] == {"MALE": 1500, "FEMALE": 1200, "UNSPECIFIED": 1500}
+    # §9 - the bounds the API rejects on ship alongside the tuning constants, so
+    # the client can stop a bad value at the field. See tests/test_config_bounds.py.
+    assert body["validation"]["age"] == {"min": 18, "max": 100}
+    assert body["validation"]["weightKg"]["max"] == 500.0
+    assert body["validation"]["heightCm"]["softMin"] == 130.0
 
 
 def test_health_does_not_touch_the_database(client):

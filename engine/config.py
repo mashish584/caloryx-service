@@ -13,6 +13,7 @@ service later, per PRD §8).
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Mapping, Optional
 
@@ -77,10 +78,19 @@ class EngineConfig:
             SexAtBirth.UNSPECIFIED: self.floor_unspecified_kcal,
         }[sex]
 
-    def to_public_dict(self) -> Dict[str, Any]:
+    def to_public_dict(
+        self, validation: Optional[Mapping[str, Any]] = None
+    ) -> Dict[str, Any]:
         """Shape handed to the client so its optimistic preview (§5.5) uses the
-        same constants the server will. Never include anything secret here."""
-        return {
+        same constants the server will. Never include anything secret here.
+
+        `validation` carries the input bounds the API enforces (§9). They are
+        injected rather than read here because they live in Django settings and
+        the onboarding serializers, and this module stays free of both - see the
+        purity note in the module docstring. Omitted when not supplied, so the
+        engine's own tests can call this with no Django context.
+        """
+        payload: Dict[str, Any] = {
             "configName": self.name,
             "goalAdjustmentsKcal": {
                 Goal.LOSE.value: self.lose_adjustment_kcal,
@@ -103,6 +113,12 @@ class EngineConfig:
             "targetRoundingKcal": self.target_rounding_kcal,
             "kcalPerKgBodyMass": self.kcal_per_kg_body_mass,
         }
+        if validation is not None:
+            # Deep, not `dict(...)`: the ranges are nested one level, and a
+            # shallow copy would leave the caller holding a handle into a payload
+            # that may well be cached.
+            payload["validation"] = deepcopy(dict(validation))
+        return payload
 
 
 DEFAULT_CONFIG = EngineConfig()

@@ -13,6 +13,7 @@ from django.conf import settings
 from rest_framework import serializers
 
 from common.exceptions import AgeBelowMinimumError
+from engine.advisories import SOFT_HEIGHT_CM, SOFT_WEIGHT_KG
 from engine.enums import ActivityLevel, Goal, HeightUnit, SexAtBirth, WeightUnit
 
 # Hard physiological bounds. Outside these we reject; inside but unusual is a
@@ -23,6 +24,39 @@ HEIGHT_CM_RANGE = (50.0, 272.0)
 # Onboarding v7 requires a binary answer; UNSPECIFIED exists in the schema purely
 # as a defensive engine fallback (§6.4) and is never accepted over the API.
 ONBOARDING_SEX_CHOICES = [SexAtBirth.MALE.value, SexAtBirth.FEMALE.value]
+
+
+def validation_bounds() -> Dict[str, Any]:
+    """What the API rejects, and what it merely warns about (§9).
+
+    Published through GET /onboarding/config so the client can stop a bad value
+    at the field instead of discovering it as a 400 four screens later. It reads
+    the same constants the serializers below enforce, and the age limits straight
+    from settings - those are env-tunable, so a client's hardcoded copy would go
+    stale the moment a market moved them. `tests/test_config_bounds.py` fails if
+    what is advertised here stops matching what is enforced.
+
+    Soft bounds do not reject: inside the hard caps but outside these, the API
+    accepts the value and returns an advisory (engine/advisories.py).
+    """
+    return {
+        "age": {
+            "min": settings.MINIMUM_AGE_YEARS,
+            "max": settings.MAXIMUM_AGE_YEARS,
+        },
+        "weightKg": {
+            "min": WEIGHT_KG_RANGE[0],
+            "max": WEIGHT_KG_RANGE[1],
+            "softMin": SOFT_WEIGHT_KG[0],
+            "softMax": SOFT_WEIGHT_KG[1],
+        },
+        "heightCm": {
+            "min": HEIGHT_CM_RANGE[0],
+            "max": HEIGHT_CM_RANGE[1],
+            "softMin": SOFT_HEIGHT_CM[0],
+            "softMax": SOFT_HEIGHT_CM[1],
+        },
+    }
 
 
 def _age_from_dob(dob: date, today: Optional[date] = None) -> int:
@@ -245,6 +279,32 @@ class EngineConfigMacrosSerializer(serializers.Serializer):
     fiberGPer1000Kcal = serializers.FloatField()
 
 
+class AgeBoundsSerializer(serializers.Serializer):
+    """Whole years. Below `min` the API raises `age_below_minimum` with its own
+    error code rather than a field error, so the client can route to the
+    dedicated screen (§9)."""
+
+    min = serializers.IntegerField()
+    max = serializers.IntegerField()
+
+
+class MeasurementBoundsSerializer(serializers.Serializer):
+    """`min`/`max` reject; `softMin`/`softMax` only trigger an advisory."""
+
+    min = serializers.FloatField()
+    max = serializers.FloatField()
+    softMin = serializers.FloatField()
+    softMax = serializers.FloatField()
+
+
+class ValidationBoundsSerializer(serializers.Serializer):
+    """See `validation_bounds`. Metric, matching the wire format."""
+
+    age = AgeBoundsSerializer()
+    weightKg = MeasurementBoundsSerializer()
+    heightCm = MeasurementBoundsSerializer()
+
+
 class EngineConfigResponseSerializer(serializers.Serializer):
     """GET /onboarding/config. See `EngineConfig.to_public_dict`.
 
@@ -259,6 +319,7 @@ class EngineConfigResponseSerializer(serializers.Serializer):
     safetyFloorsKcal = serializers.DictField(child=serializers.IntegerField())
     targetRoundingKcal = serializers.IntegerField()
     kcalPerKgBodyMass = serializers.FloatField()
+    validation = ValidationBoundsSerializer()
 
 
 def serialize_stored_plan(plan: Any) -> Dict[str, Any]:

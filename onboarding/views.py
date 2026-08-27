@@ -20,6 +20,7 @@ from .serializers import (
     ProfileUpsertSerializer,
     StoredPlanResponseSerializer,
     serialize_profile,
+    validation_bounds,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,4 +106,5 @@ class EngineConfigView(APIView):
 
     @extend_schema(responses={200: EngineConfigResponseSerializer})
     def get(self, request):
-        return Response(repository.get_active_engine_config().to_public_dict())
+        config = repository.get_active_engine_config()
+        return Response(config.to_public_dict(validation_bounds()))
