@@ -238,24 +238,13 @@ class PlanRationaleSerializer(serializers.Serializer):
 
 
 class PlanResponseSerializer(serializers.Serializer):
-    """POST /onboarding/plan."""
+    """POST and GET /onboarding/plan - one shape for both.
 
-    calories = serializers.IntegerField()
-    macros = MacrosSerializer()
-    macroEnergyKcal = MacroEnergyKcalSerializer()
-    rationale = PlanRationaleSerializer()
-    isEstimate = serializers.BooleanField()
-    bmr = serializers.FloatField()
-    tdee = serializers.FloatField()
-    advisories = AdvisorySerializer(many=True)
-
-
-class StoredPlanResponseSerializer(serializers.Serializer):
-    """GET /onboarding/plan: the POST shape plus `computedAt`.
-
-    `rationale` is deliberately the *same* serializer the POST response uses. The
-    two drifted once (the stored one was missing the clamp fields), which cost a
-    resumed plan its §6.2 explanation; sharing the schema makes that impossible.
+    They were separate once and drifted twice: the stored form first lost the
+    §6.2 clamp fields, which cost a resumed plan its explanation, then lagged
+    behind on `computedAt`. A single serializer makes a third divergence
+    impossible, and lets a client cache the POST result and age it without a
+    follow-up GET.
     """
 
     calories = serializers.IntegerField()

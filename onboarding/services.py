@@ -108,7 +108,7 @@ def generate_plan(user_id: str) -> Dict[str, Any]:
 
     config = repository.get_active_engine_config()
     result: PlanResult = calculate_plan(_to_plan_input(profile), config)
-    repository.upsert_plan(profile.id, result)
+    plan = repository.upsert_plan(profile.id, result)
 
     advisories = plan_advisories(
         profile, clamped=result.clamped, safety_floor_kcal=result.safety_floor_kcal
@@ -125,6 +125,10 @@ def generate_plan(user_id: str) -> Dict[str, Any]:
     )
 
     response = result.to_response()
+    # Taken from the persisted row rather than a fresh _now(): a client caching
+    # this payload ages it against the same instant the database holds, and the
+    # POST and GET shapes stay identical. The engine has no clock of its own.
+    response["computedAt"] = plan.computedAt.isoformat()
     response["advisories"] = [a.to_dict() for a in advisories]
     return response
 

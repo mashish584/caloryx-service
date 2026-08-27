@@ -15,7 +15,7 @@ import pytest
 
 from engine import DEFAULT_CONFIG
 from onboarding import repository, services
-from onboarding.serializers import PlanRationaleSerializer
+from onboarding.serializers import PlanRationaleSerializer, PlanResponseSerializer
 
 # The §6.2 fixture from test_engine.py: TDEE 1,111.8, a -400 deficit lands at
 # 711.8, and the female floor pulls the target back up to 1,200.
@@ -28,6 +28,8 @@ CLAMPED = {
     "goal": "LOSE",
     "activityLevel": "SEDENTARY",
 }
+COMPUTED_AT = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+
 UNCLAMPED = {
     "sexAtBirth": "MALE",
     "age": 30,
@@ -61,7 +63,7 @@ def stored_plan_from(response, **overrides):
         "weeklyChangeKg": rationale["weeklyChangeKg"],
         "safetyFloorKcal": rationale["safetyFloorKcal"],
         "requestedAdjustmentKcal": rationale["requestedAdjustmentKcal"],
-        "computedAt": datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc),
+        "computedAt": COMPUTED_AT,
     }
     row.update(overrides)
     return SimpleNamespace(id="plan-1", **row)
@@ -78,8 +80,10 @@ def seam(monkeypatch):
     )
 
     def upsert_plan(profile_id, result):
+        # Returns a row, not the PlanResult: `generate_plan` reads `computedAt`
+        # off what was persisted rather than re-deriving it.
         state.written = result
-        return result
+        return SimpleNamespace(id="plan-1", computedAt=COMPUTED_AT)
 
     monkeypatch.setattr(repository, "upsert_plan", upsert_plan)
     return state
@@ -118,9 +122,9 @@ def test_compute_and_resume_describe_the_plan_identically(seam):
 
     assert resumed["rationale"] == computed["rationale"]
     assert resumed["advisories"] == computed["advisories"]
-    # GET adds computedAt and is otherwise the POST payload.
-    assert set(resumed) - set(computed) == {"computedAt"}
-    assert not set(computed) - set(resumed)
+    # Not merely the same keys - the same payload. Computing a plan and resuming
+    # one are indistinguishable to the client, `computedAt` included.
+    assert resumed == computed
 
 
 def test_the_stored_rationale_matches_the_declared_schema(seam):
@@ -176,3 +180,34 @@ def test_a_row_predating_the_columns_is_healed_on_read(seam):
 def test_fetch_plan_returns_none_before_a_plan_exists(seam):
     seam.profile = make_profile(CLAMPED)
     assert services.fetch_plan("user-1") is None
+
+
+# -- computedAt (§8) --------------------------------------------------------
+
+
+def test_computing_a_plan_returns_its_timestamp(seam):
+    """Without this a client caching the POST response cannot tell a fresh plan
+    from a stale one without a follow-up GET it does not otherwise need."""
+    seam.profile = make_profile(CLAMPED)
+    computed = services.generate_plan("user-1")
+
+    assert computed["computedAt"] == COMPUTED_AT.isoformat()
+
+
+def test_the_timestamp_is_the_persisted_one_not_a_fresh_clock_read(seam):
+    """Re-deriving it in the service would drift from the row by however long
+    the write took."""
+    seam.profile = make_profile(CLAMPED)
+    computed = services.generate_plan("user-1")
+
+    seam.profile = make_profile(CLAMPED, plan=stored_plan_from(computed))
+    assert services.fetch_plan("user-1")["computedAt"] == computed["computedAt"]
+
+
+def test_the_plan_payload_matches_the_declared_schema(seam):
+    """One serializer now describes both operations; this fails if a field is
+    declared but never emitted."""
+    seam.profile = make_profile(CLAMPED)
+    computed = services.generate_plan("user-1")
+
+    assert set(computed) == set(PlanResponseSerializer().fields)

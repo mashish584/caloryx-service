@@ -18,7 +18,6 @@ from .serializers import (
     ProfileStateResponseSerializer,
     ProfileUpsertResponseSerializer,
     ProfileUpsertSerializer,
-    StoredPlanResponseSerializer,
     serialize_profile,
     validation_bounds,
 )
@@ -63,7 +62,7 @@ class PlanView(APIView):
 
     @extend_schema(
         responses={
-            200: StoredPlanResponseSerializer,
+            200: PlanResponseSerializer,
             404: OpenApiResponse(
                 ErrorResponseSerializer, description="No plan has been generated yet."
             ),
