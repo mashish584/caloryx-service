@@ -1,4 +1,9 @@
-"""Domain enums. Values match the Prisma enums exactly (PRD §7)."""
+"""Domain enums.
+
+Values of the persisted enums match the Prisma enums exactly (PRD §7). The
+advisory enums at the bottom are wire-only - nothing stores them - so they keep
+the lowercase form the client already receives.
+"""
 from __future__ import annotations
 
 from enum import Enum
@@ -59,3 +64,37 @@ class HeightUnit(StrEnum):
 class AuthProvider(StrEnum):
     GUEST = "GUEST"
     CLERK = "CLERK"
+
+
+class AdvisorySeverity(StrEnum):
+    """How prominently the client renders an advisory. Never blocking (§9)."""
+
+    INFO = "info"
+    WARNING = "warning"
+
+
+class AdvisoryCode(StrEnum):
+    """What the advisory is about. The client switches on this for copy and for
+    analytics, so adding a member is a contract change."""
+
+    WEIGHT_OUT_OF_TYPICAL_RANGE = "weight_out_of_typical_range"
+    HEIGHT_OUT_OF_TYPICAL_RANGE = "height_out_of_typical_range"
+    GOAL_TARGET_WEIGHT_CONFLICT = "goal_target_weight_conflict"
+    TARGET_WEIGHT_BELOW_HEALTHY_BMI = "target_weight_below_healthy_bmi"
+    CALORIES_CLAMPED_TO_FLOOR = "calories_clamped_to_floor"
+
+
+class AdvisoryField(StrEnum):
+    """Which request field the hint attaches to. Values are `ProfileUpsert` field
+    names - one that is not orphans the message beside no input at all."""
+
+    WEIGHT_KG = "weightKg"
+    HEIGHT_CM = "heightCm"
+    TARGET_WEIGHT_KG = "targetWeightKg"
+
+
+# drf-spectacular matches ENUM_NAME_OVERRIDES against the exact choice list a
+# field declares, so expose the values in the same form the serializers use.
+ADVISORY_SEVERITY_CHOICES = [s.value for s in AdvisorySeverity]
+ADVISORY_CODE_CHOICES = [c.value for c in AdvisoryCode]
+ADVISORY_FIELD_CHOICES = [f.value for f in AdvisoryField]

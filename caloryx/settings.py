@@ -121,6 +121,12 @@ SPECTACULAR_SETTINGS = {
     "ENUM_NAME_OVERRIDES": {
         "WeightUnitEnum": "engine.enums.WeightUnit",
         "HeightUnitEnum": "engine.enums.HeightUnit",
+        # Advisory fields are named `code` / `field` / `severity`, so the derived
+        # names would be `CodeEnum` and `FieldEnum` - meaningless beside the
+        # error codes in a generated client.
+        "AdvisoryCodeEnum": "engine.enums.ADVISORY_CODE_CHOICES",
+        "AdvisoryFieldEnum": "engine.enums.ADVISORY_FIELD_CHOICES",
+        "AdvisorySeverityEnum": "engine.enums.ADVISORY_SEVERITY_CHOICES",
     },
 }
 

@@ -11,7 +11,7 @@ import dataclasses
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
-from .enums import Goal
+from .enums import AdvisoryCode, AdvisoryField, AdvisorySeverity, Goal
 
 # Physiological soft bounds. Outside these we warn but still accept; the hard
 # caps that *do* reject live in the serializers (onboarding/serializers.py).
@@ -24,10 +24,10 @@ UNDERWEIGHT_BMI = 18.5
 
 @dataclass(frozen=True)
 class Advisory:
-    code: str
+    code: AdvisoryCode
     message: str
-    field: Optional[str] = None
-    severity: str = "info"  # info | warning
+    field: Optional[AdvisoryField] = None
+    severity: AdvisorySeverity = AdvisorySeverity.INFO
     # Present when the PRD asks for a one-tap choice; each option is
     # {"id": ..., "label": ..., "patch": {...}} where `patch` is the request body
     # the client would resend if the user picks it.
@@ -53,9 +53,9 @@ def _goal_vs_target_weight(
     if goal is Goal.LOSE and target_weight_kg >= weight_kg:
         return [
             Advisory(
-                code="goal_target_weight_conflict",
-                field="targetWeightKg",
-                severity="warning",
+                code=AdvisoryCode.GOAL_TARGET_WEIGHT_CONFLICT,
+                field=AdvisoryField.TARGET_WEIGHT_KG,
+                severity=AdvisorySeverity.WARNING,
                 message=(
                     "Your goal is to lose weight, but your target weight is at or "
                     "above your current weight."
@@ -74,9 +74,9 @@ def _goal_vs_target_weight(
     if goal is Goal.GAIN and target_weight_kg <= weight_kg:
         return [
             Advisory(
-                code="goal_target_weight_conflict",
-                field="targetWeightKg",
-                severity="warning",
+                code=AdvisoryCode.GOAL_TARGET_WEIGHT_CONFLICT,
+                field=AdvisoryField.TARGET_WEIGHT_KG,
+                severity=AdvisorySeverity.WARNING,
                 message=(
                     "Your goal is to gain weight, but your target weight is at or "
                     "below your current weight."
@@ -106,9 +106,9 @@ def _wellbeing(
         return []
     return [
         Advisory(
-            code="target_weight_below_healthy_bmi",
-            field="targetWeightKg",
-            severity="warning",
+            code=AdvisoryCode.TARGET_WEIGHT_BELOW_HEALTHY_BMI,
+            field=AdvisoryField.TARGET_WEIGHT_KG,
+            severity=AdvisorySeverity.WARNING,
             message=(
                 "That target weight falls below the healthy range for your height. "
                 "We'd rather not build an aggressive plan around it - it's worth "
@@ -124,9 +124,9 @@ def _plausibility(weight_kg: float, height_cm: float) -> List[Advisory]:
     if not low <= weight_kg <= high:
         out.append(
             Advisory(
-                code="weight_out_of_typical_range",
-                field="weightKg",
-                severity="warning",
+                code=AdvisoryCode.WEIGHT_OUT_OF_TYPICAL_RANGE,
+                field=AdvisoryField.WEIGHT_KG,
+                severity=AdvisorySeverity.WARNING,
                 message="Double-check your weight - that's outside the usual range.",
             )
         )
@@ -134,9 +134,9 @@ def _plausibility(weight_kg: float, height_cm: float) -> List[Advisory]:
     if not low <= height_cm <= high:
         out.append(
             Advisory(
-                code="height_out_of_typical_range",
-                field="heightCm",
-                severity="warning",
+                code=AdvisoryCode.HEIGHT_OUT_OF_TYPICAL_RANGE,
+                field=AdvisoryField.HEIGHT_CM,
+                severity=AdvisorySeverity.WARNING,
                 message="Double-check your height - that's outside the usual range.",
             )
         )
@@ -160,8 +160,8 @@ def evaluate_profile(
 def clamped_advisory(floor_kcal: int) -> Advisory:
     """Supportive message shown when the target was clamped up to the floor (§6.2)."""
     return Advisory(
-        code="calories_clamped_to_floor",
-        severity="info",
+        code=AdvisoryCode.CALORIES_CLAMPED_TO_FLOOR,
+        severity=AdvisorySeverity.INFO,
         message=(
             "We've set your daily target to {} kcal - the lowest we'll recommend "
             "without medical supervision. Eating less than this makes it hard to "

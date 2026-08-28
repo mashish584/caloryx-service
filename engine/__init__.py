@@ -18,6 +18,9 @@ from .calculator import (
 from .config import DEFAULT_CONFIG, EngineConfig, config_from_row
 from .enums import (
     ActivityLevel,
+    AdvisoryCode,
+    AdvisoryField,
+    AdvisorySeverity,
     AuthProvider,
     Goal,
     HeightUnit,
@@ -29,6 +32,9 @@ from .enums import (
 __all__ = [
     "Advisory",
     "ActivityLevel",
+    "AdvisoryCode",
+    "AdvisoryField",
+    "AdvisorySeverity",
     "AuthProvider",
     "DEFAULT_CONFIG",
     "EngineConfig",

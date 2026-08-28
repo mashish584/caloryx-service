@@ -14,7 +14,16 @@ from rest_framework import serializers
 
 from common.exceptions import AgeBelowMinimumError
 from engine.advisories import SOFT_HEIGHT_CM, SOFT_WEIGHT_KG
-from engine.enums import ActivityLevel, Goal, HeightUnit, SexAtBirth, WeightUnit
+from engine.enums import (
+    ActivityLevel,
+    AdvisoryCode,
+    AdvisoryField,
+    AdvisorySeverity,
+    Goal,
+    HeightUnit,
+    SexAtBirth,
+    WeightUnit,
+)
 
 # Hard physiological bounds. Outside these we reject; inside but unusual is a
 # warning only (engine.advisories.SOFT_*).
@@ -183,19 +192,54 @@ def serialize_profile(profile: Any) -> Dict[str, Any]:
     }
 
 
+class AdvisoryPatchSerializer(serializers.Serializer):
+    """The request-body fragment a one-tap option would resend (§9).
+
+    Every field is optional and every name is a real `ProfileUpsertSerializer`
+    field: the client merges this into the upsert body and resends it, so a key
+    the request does not accept would produce a 400 the user cannot act on.
+    `tests/test_advisories.py` enforces that subset relation.
+
+    Only `goal` is produced today. The wider shape is deliberate - it is the
+    stable contract, so a future advisory that corrects a measurement is not a
+    breaking type change for generated clients.
+
+    Scoped to what a hint could plausibly suggest changing. `sexAtBirth` and
+    `dateOfBirth` are facts rather than choices, and `preferredUnits` is a
+    display setting - no advisory corrects any of the three.
+    """
+
+    weightKg = serializers.FloatField(required=False)
+    heightCm = serializers.FloatField(required=False)
+    targetWeightKg = serializers.FloatField(required=False, allow_null=True)
+    goal = serializers.ChoiceField(choices=[g.value for g in Goal], required=False)
+    activityLevel = serializers.ChoiceField(
+        choices=[a.value for a in ActivityLevel], required=False
+    )
+
+
 class AdvisoryOptionSerializer(serializers.Serializer):
-    """One-tap correction offered by an advisory (see engine.advisories)."""
+    """One-tap correction offered by an advisory (see engine.advisories).
+
+    `id` is deliberately a free string: the client renders `label` and applies
+    `patch`, so it serves only as a list key and an analytics label.
+    """
 
     id = serializers.CharField()
     label = serializers.CharField()
-    patch = serializers.DictField()
+    patch = AdvisoryPatchSerializer()
 
 
 class AdvisorySerializer(serializers.Serializer):
-    code = serializers.CharField()
+    """A non-blocking hint (§9). The client switches on `code` for copy, styles
+    by `severity`, and attaches the message to the input named by `field`."""
+
+    code = serializers.ChoiceField(choices=[c.value for c in AdvisoryCode])
     message = serializers.CharField()
-    field = serializers.CharField(required=False)
-    severity = serializers.CharField()
+    field = serializers.ChoiceField(
+        choices=[f.value for f in AdvisoryField], required=False
+    )
+    severity = serializers.ChoiceField(choices=[s.value for s in AdvisorySeverity])
     options = AdvisoryOptionSerializer(many=True, required=False)
 
 
