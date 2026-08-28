@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import logging
 
-from drf_spectacular.utils import OpenApiResponse, extend_schema
+from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from common.serializers import ErrorResponseSerializer
+from common.exceptions import NotFoundError
+from common.schema import (
+    SERVER_ERROR,
+    UNAUTHORIZED,
+    VALIDATION_ERROR,
+    error_response,
+)
 
 from . import repository, services
 from .serializers import (
@@ -30,7 +36,17 @@ class ProfileView(APIView):
 
     @extend_schema(
         request=ProfileUpsertSerializer,
-        responses={200: ProfileUpsertResponseSerializer},
+        responses={
+            200: ProfileUpsertResponseSerializer,
+            400: VALIDATION_ERROR,
+            401: UNAUTHORIZED,
+            422: error_response(
+                "Under the minimum age (§9). Render the dedicated screen for this "
+                "one, not a field error - it blocks account creation.",
+                "age_below_minimum",
+            ),
+            500: SERVER_ERROR,
+        },
     )
     def post(self, request):
         serializer = ProfileUpsertSerializer(data=request.data)
@@ -38,7 +54,13 @@ class ProfileView(APIView):
         payload = services.save_profile(request.user.user_id, serializer.validated_data)
         return Response(payload, status=status.HTTP_200_OK)
 
-    @extend_schema(responses={200: ProfileStateResponseSerializer})
+    @extend_schema(
+        responses={
+            200: ProfileStateResponseSerializer,
+            401: UNAUTHORIZED,
+            500: SERVER_ERROR,
+        }
+    )
     def get(self, request):
         profile = repository.get_profile(request.user.user_id)
         if profile is None:
@@ -56,29 +78,43 @@ class PlanView(APIView):
     """POST computes and persists the authoritative plan; GET returns the stored
     one for the plan screen and for resuming a half-finished flow (PRD §4)."""
 
-    @extend_schema(request=None, responses={200: PlanResponseSerializer})
+    @extend_schema(
+        request=None,
+        responses={
+            200: PlanResponseSerializer,
+            401: UNAUTHORIZED,
+            409: error_response(
+                "No profile yet - send the user back to the profile step.",
+                "profile_required",
+            ),
+            500: SERVER_ERROR,
+        },
+    )
     def post(self, request):
         return Response(services.generate_plan(request.user.user_id))
 
     @extend_schema(
         responses={
             200: PlanResponseSerializer,
-            404: OpenApiResponse(
-                ErrorResponseSerializer, description="No plan has been generated yet."
+            401: UNAUTHORIZED,
+            404: error_response(
+                "No plan has been generated yet.", "plan_not_found"
             ),
+            409: error_response(
+                "No profile yet - send the user back to the profile step.",
+                "profile_required",
+            ),
+            500: SERVER_ERROR,
         }
     )
     def get(self, request):
         plan = services.fetch_plan(request.user.user_id)
         if plan is None:
-            return Response(
-                {
-                    "error": {
-                        "code": "plan_not_found",
-                        "message": "No plan has been generated yet.",
-                    }
-                },
-                status=status.HTTP_404_NOT_FOUND,
+            # Raised rather than assembled inline: `api_exception_handler` is
+            # what attaches `requestId`, and this used to be the one error in
+            # the service without one.
+            raise NotFoundError(
+                "No plan has been generated yet.", code="plan_not_found"
             )
         return Response(plan)
 
@@ -86,7 +122,20 @@ class PlanView(APIView):
 class CompleteView(APIView):
     """POST /api/v1/onboarding/complete - stamp `onboardedAt` and finalise."""
 
-    @extend_schema(request=None, responses={200: CompleteResponseSerializer})
+    @extend_schema(
+        request=None,
+        responses={
+            200: CompleteResponseSerializer,
+            401: UNAUTHORIZED,
+            409: error_response(
+                "A prior step is missing. Branch on `code`, not the status: both "
+                "outcomes are 409 and they route to different screens.",
+                "profile_required",
+                "plan_required",
+            ),
+            500: SERVER_ERROR,
+        },
+    )
     def post(self, request):
         return Response(services.complete_onboarding(request.user.user_id))
 
@@ -103,7 +152,9 @@ class EngineConfigView(APIView):
     authentication_classes = []
     permission_classes = [AllowAny]
 
-    @extend_schema(responses={200: EngineConfigResponseSerializer})
+    @extend_schema(
+        responses={200: EngineConfigResponseSerializer, 500: SERVER_ERROR}
+    )
     def get(self, request):
         config = repository.get_active_engine_config()
         return Response(config.to_public_dict(validation_bounds()))

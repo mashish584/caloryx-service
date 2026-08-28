@@ -10,6 +10,14 @@ from __future__ import annotations
 import logging
 
 from drf_spectacular.utils import extend_schema
+
+from common.schema import (
+    FORBIDDEN,
+    SERVER_ERROR,
+    THROTTLED,
+    UNAUTHORIZED,
+    error_response,
+)
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
@@ -45,7 +53,14 @@ class GuestSessionView(APIView):
     permission_classes = [AllowAny]
     throttle_scope_guest_create = True
 
-    @extend_schema(request=None, responses={201: GuestSessionResponseSerializer})
+    @extend_schema(
+        request=None,
+        responses={
+            201: GuestSessionResponseSerializer,
+            429: THROTTLED,
+            500: SERVER_ERROR,
+        },
+    )
     def post(self, request):
         user = repository.create_guest_user()
         token = issue_guest_token(user.id)
@@ -68,11 +83,24 @@ class SessionView(APIView):
     refreshes the Clerk-backed user row. GET is the cheap resume check.
     """
 
-    @extend_schema(responses={200: SessionResponseSerializer})
+    @extend_schema(
+        responses={
+            200: SessionResponseSerializer,
+            401: UNAUTHORIZED,
+            500: SERVER_ERROR,
+        }
+    )
     def get(self, request):
         return self._session_response(request)
 
-    @extend_schema(request=None, responses={200: SessionResponseSerializer})
+    @extend_schema(
+        request=None,
+        responses={
+            200: SessionResponseSerializer,
+            401: UNAUTHORIZED,
+            500: SERVER_ERROR,
+        },
+    )
     def post(self, request):
         return self._session_response(request)
 
@@ -97,7 +125,31 @@ class ClaimGuestView(APIView):
     permission_classes = [IsRegisteredActor]
 
     @extend_schema(
-        request=ClaimGuestRequestSerializer, responses={200: ClaimResponseSerializer}
+        request=ClaimGuestRequestSerializer,
+        responses={
+            200: ClaimResponseSerializer,
+            400: error_response(
+                "Malformed request, or a guest token that does not verify.",
+                "validation_error",
+                "invalid_guest_token",
+            ),
+            401: UNAUTHORIZED,
+            403: FORBIDDEN,
+            404: error_response(
+                "Either side of the claim is missing.",
+                "guest_not_found",
+                "user_not_found",
+            ),
+            409: error_response(
+                "The claim cannot proceed. Branch on `code`: the session was not "
+                "a guest, was already claimed, or the target account already has "
+                "onboarding data that would be overwritten.",
+                "not_a_guest_session",
+                "guest_already_claimed",
+                "claim_conflict",
+            ),
+            500: SERVER_ERROR,
+        },
     )
     def post(self, request):
         serializer = ClaimGuestRequestSerializer(data=request.data)
