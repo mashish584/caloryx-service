@@ -201,13 +201,14 @@ Notable codes: `age_below_minimum` (422), `profile_required` (409),
 
 Onboarding speed and completion are core metrics, so §9's edge cases come back
 as **non-blocking** advisories rather than errors. Each carries a `code`, a
-`message`, a `severity`, and — where the PRD asks for a one-tap correction — the
-`options` themselves, so the user chooses and the server never silently
-auto-corrects:
+`message`, and a `severity`. An advisory may also carry one-tap `options` so the
+user chooses and the server never silently auto-corrects; none does today —
+`goal_target_weight_conflict` was the only one that ever did, and deriving the
+goal from the target weight made it impossible. The `options` shape stays in the
+contract for the next advisory that needs it.
 
 | Code | Trigger |
 |---|---|
-| `goal_target_weight_conflict` | "Lose" with a target ≥ current (or the reverse) — carries Keep / Switch options |
 | `target_weight_below_healthy_bmi` | Wellbeing safeguard: target implies BMI < 18.5 |
 | `calories_clamped_to_floor` | Target was clamped up to the safety floor |
 | `weight_out_of_typical_range` · `height_out_of_typical_range` | Plausible but unusual input |
@@ -301,8 +302,13 @@ stays explainable after a retune.
 - **Resume state** comes from `/auth/session`: `hasProfile`, `hasPlan`,
   `onboardedAt` map onto the last incomplete step (§4).
 - **Age**: send `dateOfBirth` and let the server derive the age (§9 asks for a
-  real date entry). `age` is still accepted for offline-computed submissions;
-  when both arrive, the date wins.
+  real date entry). `age` is not a request field — a submitted one is discarded.
+- **Goal**: do not send `goal`. It is derived from `targetWeightKg` against
+  `weightKg` and returned on the profile. `targetWeightKg` is therefore
+  **required**. A target within `maintainBandKg` of the current weight reads as
+  `MAINTAIN`; outside it, the direction picks `LOSE` or `GAIN`. Derive it the
+  same way for the optimistic preview, reading the band from `/onboarding/config`
+  rather than hardcoding it.
 - **Fetch `/onboarding/config`** and drive the client preview from it, rather
   than duplicating the constants in the app (§10).
 

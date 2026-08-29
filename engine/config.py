@@ -31,6 +31,11 @@ class EngineConfig:
     lose_adjustment_kcal: int = -400
     gain_adjustment_kcal: int = 400
 
+    # Half-width of the MAINTAIN band, kg (§5.3). The goal is derived from the
+    # target weight rather than asked for, so this is what separates "hold
+    # steady" from a 400 kcal adjustment - see `goal_for`.
+    maintain_band_kg: float = 1.0
+
     # TDEE activity multipliers (§5.4).
     sedentary_multiplier: float = 1.2
     light_multiplier: float = 1.375
@@ -54,6 +59,20 @@ class EngineConfig:
 
     # Energy density of body mass, used for the "~0.4 kg / week" rationale (§6.5).
     kcal_per_kg_body_mass: float = 7700.0
+
+    def goal_for(self, weight_kg: float, target_weight_kg: float) -> Goal:
+        """Derive the goal from the two weights (§5.3).
+
+        The goal screen asked for an answer the target weight already carries,
+        so the direction of the target is now the single source of truth. The
+        band matters in both directions: someone who wants to hold steady should
+        not have to type their current weight to the decimal, and a difference
+        the size of a rounding error must not silently buy a 400 kcal deficit.
+        """
+        delta = target_weight_kg - weight_kg
+        if abs(delta) <= self.maintain_band_kg:
+            return Goal.MAINTAIN
+        return Goal.LOSE if delta < 0 else Goal.GAIN
 
     def adjustment_for(self, goal: Goal) -> int:
         if goal is Goal.LOSE:
@@ -97,6 +116,10 @@ class EngineConfig:
                 Goal.MAINTAIN.value: 0,
                 Goal.GAIN.value: self.gain_adjustment_kcal,
             },
+            # The client derives the goal the same way the server does (§5.5),
+            # so the threshold has to travel with the adjustments it selects
+            # between - a hardcoded copy would drift the moment this is retuned.
+            "maintainBandKg": self.maintain_band_kg,
             "activityMultipliers": {
                 level.value: self.multiplier_for(level) for level in ActivityLevel
             },
@@ -129,6 +152,7 @@ COLUMN_TO_FIELD = {
     "name": "name",
     "loseAdjustmentKcal": "lose_adjustment_kcal",
     "gainAdjustmentKcal": "gain_adjustment_kcal",
+    "maintainBandKg": "maintain_band_kg",
     "sedentaryMultiplier": "sedentary_multiplier",
     "lightMultiplier": "light_multiplier",
     "moderateMultiplier": "moderate_multiplier",

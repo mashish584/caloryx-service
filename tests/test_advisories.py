@@ -9,7 +9,6 @@ from engine import (
     AdvisoryCode,
     AdvisoryField,
     AdvisorySeverity,
-    Goal,
     bmi,
     clamped_advisory,
     evaluate_profile,
@@ -25,47 +24,26 @@ def codes(advisories):
     return [a.code for a in advisories]
 
 
-def test_lose_goal_with_a_higher_target_weight_offers_a_one_tap_choice():
-    advisories = evaluate_profile(
-        goal=Goal.LOSE, weight_kg=70.0, height_cm=175.0, target_weight_kg=80.0
-    )
+def test_a_target_weight_in_either_direction_is_unremarkable():
+    """The goal is derived from the target, so no direction is a contradiction.
 
-    assert codes(advisories) == ["goal_target_weight_conflict"]
-    conflict = advisories[0]
-    # Never a silent auto-correct: the user picks.
-    assert [o["id"] for o in conflict.options] == ["keep_goal", "switch_goal"]
-    assert conflict.severity == "warning"
-
-
-def test_gain_goal_with_a_lower_target_weight_conflicts_too():
-    advisories = evaluate_profile(
-        goal=Goal.GAIN, weight_kg=70.0, height_cm=175.0, target_weight_kg=65.0
-    )
-    assert codes(advisories) == ["goal_target_weight_conflict"]
-
-
-def test_equal_target_weight_still_counts_as_a_conflict_for_lose():
-    advisories = evaluate_profile(
-        goal=Goal.LOSE, weight_kg=70.0, height_cm=175.0, target_weight_kg=70.0
-    )
-    assert "goal_target_weight_conflict" in codes(advisories)
-
-
-def test_a_consistent_goal_produces_no_advisories():
-    advisories = evaluate_profile(
-        goal=Goal.LOSE, weight_kg=80.0, height_cm=175.0, target_weight_kg=72.0
-    )
-    assert advisories == []
+    This replaces four tests that asserted a goal could conflict with the target
+    weight. `EngineConfig.goal_for` made the conflict unrepresentable.
+    """
+    assert evaluate_profile(weight_kg=80.0, height_cm=175.0, target_weight_kg=72.0) == []
+    assert evaluate_profile(weight_kg=70.0, height_cm=175.0, target_weight_kg=80.0) == []
+    assert evaluate_profile(weight_kg=70.0, height_cm=175.0, target_weight_kg=70.0) == []
 
 
 def test_omitted_target_weight_is_allowed():
-    """§9 - target weight omitted defaults to 'no target'; nothing is blocked."""
-    assert evaluate_profile(goal=Goal.LOSE, weight_kg=80.0, height_cm=175.0) == []
+    """The upsert now requires a target, but stored rows written before that
+    change have none - `evaluate_profile` still has to cope on the read path."""
+    assert evaluate_profile(weight_kg=80.0, height_cm=175.0) == []
 
 
 def test_target_weight_below_healthy_bmi_triggers_the_wellbeing_safeguard():
     advisories = evaluate_profile(
-        goal=Goal.LOSE, weight_kg=60.0, height_cm=175.0, target_weight_kg=52.0
+        weight_kg=60.0, height_cm=175.0, target_weight_kg=52.0
     )
 
     assert "target_weight_below_healthy_bmi" in codes(advisories)
@@ -76,7 +54,7 @@ def test_target_weight_below_healthy_bmi_triggers_the_wellbeing_safeguard():
 
 
 def test_implausible_but_accepted_values_only_warn():
-    advisories = evaluate_profile(goal=Goal.MAINTAIN, weight_kg=300.0, height_cm=125.0)
+    advisories = evaluate_profile(weight_kg=300.0, height_cm=125.0)
 
     assert codes(advisories) == [
         "weight_out_of_typical_range",
@@ -100,11 +78,9 @@ def test_advisory_dict_drops_empty_fields():
 
 # Every advisory the producers can emit, reached through its triggering input.
 ALL_ADVISORIES = (
-    evaluate_profile(goal=Goal.LOSE, weight_kg=70.0, height_cm=175.0, target_weight_kg=80.0)
-    + evaluate_profile(goal=Goal.GAIN, weight_kg=80.0, height_cm=175.0, target_weight_kg=70.0)
-    + evaluate_profile(goal=Goal.LOSE, weight_kg=300.0, height_cm=125.0, target_weight_kg=40.0)
+    evaluate_profile(weight_kg=300.0, height_cm=125.0, target_weight_kg=40.0)
     # BMI 16.3 at the target, which is what trips the wellbeing safeguard.
-    + evaluate_profile(goal=Goal.LOSE, weight_kg=70.0, height_cm=175.0, target_weight_kg=50.0)
+    + evaluate_profile(weight_kg=70.0, height_cm=175.0, target_weight_kg=50.0)
     + [clamped_advisory(1200)]
 )
 
@@ -119,9 +95,14 @@ def test_a_patch_can_only_name_a_field_the_request_accepts():
 
 
 def test_every_patch_actually_emitted_validates():
-    """Guards the hand-written patch dicts in engine/advisories.py."""
+    """Guards any hand-written patch dict in engine/advisories.py.
+
+    Vacuous today: the goal/target-weight conflict was the only advisory that
+    ever carried options, and the derived goal removed it. Kept because the
+    `options` contract is still declared, so the first advisory to use it again
+    is checked from the moment it lands.
+    """
     patches = [o["patch"] for a in ALL_ADVISORIES for o in a.options]
-    assert patches, "no advisory carried options - the walk above missed one"
 
     for patch in patches:
         serializer = AdvisoryPatchSerializer(data=patch)

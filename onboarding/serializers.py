@@ -109,6 +109,13 @@ class ProfileUpsertSerializer(serializers.Serializer):
 
     Everything is stored metric (§5.2); `preferredUnits` records the display
     choice so the app can restore it across devices.
+
+    `goal` is not accepted: it is derived from `targetWeightKg` against
+    `weightKg` by `EngineConfig.goal_for` and written in `services.save_profile`.
+    The goal screen asked for an answer the target weight already gave, and two
+    fields carrying one answer could contradict each other. That is also why
+    `targetWeightKg` is required here where it used to be optional - it is now
+    load-bearing rather than decorative.
     """
 
     sexAtBirth = serializers.ChoiceField(choices=ONBOARDING_SEX_CHOICES)
@@ -122,12 +129,8 @@ class ProfileUpsertSerializer(serializers.Serializer):
         min_value=HEIGHT_CM_RANGE[0], max_value=HEIGHT_CM_RANGE[1]
     )
     targetWeightKg = serializers.FloatField(
-        required=False,
-        allow_null=True,
-        min_value=WEIGHT_KG_RANGE[0],
-        max_value=WEIGHT_KG_RANGE[1],
+        min_value=WEIGHT_KG_RANGE[0], max_value=WEIGHT_KG_RANGE[1]
     )
-    goal = serializers.ChoiceField(choices=[g.value for g in Goal])
     activityLevel = serializers.ChoiceField(choices=[a.value for a in ActivityLevel])
     preferredUnits = PreferredUnitsSerializer(default=DEFAULT_PREFERRED_UNITS)
 
@@ -206,9 +209,12 @@ class AdvisoryPatchSerializer(serializers.Serializer):
     the request does not accept would produce a 400 the user cannot act on.
     `tests/test_advisories.py` enforces that subset relation.
 
-    Only `goal` is produced today. The wider shape is deliberate - it is the
-    stable contract, so a future advisory that corrects a measurement is not a
-    breaking type change for generated clients.
+    Nothing produces a patch today - the goal/target-weight conflict was the only
+    advisory that ever carried options, and deriving the goal made it impossible.
+    The shape is kept deliberately: it is the stable contract, so a future
+    advisory that corrects a measurement is not a breaking type change for
+    generated clients. `goal` was dropped from it with the request field, since
+    a patch naming a key the upsert no longer accepts would 400.
 
     Scoped to what a hint could plausibly suggest changing. `sexAtBirth` and
     `dateOfBirth` are facts rather than choices, and `preferredUnits` is a
@@ -217,8 +223,7 @@ class AdvisoryPatchSerializer(serializers.Serializer):
 
     weightKg = serializers.FloatField(required=False)
     heightCm = serializers.FloatField(required=False)
-    targetWeightKg = serializers.FloatField(required=False, allow_null=True)
-    goal = serializers.ChoiceField(choices=[g.value for g in Goal], required=False)
+    targetWeightKg = serializers.FloatField(required=False)
     activityLevel = serializers.ChoiceField(
         choices=[a.value for a in ActivityLevel], required=False
     )
@@ -371,6 +376,9 @@ class EngineConfigResponseSerializer(serializers.Serializer):
 
     configName = serializers.CharField()
     goalAdjustmentsKcal = serializers.DictField(child=serializers.IntegerField())
+    # How the client picks between those adjustments: the goal is derived from
+    # the target weight, and this is the band that reads as MAINTAIN (§5.3).
+    maintainBandKg = serializers.FloatField()
     activityMultipliers = serializers.DictField(child=serializers.FloatField())
     macros = EngineConfigMacrosSerializer()
     safetyFloorsKcal = serializers.DictField(child=serializers.IntegerField())

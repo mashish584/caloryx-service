@@ -25,7 +25,6 @@ VALID = {
     "weightKg": 90.0,
     "heightCm": 180.0,
     "targetWeightKg": 82.0,
-    "goal": "LOSE",
     "activityLevel": "SEDENTARY",
 }
 
@@ -147,15 +146,28 @@ def test_heights_outside_physiological_bounds_are_rejected(height):
     assert "heightCm" in serializer.errors
 
 
-def test_target_weight_is_optional():
+def test_target_weight_is_required():
+    """It used to be optional. The goal is derived from it now, so a profile
+    without one has no way to say which direction the user is going."""
     payload = dict(VALID)
     payload.pop("targetWeightKg")
     serializer = ProfileUpsertSerializer(data=payload)
-    assert serializer.is_valid(), serializer.errors
+
+    assert not serializer.is_valid()
+    assert "targetWeightKg" in serializer.errors
 
 
-def test_target_weight_may_be_null():
-    assert validated(targetWeightKg=None)["targetWeightKg"] is None
+def test_target_weight_may_not_be_null():
+    serializer = ProfileUpsertSerializer(data=dict(VALID, targetWeightKg=None))
+
+    assert not serializer.is_valid()
+    assert "targetWeightKg" in serializer.errors
+
+
+def test_a_supplied_goal_is_ignored():
+    """`goal` left the request contract - the target weight determines it, and
+    accepting both invited a profile that contradicted itself."""
+    assert "goal" not in validated(goal="GAIN")
 
 
 def test_unusual_but_plausible_values_are_accepted():

@@ -15,12 +15,13 @@ from engine.enums import HeightUnit, UnitSystem, WeightUnit
 from onboarding import repository, services
 from tests.support import dob_for_age
 
+# No `goal`: it is derived from the target weight in `save_profile`.
 PROFILE = {
     "sexAtBirth": "FEMALE",
     "dateOfBirth": dob_for_age(30),
     "weightKg": 68.0,
     "heightCm": 165.0,
-    "goal": "LOSE",
+    "targetWeightKg": 62.0,
     "activityLevel": "MODERATE",
 }
 
@@ -34,7 +35,7 @@ def seam(monkeypatch):
         captured["payload"] = payload
         return SimpleNamespace(
             id="p1",
-            targetWeightKg=payload.get("targetWeightKg"),
+            goal=payload["goal"],
             weightUnit=payload["weightUnit"],
             heightUnit=payload["heightUnit"],
             onboardedAt=None,

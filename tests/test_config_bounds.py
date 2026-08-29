@@ -13,7 +13,11 @@ from django.test import Client, override_settings
 
 from engine import DEFAULT_CONFIG
 from engine.advisories import SOFT_HEIGHT_CM, SOFT_WEIGHT_KG
-from onboarding.serializers import ProfileUpsertSerializer, validation_bounds
+from onboarding.serializers import (
+    EngineConfigResponseSerializer,
+    ProfileUpsertSerializer,
+    validation_bounds,
+)
 from tests.support import dob_str
 
 VALID = {
@@ -21,7 +25,7 @@ VALID = {
     "dateOfBirth": dob_str(30),
     "weightKg": 90.0,
     "heightCm": 180.0,
-    "goal": "LOSE",
+    "targetWeightKg": 82.0,
     "activityLevel": "SEDENTARY",
 }
 
@@ -115,7 +119,19 @@ def test_the_bounds_are_fetchable_before_sign_in():
     response = Client().get("/api/v1/onboarding/config")
 
     assert response.status_code == 200
-    assert response.json()["validation"] == validation_bounds()
+    payload = response.json()
+    assert payload["validation"] == validation_bounds()
+    # The goal is derived client-side for the preview and server-side for real,
+    # so both have to read the band from the same place (§5.3).
+    assert payload["maintainBandKg"] == DEFAULT_CONFIG.maintain_band_kg
+
+
+def test_the_published_config_matches_the_declared_response_schema():
+    """`to_public_dict` and `EngineConfigResponseSerializer` are hand-kept in
+    step; a key added to one and not the other ships an undocumented field."""
+    payload = DEFAULT_CONFIG.to_public_dict(validation_bounds())
+
+    assert set(payload) == set(EngineConfigResponseSerializer().fields)
 
 
 # -- the engine stays Django-free -------------------------------------------

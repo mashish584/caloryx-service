@@ -145,6 +145,12 @@ model EngineConfig {
   loseAdjustmentKcal Int @default(-400)
   gainAdjustmentKcal Int @default(400)
 
+  /// Half-width of the MAINTAIN band, kg. A target within this of the current
+  /// weight derives MAINTAIN; outside it the sign of the difference picks LOSE
+  /// or GAIN. The goal is derived rather than asked for (§5.3), so this is the
+  /// threshold that decides which adjustment above a user gets.
+  maintainBandKg Float @default(1.0)
+
   // Activity multipliers
   sedentaryMultiplier Float @default(1.2)
   lightMultiplier     Float @default(1.375)

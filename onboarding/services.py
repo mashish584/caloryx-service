@@ -63,7 +63,6 @@ def _to_plan_input(profile: Any) -> PlanInput:
 
 def profile_advisories(profile: Any) -> List[Advisory]:
     return evaluate_profile(
-        goal=Goal(profile.goal),
         weight_kg=profile.weightKg,
         height_cm=profile.heightCm,
         target_weight_kg=profile.targetWeightKg,
@@ -98,7 +97,16 @@ def derive_stored_rationale(profile: Any, config: EngineConfig) -> Tuple[int, in
 def save_profile(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     """Upsert the step 1-3 inputs and hand back any inline hints."""
     payload = dict(data)
-    payload.setdefault("targetWeightKg", None)
+    # `goal` left the request contract: the target weight already says which way
+    # the user is going, so the goal screen was a step for an answer we had.
+    # Derived here rather than in the serializer because the MAINTAIN band is
+    # server-tunable config and the serializers stay clear of the repository.
+    # `get_active_engine_config` is cached and falls back to the compiled
+    # defaults, so this cannot cost a profile save.
+    config = repository.get_active_engine_config()
+    payload["goal"] = config.goal_for(
+        payload["weightKg"], payload["targetWeightKg"]
+    ).value
     # `preferredUnits` is nested on the wire but two columns in the database, and
     # `upsert_profile` spreads this payload straight into Prisma. Flatten here so
     # the repository stays a blind pass-through.

@@ -2,8 +2,9 @@
 
 Onboarding speed and completion are core metrics, so nothing here blocks a
 request. Each advisory is a structured object the client renders as an inline
-hint; where the PRD calls for a one-tap correction the advisory carries the
-choices rather than the server silently auto-correcting anything.
+hint. An advisory may also carry one-tap `options` rather than have the server
+silently auto-correct anything; none does today - the only advisory that ever
+did was the goal/target-weight conflict, which the derived goal made impossible.
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import dataclasses
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
-from .enums import AdvisoryCode, AdvisoryField, AdvisorySeverity, Goal
+from .enums import AdvisoryCode, AdvisoryField, AdvisorySeverity
 
 # Physiological soft bounds. Outside these we warn but still accept; the hard
 # caps that *do* reject live in the serializers (onboarding/serializers.py).
@@ -40,59 +41,6 @@ class Advisory:
 def bmi(weight_kg: float, height_cm: float) -> float:
     height_m = height_cm / 100.0
     return weight_kg / (height_m * height_m)
-
-
-def _goal_vs_target_weight(
-    goal: Goal, weight_kg: float, target_weight_kg: Optional[float]
-) -> List[Advisory]:
-    """Goal contradicts the target weight (§9): non-blocking hint with a one-tap
-    choice. Never a silent auto-correct, never a block."""
-    if target_weight_kg is None:
-        return []
-
-    if goal is Goal.LOSE and target_weight_kg >= weight_kg:
-        return [
-            Advisory(
-                code=AdvisoryCode.GOAL_TARGET_WEIGHT_CONFLICT,
-                field=AdvisoryField.TARGET_WEIGHT_KG,
-                severity=AdvisorySeverity.WARNING,
-                message=(
-                    "Your goal is to lose weight, but your target weight is at or "
-                    "above your current weight."
-                ),
-                options=[
-                    {"id": "keep_goal", "label": "Keep Lose", "patch": {"goal": "LOSE"}},
-                    {
-                        "id": "switch_goal",
-                        "label": "Switch to Gain",
-                        "patch": {"goal": "GAIN"},
-                    },
-                ],
-            )
-        ]
-
-    if goal is Goal.GAIN and target_weight_kg <= weight_kg:
-        return [
-            Advisory(
-                code=AdvisoryCode.GOAL_TARGET_WEIGHT_CONFLICT,
-                field=AdvisoryField.TARGET_WEIGHT_KG,
-                severity=AdvisorySeverity.WARNING,
-                message=(
-                    "Your goal is to gain weight, but your target weight is at or "
-                    "below your current weight."
-                ),
-                options=[
-                    {"id": "keep_goal", "label": "Keep Gain", "patch": {"goal": "GAIN"}},
-                    {
-                        "id": "switch_goal",
-                        "label": "Switch to Lose",
-                        "patch": {"goal": "LOSE"},
-                    },
-                ],
-            )
-        ]
-
-    return []
 
 
 def _wellbeing(
@@ -145,14 +93,18 @@ def _plausibility(weight_kg: float, height_cm: float) -> List[Advisory]:
 
 def evaluate_profile(
     *,
-    goal: Goal,
     weight_kg: float,
     height_cm: float,
     target_weight_kg: Optional[float] = None,
 ) -> List[Advisory]:
-    """All profile-level advisories, in the order the client should surface them."""
+    """All profile-level advisories, in the order the client should surface them.
+
+    There was a third advisory here once, reconciling a goal that contradicted
+    the target weight. The goal is now derived from that same target
+    (`EngineConfig.goal_for`), so the two can no longer disagree and the hint has
+    nothing left to warn about.
+    """
     advisories = _plausibility(weight_kg, height_cm)
-    advisories += _goal_vs_target_weight(goal, weight_kg, target_weight_kg)
     advisories += _wellbeing(height_cm, target_weight_kg)
     return advisories
 

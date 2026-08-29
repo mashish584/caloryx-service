@@ -79,7 +79,6 @@ class AdvisoryCode(StrEnum):
 
     WEIGHT_OUT_OF_TYPICAL_RANGE = "weight_out_of_typical_range"
     HEIGHT_OUT_OF_TYPICAL_RANGE = "height_out_of_typical_range"
-    GOAL_TARGET_WEIGHT_CONFLICT = "goal_target_weight_conflict"
     TARGET_WEIGHT_BELOW_HEALTHY_BMI = "target_weight_below_healthy_bmi"
     CALORIES_CLAMPED_TO_FLOOR = "calories_clamped_to_floor"
 
