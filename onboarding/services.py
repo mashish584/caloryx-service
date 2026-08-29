@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+from common.db import from_prisma_date, to_prisma_date
 from common.exceptions import ProfileRequiredError
 from engine import (
     Advisory,
@@ -40,7 +41,11 @@ def _profile_age(profile: Any) -> int:
     existed; `backfill_date_of_birth` clears those, and the fallback goes with
     the column.
     """
-    dob = getattr(profile, "dateOfBirth", None)
+    # Normalised because the source varies: Prisma hands back a `datetime` even
+    # for the `@db.Date` column, the repository seams in the tests hand back a
+    # `date`. `age_from_dob` happens to work on both - `datetime` subclasses
+    # `date` - but the read side has drifted on exactly that coincidence before.
+    dob = from_prisma_date(getattr(profile, "dateOfBirth", None))
     return age_from_dob(dob) if dob is not None else profile.age
 
 
@@ -100,6 +105,9 @@ def save_profile(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     units = payload.pop("preferredUnits", None) or DEFAULT_PREFERRED_UNITS
     payload["weightUnit"] = units["weight"]
     payload["heightUnit"] = units["height"]
+    # DRF hands back a `date`, which Prisma cannot serialize at all - it used to
+    # crash the whole endpoint with a 500. See `to_prisma_date`.
+    payload["dateOfBirth"] = to_prisma_date(payload.get("dateOfBirth"))
     profile = repository.upsert_profile(user_id, payload)
     advisories = profile_advisories(profile)
     return {

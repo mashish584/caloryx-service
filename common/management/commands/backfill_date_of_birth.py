@@ -18,7 +18,7 @@ from datetime import date
 
 from django.core.management.base import BaseCommand
 
-from common.db import get_client
+from common.db import get_client, to_prisma_date
 
 
 def dob_from_age(age: int, on: date) -> date:
@@ -70,7 +70,8 @@ class Command(BaseCommand):
             )
             if not dry_run:
                 client.profile.update(
-                    where={"id": profile.id}, data={"dateOfBirth": dob}
+                    where={"id": profile.id},
+                    data={"dateOfBirth": to_prisma_date(dob)},
                 )
             updated += 1
 

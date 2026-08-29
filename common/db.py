@@ -10,7 +10,7 @@ from __future__ import annotations
 import atexit
 import logging
 import threading
-from datetime import timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import TYPE_CHECKING, Optional
 
 from django.conf import settings
@@ -26,6 +26,45 @@ _lock = threading.Lock()
 
 class PrismaClientUnavailable(RuntimeError):
     pass
+
+
+# -- date adaptation -------------------------------------------------------
+#
+# Prisma renders query arguments through a `singledispatch` serializer that
+# knows `datetime.datetime` but not `datetime.date` (prisma._builder), so a bare
+# date raises `TypeError: Type <class 'datetime.date'> not serializable` and the
+# write comes back as a 500. The generated client types even a `@db.Date` column
+# as `Optional[datetime]` on both input and output, so dates cross this boundary
+# as datetimes in both directions and are converted here.
+#
+# Both legs are pinned to UTC and neither ever touches local time. A birth date
+# is a calendar fact, not an instant: convert it through a local zone and
+# midnight lands on the previous day for anyone west of UTC, silently shifting
+# the date by one and, on a birthday, the derived age with it.
+
+
+def to_prisma_date(value: Optional[date]) -> Optional[datetime]:
+    """A plain `date` as the UTC-midnight `datetime` Prisma requires.
+
+    Matches the "naive means UTC" assumption in `serialize_datetime`, so the
+    calendar day submitted is the calendar day Postgres stores. A `datetime`
+    passes through untouched - a caller that already holds one is not an error.
+    """
+    if value is None or isinstance(value, datetime):
+        return value
+    return datetime.combine(value, time.min, tzinfo=timezone.utc)
+
+
+def from_prisma_date(value: Optional[date]) -> Optional[date]:
+    """The inverse: back to a plain `date` for serialization and arithmetic.
+
+    Takes `.date()` directly rather than converting zones first, for the reason
+    above. A `date` passes through unchanged, which is also what the repository
+    seams in the test suite hand back.
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    return value
 
 
 def _import_prisma():

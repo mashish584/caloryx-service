@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 from django.conf import settings
 from rest_framework import serializers
 
+from common.db import from_prisma_date
 from common.exceptions import AgeBelowMinimumError
 from engine.advisories import SOFT_HEIGHT_CM, SOFT_WEIGHT_KG
 from engine.enums import (
@@ -174,10 +175,15 @@ class CompleteSerializer(serializers.Serializer):
 
 
 def serialize_profile(profile: Any) -> Dict[str, Any]:
+    # `dateOfBirth` is normalised before rendering: Prisma reads the `@db.Date`
+    # column back as a `datetime`, so isoformatting it raw emits a full
+    # timestamp for a field this module publishes as a `DateField` - a plain
+    # `YYYY-MM-DD` is the documented contract.
+    dob = from_prisma_date(profile.dateOfBirth)
     return {
         "id": profile.id,
         "sexAtBirth": profile.sexAtBirth,
-        "dateOfBirth": profile.dateOfBirth.isoformat() if profile.dateOfBirth else None,
+        "dateOfBirth": dob.isoformat() if dob else None,
         "weightKg": profile.weightKg,
         "heightCm": profile.heightCm,
         "targetWeightKg": profile.targetWeightKg,
