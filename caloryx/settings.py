@@ -45,6 +45,7 @@ INSTALLED_APPS = [
     "common",
     "authx",
     "onboarding",
+    "meals",
 ]
 
 MIDDLEWARE = [
@@ -127,6 +128,13 @@ SPECTACULAR_SETTINGS = {
         "AdvisoryCodeEnum": "engine.enums.ADVISORY_CODE_CHOICES",
         "AdvisoryFieldEnum": "engine.enums.ADVISORY_FIELD_CHOICES",
         "AdvisorySeverityEnum": "engine.enums.ADVISORY_SEVERITY_CHOICES",
+        # `state` is named identically (and shares its choice set) across
+        # FoodSerializer/LoggedMealItemInputSerializer/etc; without this,
+        # spectacular can't tell those apart from an unrelated `StateEnum`.
+        "StateEnum": "nutrition.enums.FoodState",
+        "SourceEnum": "nutrition.enums.FoodSource",
+        "SlotEnum": "nutrition.enums.MealSlot",
+        "TypeEnum": "nutrition.enums.ServingUnitType",
     },
 }
 

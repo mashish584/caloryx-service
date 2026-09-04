@@ -9,6 +9,7 @@ from drf_spectacular.views import (
 )
 
 from common.views import health, readiness
+from meals.views import LoggedMealListCreateView
 
 # The schema describes shapes, not secrets, so it and its docs UIs bypass the
 # default bearer-auth requirement - CI needs to fetch it without a token.
@@ -19,6 +20,15 @@ urlpatterns = [
     path("readyz", readiness, name="readiness"),
     path("api/v1/auth/", include("authx.urls")),
     path("api/v1/onboarding/", include("onboarding.urls")),
+    # Registered without a trailing slash, unlike every other endpoint in this
+    # file: it's the collection root ("/api/v1/meals"), and `meals.urls`'s own
+    # patterns (which all have a named final segment, e.g. "/foods") are
+    # included under the slash-suffixed prefix below. Folding this into that
+    # include as `path("", ...)` would make it reachable only via
+    # "/api/v1/meals/" and hit Django's APPEND_SLASH redirect on POST, which
+    # most HTTP clients turn into a GET.
+    path("api/v1/meals", LoggedMealListCreateView.as_view(), name="meals-list-create"),
+    path("api/v1/meals/", include("meals.urls")),
     # Schema is the source of truth for FE type generation (see
     # scripts/export_openapi_schema.sh); docs UIs are for humans only.
     path("api/schema", SpectacularAPIView.as_view(**_open), name="schema"),

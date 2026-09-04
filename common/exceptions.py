@@ -73,6 +73,17 @@ class UpstreamUnavailableError(DomainError):
     message = "A dependency is unavailable. Please retry."
 
 
+class UnresolvableQuantityError(DomainError):
+    """A meal item's quantity could not be turned into a mass (meals app, PRD
+    §8) - an unrecognised unit, or a raw/cooked conversion with no yield
+    factor on the food. 422 rather than 400: the request is well-formed, the
+    domain data just can't satisfy it."""
+
+    code = "invalid_quantity"
+    status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+    message = "Could not resolve this item's quantity to a mass."
+
+
 def error_body(
     code: str,
     message: str,

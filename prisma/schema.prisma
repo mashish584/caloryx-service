@@ -75,6 +75,7 @@ model User {
   updatedAt    DateTime     @updatedAt
   lastSeenAt   DateTime     @default(now())
   profile      Profile?
+  loggedMeals  LoggedMeal[]
 
   @@index([isGuest, createdAt])
 }
@@ -177,4 +178,157 @@ model EngineConfig {
   plans     Plan[]
 
   @@index([isActive])
+}
+
+// --- Meal logging (AI Meal Assistant PRD §6, §8) ---------------------------
+//
+// Chunk 1 of the roadmap: the deterministic foundation every later chunk
+// (chat drafts, AI parsing, composite foods, ...) builds on. No chat, no AI -
+// just a Food catalog and the ability to log a fully-quantified meal against
+// it, with the same nutrition math every later tier will call into.
+
+enum FoodSource {
+  USDA
+  OPEN_FOOD_FACTS
+  CALORYX_CURATED
+}
+
+/// Raw vs. cooked - the single largest accuracy risk in text-based logging
+/// (§8: rice roughly triples in mass when cooked). UNSPECIFIED means the
+/// distinction was never captured, not that the food has none.
+enum FoodState {
+  RAW
+  COOKED
+  UNSPECIFIED
+}
+
+enum ServingUnitType {
+  CONTINUOUS
+  COUNTABLE
+  HOUSEHOLD
+}
+
+enum MealSlot {
+  BREAKFAST
+  LUNCH
+  DINNER
+  SNACK
+}
+
+/// Distinguishes how a `LoggedMeal` was created (§6 "parity with the Meals
+/// surface") without implying a different record shape. CHAT_AI is unused
+/// until the chat pipeline (Chunk 2+) starts writing here.
+enum LoggedMealSource {
+  MANUAL
+  CHAT_AI
+}
+
+/// Food catalog (§8). Nutrient columns are per 100g, on `defaultState` basis -
+/// e.g. rice defaults to COOKED, so its vector describes cooked rice, and a
+/// raw-stated quantity is converted via `rawToCookedYield` before lookup
+/// (see nutrition.calculator.apply_yield).
+model Food {
+  id     String     @id @default(cuid())
+  name   String
+  source FoodSource
+  // External id/name at the source - USDA FDC id, Open Food Facts barcode, or
+  // a curation note. Nullable for CALORYX_CURATED entries with no upstream ref.
+  sourceRef        String?
+  defaultState     FoodState @default(UNSPECIFIED)
+  // Grams-cooked-per-gram-raw. Null when the food has no meaningful raw/cooked
+  // distinction (a banana) or the factor isn't catalogued yet - logging this
+  // food in the non-default state then fails validation rather than guessing.
+  rawToCookedYield Float?
+
+  caloriesKcalPer100g Float
+  proteinGPer100g     Float
+  carbsGPer100g       Float
+  fatGPer100g         Float
+  // Missing != zero (§8): null means unknown and renders as "-"; it must never
+  // be coerced to 0, or a partial macro sum silently understates.
+  fiberGPer100g        Float?
+  sugarGPer100g        Float?
+  saturatedFatGPer100g Float?
+  sodiumMgPer100g      Float?
+  cholesterolMgPer100g Float?
+
+  servingUnits    FoodServingUnit[]
+  loggedMealItems LoggedMealItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([name])
+}
+
+/// Household/countable measures, defined per food (§8) - a cup of rice and a
+/// cup of spinach are not the same mass. `g`/`kg` are universal and never
+/// stored here; see nutrition.units.resolve_grams.
+model FoodServingUnit {
+  id     String @id @default(cuid())
+  food   Food   @relation(fields: [foodId], references: [id], onDelete: Cascade)
+  foodId String
+  unit   String // "katori", "cup", "roti", "piece"...
+  grams  Float  // grams per one `unit`, as-served
+  type   ServingUnitType
+
+  @@unique([foodId, unit])
+}
+
+/// A logged meal (§6). Whatever surface creates it (this chunk's direct entry,
+/// or a chat draft later), it lands here as the same record - `source` is the
+/// only thing that varies.
+model LoggedMeal {
+  id     String           @id @default(cuid())
+  user   User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String
+  name   String
+  slot   MealSlot
+  source LoggedMealSource @default(MANUAL)
+
+  loggedAt DateTime @default(now())
+
+  // Always the sum of `items` at write time (§6) - ingredients are the source
+  // of truth; this is a render cache, never an independently authored number.
+  caloriesKcal Float
+  proteinG     Float
+  carbsG       Float
+  fatG         Float
+  fiberG       Float?
+
+  items LoggedMealItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, loggedAt])
+}
+
+model LoggedMealItem {
+  id     String     @id @default(cuid())
+  meal   LoggedMeal @relation(fields: [mealId], references: [id], onDelete: Cascade)
+  mealId String
+  food   Food       @relation(fields: [foodId], references: [id])
+  foodId String
+
+  quantity Float     // as entered, in `unit`
+  unit     String    // "g", "katori", "piece"...
+  // Resolved mass FROM `quantity`+`unit`, in `state` (as entered) - what the
+  // item shows the user, not a defaultState-basis figure. Any raw<->cooked
+  // conversion needed to reach the food's own basis happens at write time via
+  // nutrition.calculator.apply_yield and is reflected only in the nutrition
+  // columns below, so this always matches what the person actually said.
+  grams    Float
+  state    FoodState @default(UNSPECIFIED)
+
+  // Computed once at write time from food.*Per100g x grams/100 (§8) and never
+  // re-derived silently, so a later catalog edit can't retroactively rewrite a
+  // past meal (full snapshot/versioning is a later chunk - §12.3).
+  caloriesKcal Float
+  proteinG     Float
+  carbsG       Float
+  fatG         Float
+  fiberG       Float?
+
+  createdAt DateTime @default(now())
 }
