@@ -76,6 +76,8 @@ model User {
   lastSeenAt   DateTime     @default(now())
   profile      Profile?
   loggedMeals  LoggedMeal[]
+  chatSessions ChatSession[]
+  mealDrafts   MealDraft[]
 
   @@index([isGuest, createdAt])
 }
@@ -254,6 +256,7 @@ model Food {
 
   servingUnits    FoodServingUnit[]
   loggedMealItems LoggedMealItem[]
+  mealDraftItems  MealDraftItem[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -331,4 +334,219 @@ model LoggedMealItem {
   fiberG       Float?
 
   createdAt DateTime @default(now())
+}
+
+// --- Meal Assistant chat drafts (AI Meal Assistant PRD §9, §12.1, §12.2) ---
+//
+// Chunk 2a of the roadmap: the draft data model, state machine, optimistic
+// locking, and confirm-time idempotency - built and tested against structured
+// input identical in shape to Chunk 1's manual entry. No free-text parsing,
+// no ChatMessage, no AI: that's Chunk 2b, layered on top of what's here.
+
+enum DraftStatus {
+  OPEN
+  CONFIRMED
+  DISCARDED
+  EXPIRED
+}
+
+/// Which tier produced a draft (§9). `MANUAL` is NOT in the PRD's enum - it's
+/// added here because none of the PRD's members describe "no parsing
+/// happened," which is the only case Chunk 2a's structured endpoints produce.
+/// The rest become reachable starting Chunk 2b (PARSER, CACHE, PRECLASSIFIER
+/// don't apply to a draft itself but round out the shared vocabulary) and
+/// Chunk 4 (LLM_SMALL/LLM_LARGE).
+enum ParseTier {
+  MANUAL
+  PRECLASSIFIER
+  CACHE
+  PARSER
+  LLM_SMALL
+  LLM_LARGE
+}
+
+/// An item is in exactly one resolution state, and that state determines
+/// which fields are required/meaningful (enforced in the service layer, not
+/// the database). Only RESOLVED is reachable in Chunk 2a - UNRESOLVED needs
+/// food-name matching (Chunk 2b) and ESTIMATED_DISH needs the AI-driven
+/// DishCategoryProfile (Chunk 5).
+enum ItemResolution {
+  RESOLVED
+  UNRESOLVED
+  ESTIMATED_DISH
+}
+
+/// Was an amount stated? (§5.1.1a) Only EXPLICIT is reachable in Chunk 2a -
+/// the structured item endpoint requires a quantity. ASSUMED needs the
+/// quantity-resolution ladder (Chunk 4).
+enum QuantitySource {
+  EXPLICIT
+  ASSUMED
+}
+
+/// How a quantity was converted to grams (§5.1.1a). Only DIRECT and
+/// HOUSEHOLD_TABLE are reachable in Chunk 2a - USER_HISTORY/CATALOG_SERVING/
+/// CATEGORY_FALLBACK are ladder steps that need Chunk 4.
+enum MassSource {
+  DIRECT
+  HOUSEHOLD_TABLE
+  USER_HISTORY
+  CATALOG_SERVING
+  CATEGORY_FALLBACK
+}
+
+/// Food-resolution confidence band (§12.6). Unused (null) in Chunk 2a - a
+/// draft item's food is chosen by exact id, not fuzzy-matched, so there is
+/// nothing to band yet. Populated starting Chunk 2b.
+enum MatchBand {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+/// Groups a user's drafts (and, from Chunk 2b, their chat messages). Not
+/// client-visible yet - get-or-created internally, one per UTC calendar day
+/// per user (see assistant.repository.get_or_create_today_session). Becomes a
+/// real "resume my chat" concept once ChatMessage exists.
+model ChatSession {
+  id        String      @id @default(cuid())
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  startedAt DateTime    @default(now())
+  drafts    MealDraft[]
+
+  @@index([userId, startedAt])
+}
+
+/// A live, editable, server-side draft (§5.1.1, §9) - the object every chat
+/// mutation (tap or, from Chunk 2b, text) mutates in place rather than
+/// re-creating.
+model MealDraft {
+  id        String      @id @default(cuid())
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sessionId String
+  name      String
+  slot      MealSlot
+  items     MealDraftItem[]
+
+  // Always the sum of `items` at write time (§6) - recomputed on every
+  // mutation exactly like LoggedMeal's totals, never authored independently.
+  caloriesKcal Float
+  proteinG     Float
+  carbsG       Float
+  fatG         Float
+  fiberG       Float?
+
+  parseTier  ParseTier @default(MANUAL)
+  confidence Float     @default(1.0)
+
+  // Optimistic lock (§12.1): increments on every mutation. A mutating request
+  // carries the version it read; a mismatch means someone else changed the
+  // draft first.
+  version Int @default(1)
+
+  status    DraftStatus @default(OPEN)
+  // 24h TTL. Enforced by transactional lazy expiry at creation
+  // (assistant.repository.create_draft_with_expiry_check) plus a read-path
+  // check (assistant.repository.expire_draft_if_stale) - see §12.2. There is
+  // NO database-level partial unique index backing "one open draft per user"
+  // (Prisma's schema language can't express a WHERE-filtered unique
+  // constraint without a raw-SQL migration, and this repo only uses
+  // `db push` today) - enforcement is app-level only. Small race window on
+  // concurrent multi-device draft creation, documented and accepted; revisit
+  // if/when the team adopts `prisma migrate`.
+  expiresAt DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status])
+}
+
+/// An item on an open draft. No nutrition columns here (unlike
+/// LoggedMealItem): a draft is mutable and unconfirmed, so nutrition is
+/// computed live from food.*Per100g x grams/100 on every read rather than
+/// frozen - freezing only matters once a meal is actually logged (§12.3).
+///
+/// FIELD REQUIREMENTS BY RESOLUTION STATE (enforced in the service layer):
+///   RESOLVED        foodId, quantity, unit, grams, defaultGrams,
+///                    quantitySource, massSource                 REQUIRED
+///                    matchScore/matchBand                        set when
+///                                                                 food-name
+///                                                                 matched
+///                                                                 (Chunk 2b)
+///                    dishCategory, kcal*                         MUST BE NULL
+///   UNRESOLVED      rawText                                      REQUIRED
+///                    everything else                             NULL
+///                    (unreachable until Chunk 2b)
+///   ESTIMATED_DISH  dishCategory, grams, kcalLow/High/Midpoint,
+///                    profileVersion                              REQUIRED
+///                    (unreachable until Chunk 5)
+model MealDraftItem {
+  id      String        @id @default(cuid())
+  draft   MealDraft     @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  draftId String
+  resolution ItemResolution @default(RESOLVED)
+
+  food   Food?   @relation(fields: [foodId], references: [id])
+  foodId String?
+  // Always present. In Chunk 2a there's no user-typed text to store, so this
+  // is synthesized ("200g Cooked White Rice") for display/debug parity with
+  // the PRD's shape; from Chunk 2b it's what the user actually said, and it's
+  // what a low-confidence match files to the miss-queue (Chunk 3).
+  rawText String
+
+  quantity Float?
+  unit     String?
+  grams    Float?
+  state    FoodState @default(UNSPECIFIED)
+  // Baseline for Adjust Portion's multiplier chips and deltas (§5.2.1) - set
+  // once at item creation to the item's own `grams`, then held fixed across
+  // edits so "the default" stays meaningful.
+  defaultGrams Float?
+
+  // Full interpretation persisted, nothing dropped - always null in Chunk 2a,
+  // no grammar exists yet to populate them (Chunk 2b).
+  prep          String?
+  sizeQualifier String?
+
+  quantitySource QuantitySource? // drives the est. chip (§5.1.1a) - always EXPLICIT in Chunk 2a
+  massSource     MassSource?     // drives the provenance line
+
+  matchScore Float?     // null in Chunk 2a - food is chosen by exact id, not fuzzy-matched
+  matchBand  MatchBand?
+
+  // ESTIMATED_DISH persistence (§7.6.1) - unreachable until Chunk 5.
+  dishCategory   String?
+  kcalLow        Float?
+  kcalHigh       Float?
+  kcalMidpoint   Float?
+  profileVersion Int?
+
+  createdAt DateTime @default(now())
+}
+
+/// Idempotency for mutating requests that must never double-apply on retry
+/// (§9, §12.1). Used only by `confirm` in Chunk 2a (double-tapping
+/// Confirm & Log must not create two LoggedMeals); Chunk 2b reuses it for
+/// `POST /messages`.
+model IdempotencyRecord {
+  key    String @id // client-supplied idempotency key
+  userId String
+  // Guards against the same key being reused with different request content -
+  // a replay must match both the key AND the original request.
+  requestHash  String
+  responseBody Json
+  statusCode   Int
+  createdAt    DateTime @default(now())
+  // 24h for now. RETENTION RULE (§9): once the offline queue exists (Chunk 7)
+  // this must be >= the offline replay window, or a queued op replayed after
+  // this expires creates a duplicate - exactly the bug the PRD's v1.6 review
+  // caught. Revisit this constant then; it must not be tuned independently of
+  // the queue's max age.
+  expiresAt DateTime
+
+  @@index([expiresAt])
 }

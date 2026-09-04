@@ -8,6 +8,7 @@ from drf_spectacular.views import (
     SpectacularSwaggerView,
 )
 
+from assistant.views import DraftCreateView
 from common.views import health, readiness
 from meals.views import LoggedMealListCreateView
 
@@ -29,6 +30,9 @@ urlpatterns = [
     # most HTTP clients turn into a GET.
     path("api/v1/meals", LoggedMealListCreateView.as_view(), name="meals-list-create"),
     path("api/v1/meals/", include("meals.urls")),
+    # Same trailing-slash reasoning as meals-list-create above.
+    path("api/v1/assistant/drafts", DraftCreateView.as_view(), name="assistant-drafts-create"),
+    path("api/v1/assistant/drafts/", include("assistant.urls")),
     # Schema is the source of truth for FE type generation (see
     # scripts/export_openapi_schema.sh); docs UIs are for humans only.
     path("api/schema", SpectacularAPIView.as_view(**_open), name="schema"),

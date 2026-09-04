@@ -6,6 +6,7 @@ and writes. Mirrors onboarding/repository.py.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from common.db import get_client
@@ -65,11 +66,20 @@ def get_logged_meal(user_id: str, meal_id: str) -> Optional[Any]:
 
 
 def list_logged_meals(
-    user_id: str, *, slot: Optional[str] = None, limit: int = 50
+    user_id: str,
+    *,
+    slot: Optional[str] = None,
+    logged_after: Optional[datetime] = None,
+    limit: int = 50,
 ) -> List[Any]:
     where: Dict[str, Any] = {"userId": user_id}
     if slot:
         where["slot"] = slot
+    if logged_after is not None:
+        # Used by assistant.services for "today's totals" on confirm - a plain
+        # gte filter rather than a dedicated day-boundary query, since the
+        # caller already knows what "today" means (UTC vs. local is its call).
+        where["loggedAt"] = {"gte": logged_after}
     return get_client().loggedmeal.find_many(
         where=where, include=_MEAL_WITH_ITEMS, order={"loggedAt": "desc"}, take=limit
     )

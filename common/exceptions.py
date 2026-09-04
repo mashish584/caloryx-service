@@ -84,6 +84,49 @@ class UnresolvableQuantityError(DomainError):
     message = "Could not resolve this item's quantity to a mass."
 
 
+class OpenDraftExistsError(DomainError):
+    """One open draft per user (assistant app, PRD §9, §12.2) - raised instead
+    of silently starting a second one or clobbering the first. Callers attach
+    the existing draft as `details={"draft": <serialized draft>}` so the
+    client can re-render it, mirroring the PRD's §10.1 version-conflict shape."""
+
+    code = "open_draft_exists"
+    status_code = status.HTTP_409_CONFLICT
+    message = "You already have an open meal draft."
+
+
+class DraftVersionConflictError(DomainError):
+    """Optimistic-lock mismatch (§12.1) - the request's `version` doesn't
+    match the draft's current one, meaning it changed since the client last
+    read it. Callers attach `details={"draft": <serialized draft>}` so the
+    client re-renders rather than retrying blindly (§10.1)."""
+
+    code = "draft_version_conflict"
+    status_code = status.HTTP_409_CONFLICT
+    message = "This meal changed since you last saw it."
+
+
+class DraftNotOpenError(DomainError):
+    """A mutation was attempted against a draft in a terminal state
+    (CONFIRMED/DISCARDED/EXPIRED) - the draft state machine only allows
+    mutations while OPEN (§12.2)."""
+
+    code = "draft_not_open"
+    status_code = status.HTTP_409_CONFLICT
+    message = "This draft can no longer be changed."
+
+
+class IdempotencyKeyReuseError(DomainError):
+    """The same idempotency key arrived with a different request body (§9's
+    `IdempotencyRecord.requestHash` guard) - a replay must match both the key
+    AND the original content, or a client bug could silently apply someone
+    else's stale request under a reused key."""
+
+    code = "idempotency_key_reused"
+    status_code = status.HTTP_409_CONFLICT
+    message = "This idempotency key was already used for a different request."
+
+
 def error_body(
     code: str,
     message: str,

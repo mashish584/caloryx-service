@@ -32,7 +32,10 @@ def _serving_units(food: Any) -> List[ServingUnit]:
     ]
 
 
-def _food_per_100g(food: Any) -> NutrientVector:
+def food_per_100g(food: Any) -> NutrientVector:
+    """Public: `assistant.serializers`/`assistant.services` reuse this to
+    compute a draft item's nutrition live (drafts store no nutrition columns
+    of their own - see the MealDraftItem schema comment)."""
     return NutrientVector(
         calories_kcal=food.caloriesKcalPer100g,
         protein_g=food.proteinGPer100g,
@@ -42,12 +45,17 @@ def _food_per_100g(food: Any) -> NutrientVector:
     )
 
 
-def _resolve_item(
+def resolve_item(
     food: Any, quantity: float, unit: str, state: Optional[str]
 ) -> Tuple[Dict[str, Any], NutrientVector]:
     """One input item -> `{grams, state, nutrition}` against `food`'s catalog
     data. `state` defaults to the food's own default state when the caller
-    didn't send one - there is nothing to convert (§8)."""
+    didn't send one - there is nothing to convert (§8).
+
+    Public (not `_`-prefixed): `assistant.services` reuses this directly for
+    draft items and the confirm->LoggedMeal handoff, rather than duplicating
+    the quantity/unit/yield-resolution logic Chunk 1 already tested.
+    """
     item_state = FoodState(state) if state else FoodState(food.defaultState)
     default_state = FoodState(food.defaultState)
 
@@ -66,7 +74,7 @@ def _resolve_item(
     except NutritionError as exc:
         raise UnresolvableQuantityError(str(exc), details={"state": item_state.value}) from exc
 
-    nutrition = item_nutrition(_food_per_100g(food), basis_grams)
+    nutrition = item_nutrition(food_per_100g(food), basis_grams)
     item = {
         "foodId": food.id,
         "quantity": quantity,
@@ -110,7 +118,7 @@ def log_meal(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
             raise NotFoundError(
                 "Food not found.", code="food_not_found", details={"foodId": raw["foodId"]}
             )
-        item, vector = _resolve_item(food, raw["quantity"], raw["unit"], raw.get("state"))
+        item, vector = resolve_item(food, raw["quantity"], raw["unit"], raw.get("state"))
         resolved_items.append(item)
         vectors.append(vector)
 
@@ -157,7 +165,7 @@ def update_logged_meal_item(
     quantity = data.get("quantity", item.quantity)
     unit = data.get("unit", item.unit)
     state = data.get("state", item.state)
-    resolved, _ = _resolve_item(food, quantity, unit, state)
+    resolved, _ = resolve_item(food, quantity, unit, state)
     repository.update_logged_meal_item(item_id, resolved)
 
     meal = _recompute_meal_totals(user_id, meal_id)

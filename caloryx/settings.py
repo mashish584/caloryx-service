@@ -46,6 +46,7 @@ INSTALLED_APPS = [
     "authx",
     "onboarding",
     "meals",
+    "assistant",
 ]
 
 MIDDLEWARE = [
