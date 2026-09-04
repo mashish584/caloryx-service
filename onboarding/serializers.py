@@ -254,6 +254,40 @@ class AdvisorySerializer(serializers.Serializer):
     options = AdvisoryOptionSerializer(many=True, required=False)
 
 
+class AdvisoryCheckSerializer(serializers.Serializer):
+    """POST /onboarding/advisories - values to look at, not to keep.
+
+    Exactly the three inputs `engine.advisories.evaluate_profile` reads, which
+    are also exactly the `AdvisoryField` members: every advisory this endpoint
+    can emit therefore points at a field the caller actually sent. The rest of
+    the upsert body is asked for nowhere here because nothing in §9 has an
+    opinion about it, and a dry run should not demand answers the user may not
+    have reached yet.
+
+    Bounds are the same module constants `ProfileUpsertSerializer` enforces, so
+    a body that passes here is a body the save will accept: the hard caps reject,
+    and everything softer comes back as an advisory rather than an error.
+    """
+
+    weightKg = serializers.FloatField(
+        min_value=WEIGHT_KG_RANGE[0], max_value=WEIGHT_KG_RANGE[1]
+    )
+    heightCm = serializers.FloatField(
+        min_value=HEIGHT_CM_RANGE[0], max_value=HEIGHT_CM_RANGE[1]
+    )
+    targetWeightKg = serializers.FloatField(
+        min_value=WEIGHT_KG_RANGE[0], max_value=WEIGHT_KG_RANGE[1]
+    )
+
+
+class AdvisoryCheckResponseSerializer(serializers.Serializer):
+    """POST /onboarding/advisories. No `profile` key, deliberately: nothing was
+    stored, so there is no record to hand back. An empty list means the values
+    look fine."""
+
+    advisories = AdvisorySerializer(many=True)
+
+
 class ProfileSerializer(serializers.Serializer):
     """Mirrors `serialize_profile`."""
 

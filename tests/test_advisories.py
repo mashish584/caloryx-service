@@ -14,10 +14,13 @@ from engine import (
     evaluate_profile,
 )
 from onboarding.serializers import (
+    WEIGHT_KG_RANGE,
+    AdvisoryCheckSerializer,
     AdvisoryPatchSerializer,
     AdvisorySerializer,
     ProfileUpsertSerializer,
 )
+from onboarding.services import check_advisories
 
 
 def codes(advisories):
@@ -150,3 +153,94 @@ def test_the_clamp_advisory_is_the_only_supportive_one():
         for c, s in by_severity.items()
         if c != AdvisoryCode.CALORIES_CLAMPED_TO_FLOOR
     )
+
+
+# -- the preview endpoint (POST /onboarding/advisories) ---------------------
+
+
+def test_the_preview_returns_what_the_save_would_have_returned():
+    """The drift guard. Two paths reach the user with a hint about the same
+    numbers; if they ever disagree, the preview is worse than useless."""
+    measurements = {"weightKg": 300.0, "heightCm": 125.0, "targetWeightKg": 40.0}
+
+    assert check_advisories(measurements)["advisories"] == [
+        a.to_dict()
+        for a in evaluate_profile(
+            weight_kg=300.0, height_cm=125.0, target_weight_kg=40.0
+        )
+    ]
+
+
+def test_values_that_look_fine_come_back_with_an_empty_list():
+    """An empty list is the "everything looks good" answer - not an absent key,
+    and not a null."""
+    payload = check_advisories(
+        {"weightKg": 80.0, "heightCm": 175.0, "targetWeightKg": 72.0}
+    )
+
+    assert payload == {"advisories": []}
+
+
+def test_the_preview_never_emits_the_plan_time_advisory():
+    """The clamp is an outcome of computing a plan (§6.2). Nothing about a set
+    of measurements alone can produce it."""
+    payload = check_advisories(
+        {"weightKg": 300.0, "heightCm": 125.0, "targetWeightKg": 40.0}
+    )
+
+    assert AdvisoryCode.CALORIES_CLAMPED_TO_FLOOR not in {
+        a["code"] for a in payload["advisories"]
+    }
+
+
+def test_the_preview_only_asks_for_fields_the_upsert_accepts():
+    """Same reasoning as the patch above: the client collects these values for
+    the save, so the dry run must not invent a second vocabulary for them."""
+    check_fields = set(AdvisoryCheckSerializer().fields)
+    upsert_fields = set(ProfileUpsertSerializer().fields)
+
+    assert check_fields <= upsert_fields, check_fields - upsert_fields
+
+
+def test_the_preview_asks_for_every_field_an_advisory_can_name():
+    """Otherwise an advisory could point at an input the caller never sent, and
+    the client would have nothing to attach the message to."""
+    check_fields = set(AdvisoryCheckSerializer().fields)
+
+    assert {f.value for f in AdvisoryField} <= check_fields
+
+
+def test_the_preview_rejects_what_the_save_would_reject():
+    """§9: hard caps reject on both paths. A body that passes the dry run has to
+    be one the upsert will accept, or the preview is lying."""
+    serializer = AdvisoryCheckSerializer(
+        data={
+            "weightKg": WEIGHT_KG_RANGE[1] + 1,
+            "heightCm": 175.0,
+            "targetWeightKg": 72.0,
+        }
+    )
+
+    assert not serializer.is_valid()
+    assert "weightKg" in serializer.errors
+
+
+def test_the_preview_accepts_what_the_save_would_only_warn_about():
+    """The other half of §9: inside the hard cap but outside the soft range is a
+    200 with an advisory, never a 400."""
+    serializer = AdvisoryCheckSerializer(
+        data={"weightKg": 300.0, "heightCm": 175.0, "targetWeightKg": 90.0}
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    advisories = check_advisories(serializer.validated_data)["advisories"]
+    assert [a["code"] for a in advisories] == ["weight_out_of_typical_range"]
+
+
+def test_all_three_measurements_are_required():
+    """The target weight is load-bearing here, not decorative: it is the only
+    input the wellbeing safeguard reads."""
+    serializer = AdvisoryCheckSerializer(data={"weightKg": 80.0})
+
+    assert not serializer.is_valid()
+    assert set(serializer.errors) == {"heightCm", "targetWeightKg"}

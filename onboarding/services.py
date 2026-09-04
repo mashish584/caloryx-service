@@ -69,6 +69,31 @@ def profile_advisories(profile: Any) -> List[Advisory]:
     )
 
 
+def check_advisories(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Advisories for measurements that have not been saved (§9).
+
+    Reads nothing and writes nothing - the whole point is that a client can ask
+    "do these numbers look sensible?" mid-flow without persisting a
+    half-answered profile to find out. The preview and the save funnel into the
+    same `evaluate_profile`, which is what stops the hint the user sees here
+    from disagreeing with the one they get on submit.
+
+    Takes the validated request dict rather than a profile, unlike
+    `profile_advisories` above - there is no row to read, and inventing a
+    profile-shaped object just to satisfy an attribute access would be a fake
+    for its own sake.
+
+    `clamped_advisory` is unreachable from here on purpose: the clamp is an
+    outcome of computing a plan (§6.2), not a property of the inputs.
+    """
+    advisories = evaluate_profile(
+        weight_kg=data["weightKg"],
+        height_cm=data["heightCm"],
+        target_weight_kg=data["targetWeightKg"],
+    )
+    return {"advisories": [a.to_dict() for a in advisories]}
+
+
 def plan_advisories(
     profile: Any, *, clamped: bool, safety_floor_kcal: int
 ) -> List[Advisory]:

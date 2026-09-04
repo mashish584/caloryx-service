@@ -18,6 +18,8 @@ from common.schema import (
 
 from . import repository, services
 from .serializers import (
+    AdvisoryCheckResponseSerializer,
+    AdvisoryCheckSerializer,
     CompleteResponseSerializer,
     EngineConfigResponseSerializer,
     PlanResponseSerializer,
@@ -72,6 +74,34 @@ class ProfileView(APIView):
                 "advisories": [a.to_dict() for a in services.profile_advisories(profile)],
             }
         )
+
+
+class AdvisoryCheckView(APIView):
+    """POST /api/v1/onboarding/advisories - hints for values, without storing them.
+
+    A read-only sibling of the profile upsert. The client sends the measurements
+    it has collected so far, gets the §9 advisories back, and nothing is
+    persisted: there is no `profile` in the response because there is no row.
+    Before this existed, the only way to see an advisory was to write one.
+
+    Authenticated like the rest of the flow. It touches no user data, but an
+    unauthenticated compute endpoint is a throttling problem for no gain - the
+    client already holds a guest token by this point in onboarding (§5.1).
+    """
+
+    @extend_schema(
+        request=AdvisoryCheckSerializer,
+        responses={
+            200: AdvisoryCheckResponseSerializer,
+            400: VALIDATION_ERROR,
+            401: UNAUTHORIZED,
+            500: SERVER_ERROR,
+        },
+    )
+    def post(self, request):
+        serializer = AdvisoryCheckSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response(services.check_advisories(serializer.validated_data))
 
 
 class PlanView(APIView):

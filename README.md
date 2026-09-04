@@ -154,6 +154,7 @@ Base path `/api/v1`. Every endpoint accepts **guest and Clerk sessions alike**
 | `GET`/`POST` | `/auth/session` | Resolve the current session + where to resume |
 | `POST` | `/auth/claim` | Move a guest's onboarding data onto the signed-in account |
 | `GET`/`POST` | `/onboarding/profile` | Upsert / read the collected inputs |
+| `POST` | `/onboarding/advisories` | Advisories for values the client has not saved yet |
 | `POST` | `/onboarding/plan` | Compute + persist the plan |
 | `GET` | `/onboarding/plan` | Fetch the stored plan (plan screen, resume) |
 | `POST` | `/onboarding/complete` | Stamp `onboardedAt`, finalise |
