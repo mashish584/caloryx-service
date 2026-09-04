@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from assistant import repository, services
+from chatparser import hash_normalized, normalize_text
 from common.exceptions import (
     DraftNotOpenError,
     DraftVersionConflictError,
@@ -75,6 +76,47 @@ def make_item(food, **overrides):
     return SimpleNamespace(**fields)
 
 
+def make_unresolved_item(**overrides):
+    fields = dict(
+        id="item-1",
+        draftId="draft-1",
+        resolution="UNRESOLVED",
+        foodId=None,
+        food=None,
+        rawText="unresolved item",
+        quantity=None,
+        unit=None,
+        grams=None,
+        state="UNSPECIFIED",
+        defaultGrams=None,
+        prep=None,
+        sizeQualifier=None,
+        quantitySource=None,
+        massSource=None,
+        matchScore=None,
+        matchBand=None,
+        dishCategory=None,
+        kcalLow=None,
+        kcalHigh=None,
+        kcalMidpoint=None,
+        profileVersion=None,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def item_from_payload(state, item_data):
+    """Builds a fake `MealDraftItem` row from a service-produced payload dict
+    (RESOLVED - has `foodId` - or UNRESOLVED - doesn't), the way the real
+    repository's `create_draft_item`/`create_draft_with_expiry_check` would."""
+    item_id = "item-{}".format(state.next_item_id)
+    state.next_item_id += 1
+    if item_data.get("resolution") == "UNRESOLVED":
+        return make_unresolved_item(id=item_id, **item_data)
+    food = state.foods[item_data["foodId"]]
+    return make_item(food, id=item_id, **{k: v for k, v in item_data.items() if k != "foodId"})
+
+
 def make_draft(items, **overrides):
     fields = dict(
         id="draft-1",
@@ -111,6 +153,7 @@ def seam(monkeypatch):
         idempotency={},
         logged_meals=[],
         create_logged_meal_calls=0,
+        messages=[],
     )
 
     # -- assistant.repository ------------------------------------------------
@@ -125,17 +168,7 @@ def seam(monkeypatch):
                 return None
             state.draft = SimpleNamespace(**{**state.draft.__dict__, "status": "EXPIRED"})
 
-        items = []
-        for item_data in items_data:
-            food = state.foods[item_data["foodId"]]
-            items.append(
-                make_item(
-                    food,
-                    id="item-{}".format(state.next_item_id),
-                    **{k: v for k, v in item_data.items() if k != "foodId"},
-                )
-            )
-            state.next_item_id += 1
+        items = [item_from_payload(state, item_data) for item_data in items_data]
 
         state.draft = make_draft(
             items,
@@ -184,13 +217,7 @@ def seam(monkeypatch):
     monkeypatch.setattr(repository, "update_draft", update_draft)
 
     def create_draft_item(draft_id, item_data):
-        food = state.foods[item_data["foodId"]]
-        item = make_item(
-            food,
-            id="item-{}".format(state.next_item_id),
-            **{k: v for k, v in item_data.items() if k != "foodId"},
-        )
-        state.next_item_id += 1
+        item = item_from_payload(state, item_data)
         state.draft = SimpleNamespace(
             **{**state.draft.__dict__, "items": state.draft.items + [item]}
         )
@@ -240,9 +267,40 @@ def seam(monkeypatch):
 
     monkeypatch.setattr(repository, "save_idempotency_record", save_idempotency_record)
 
+    # -- assistant.repository: chat messages (Chunk 2b) ----------------------
+
+    def create_chat_message(session_id, user_id, data):
+        message = SimpleNamespace(
+            id="msg-{}".format(len(state.messages) + 1),
+            sessionId=session_id,
+            userId=user_id,
+            createdAt=datetime.now(timezone.utc),
+            **data,
+        )
+        state.messages.append(message)
+        return message
+
+    monkeypatch.setattr(repository, "create_chat_message", create_chat_message)
+
+    def find_cached_message(user_id, normalized_hash):
+        for message in reversed(state.messages):
+            if (
+                message.userId == user_id
+                and message.role == "USER"
+                and message.normalizedHash == normalized_hash
+                and message.parseSnapshot is not None
+            ):
+                return message
+        return None
+
+    monkeypatch.setattr(repository, "find_cached_message", find_cached_message)
+
     # -- meals.repository (confirm -> LoggedMeal handoff) --------------------
 
     monkeypatch.setattr(meals_repository, "get_food", lambda food_id: state.foods.get(food_id))
+    monkeypatch.setattr(
+        meals_repository, "search_foods", lambda query, **kw: list(state.foods.values())
+    )
 
     def create_logged_meal(user_id, meal_data, items_data):
         state.create_logged_meal_calls += 1
@@ -278,6 +336,24 @@ def create_lunch_draft(seam, **item_overrides):
     item = dict(foodId="food-rice", quantity=200.0, unit="g")
     item.update(item_overrides)
     return services.create_draft("user-1", {"name": "Lunch", "slot": "LUNCH", "items": [item]})
+
+
+def make_egg_food(**overrides):
+    fields = dict(
+        id="food-egg",
+        name="Boiled Egg",
+        source="CALORYX_CURATED",
+        defaultState="COOKED",
+        rawToCookedYield=None,
+        caloriesKcalPer100g=155.0,
+        proteinGPer100g=13.0,
+        carbsGPer100g=1.1,
+        fatGPer100g=11.0,
+        fiberGPer100g=0.0,
+        servingUnits=[serving_unit("piece", 50.0, "COUNTABLE")],
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
 
 
 # -- create_draft --------------------------------------------------------
@@ -517,3 +593,187 @@ def test_confirm_draft_includes_todays_totals(seam):
     created = create_lunch_draft(seam)
     response = services.confirm_draft("user-1", created["id"], "idem-1", created["version"])
     assert response["dailyTotals"]["caloriesKcal"] == 260
+
+
+# -- send_message (Chunk 2b: §7, §7.5, §12.6) --------------------------------
+
+
+def send(seam, content, client_message_id="m1", **kw):
+    seam.foods.setdefault("food-rice", make_food())
+    return services.send_message(
+        "user-1", {"clientMessageId": client_message_id, "content": content, **kw}
+    )
+
+
+def test_send_message_short_circuits_on_a_greeting_and_persists_both_messages(seam):
+    response = send(seam, "hey there")
+
+    assert response["tier"] == "PRECLASSIFIER"
+    assert response["intent"] == "OTHER"
+    assert response["draft"] is None
+    assert len(seam.messages) == 2
+    user_msg, assistant_msg = seam.messages
+    assert (user_msg.role, assistant_msg.role) == ("USER", "ASSISTANT")
+    assert user_msg.normalizedHash is None  # nothing worth caching for a greeting
+
+
+def test_send_message_with_no_food_identified_creates_no_draft(seam):
+    response = send(seam, "what a lovely day")
+    assert response["draft"] is None
+    assert response["intent"] == "OTHER"
+    assert response["unconsumedText"] == ["what a lovely day"]
+
+
+def test_send_message_creates_a_draft_with_mixed_resolved_and_unresolved_items(seam):
+    response = send(seam, "200g rice and 50g xyzzyplonk")
+
+    assert response["tier"] == "PARSER"
+    assert response["intent"] == "LOG_NEW"
+    items = response["draft"]["items"]
+    assert len(items) == 2
+    resolved = next(i for i in items if i["resolution"] == "RESOLVED")
+    unresolved = next(i for i in items if i["resolution"] == "UNRESOLVED")
+    assert resolved["foodName"] == "Cooked White Rice"
+    assert unresolved["foodId"] is None
+    assert unresolved["rawText"] == "50g xyzzyplonk"
+    # Confidence is a coverage ratio (1 of 2 phrases resolved), not the full
+    # §7.2 formula (Chunk 4).
+    assert response["draft"]["confidence"] == pytest.approx(0.5)
+
+
+def test_send_message_t0_cache_hit_skips_the_grammar(seam):
+    seam.foods["food-rice"] = make_food()
+    content = "200g rice"
+    seam.messages.append(
+        SimpleNamespace(
+            id="msg-old",
+            userId="user-1",
+            role="USER",
+            normalizedHash=hash_normalized(normalize_text(content)),
+            parseSnapshot={
+                "name": "Lunch — Rice",
+                "slot": "LUNCH",
+                "items": [{"foodId": "food-rice", "quantity": 200.0, "unit": "g", "state": None}],
+            },
+        )
+    )
+
+    response = send(seam, content)
+
+    assert response["tier"] == "CACHE"
+    assert response["intent"] == "LOG_NEW"
+    assert response["draft"]["totals"]["caloriesKcal"] == 260
+
+
+def test_send_message_edit_item_updates_the_open_draft(seam):
+    create_lunch_draft(seam)  # 200g rice
+    response = send(seam, "rice was actually 100g", client_message_id="m2")
+
+    assert response["intent"] == "EDIT_ITEM"
+    item = response["draft"]["items"][0]
+    assert item["grams"] == 100.0
+    assert item["caloriesKcal"] == round_int(130.0)
+
+
+def test_send_message_remove_item_deletes_from_the_open_draft(seam):
+    create_lunch_draft(seam)
+    response = send(seam, "remove the rice", client_message_id="m2")
+
+    assert response["intent"] == "REMOVE_ITEM"
+    assert response["draft"]["items"] == []
+
+
+def test_send_message_add_item_via_edit_grammar_appends_to_the_open_draft(seam):
+    create_lunch_draft(seam)
+    seam.foods["food-egg"] = make_egg_food()
+
+    response = send(seam, "add 1 piece boiled egg", client_message_id="m2")
+
+    assert response["intent"] == "ADD_ITEM"
+    assert len(response["draft"]["items"]) == 2
+    egg = next(i for i in response["draft"]["items"] if i["foodName"] == "Boiled Egg")
+    assert egg["grams"] == 50.0
+
+
+def test_send_message_set_slot_updates_the_open_draft(seam):
+    create_lunch_draft(seam)
+    response = send(seam, "this was breakfast", client_message_id="m2")
+
+    assert response["intent"] == "SET_SLOT"
+    assert response["draft"]["slot"] == "BREAKFAST"
+
+
+def test_send_message_edit_with_no_confident_target_is_ambiguous(seam):
+    create_lunch_draft(seam)  # only "Cooked White Rice" on the draft
+    response = send(seam, "xyzzyplonk was actually 100g", client_message_id="m2")
+
+    assert response["draft"]["items"][0]["grams"] == 200.0  # unchanged
+    assert response["needsClarification"]["reason"] == "ambiguous_target"
+
+
+def test_send_message_edit_with_two_close_matches_is_ambiguous(seam):
+    chicken_breast = make_food(
+        id="food-chicken-breast", name="Grilled Chicken Breast", servingUnits=[]
+    )
+    chicken_curry = make_food(id="food-chicken-curry", name="Chicken Curry", servingUnits=[])
+    seam.draft = make_draft(
+        [make_item(chicken_breast, id="item-1"), make_item(chicken_curry, id="item-2")],
+        caloriesKcal=0.0,
+        proteinG=0.0,
+        carbsG=0.0,
+        fatG=0.0,
+    )
+
+    response = send(seam, "chicken was actually 150g", client_message_id="m2")
+
+    assert response["needsClarification"]["reason"] == "ambiguous_target"
+    assert set(response["needsClarification"]["candidates"]) == {
+        "Grilled Chicken Breast",
+        "Chicken Curry",
+    }
+
+
+def test_send_message_new_meal_while_draft_open_asks_add_or_new(seam):
+    create_lunch_draft(seam)
+    seam.foods["food-egg"] = make_egg_food()
+
+    response = send(seam, "1 piece boiled egg", client_message_id="m2")
+
+    assert response["needsClarification"] == {"reason": "open_draft", "candidates": ["ADD", "NEW"]}
+    assert len(response["draft"]["items"]) == 1  # untouched
+
+
+def test_send_message_on_open_draft_add_appends_the_new_items(seam):
+    create_lunch_draft(seam)
+    seam.foods["food-egg"] = make_egg_food()
+
+    response = send(seam, "1 piece boiled egg", client_message_id="m2", onOpenDraft="ADD")
+
+    assert response["intent"] == "ADD_ITEM"
+    assert len(response["draft"]["items"]) == 2
+
+
+def test_send_message_on_open_draft_new_discards_the_old_one(seam):
+    old = create_lunch_draft(seam)
+    seam.foods["food-egg"] = make_egg_food()
+
+    response = send(seam, "1 piece boiled egg", client_message_id="m2", onOpenDraft="NEW")
+
+    assert response["intent"] == "LOG_NEW"
+    assert response["draft"]["id"] != old["id"]
+    assert len(response["draft"]["items"]) == 1
+    assert response["draft"]["items"][0]["foodName"] == "Boiled Egg"
+
+
+def test_send_message_idempotency_replay_returns_the_same_response(seam):
+    first = send(seam, "200g rice", client_message_id="m1")
+    second = send(seam, "200g rice", client_message_id="m1")
+    assert second == first
+    # No second draft/message pair was created on replay.
+    assert len(seam.messages) == 2
+
+
+def test_send_message_idempotency_key_reuse_with_different_content_is_rejected(seam):
+    send(seam, "200g rice", client_message_id="m1")
+    with pytest.raises(IdempotencyKeyReuseError):
+        send(seam, "200g chicken", client_message_id="m1")

@@ -51,3 +51,21 @@ class MatchBand(StrEnum):
     HIGH = "HIGH"
     MEDIUM = "MEDIUM"
     LOW = "LOW"
+
+
+class ChatRole(StrEnum):
+    USER = "USER"
+    ASSISTANT = "ASSISTANT"
+
+
+class ChatIntent(StrEnum):
+    """The 6 members Chunk 2b can produce. Chunk 6 adds the other 7 PRD
+    intents (DIARY_QUERY, APP_HELP, NUTRITION_QA, ADVICE_SEEKING,
+    WELLBEING_FLAG, SOCIAL, UNCLEAR) with the full 13-intent taxonomy."""
+
+    LOG_NEW = "LOG_NEW"
+    EDIT_ITEM = "EDIT_ITEM"
+    ADD_ITEM = "ADD_ITEM"
+    REMOVE_ITEM = "REMOVE_ITEM"
+    SET_SLOT = "SET_SLOT"
+    OTHER = "OTHER"

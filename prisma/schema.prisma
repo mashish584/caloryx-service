@@ -78,6 +78,7 @@ model User {
   loggedMeals  LoggedMeal[]
   chatSessions ChatSession[]
   mealDrafts   MealDraft[]
+  chatMessages ChatMessage[]
 
   @@index([isGuest, createdAt])
 }
@@ -338,10 +339,13 @@ model LoggedMealItem {
 
 // --- Meal Assistant chat drafts (AI Meal Assistant PRD §9, §12.1, §12.2) ---
 //
-// Chunk 2a of the roadmap: the draft data model, state machine, optimistic
-// locking, and confirm-time idempotency - built and tested against structured
-// input identical in shape to Chunk 1's manual entry. No free-text parsing,
-// no ChatMessage, no AI: that's Chunk 2b, layered on top of what's here.
+// Chunk 2a: the draft data model, state machine, optimistic locking, and
+// confirm-time idempotency - built and tested against structured input
+// identical in shape to Chunk 1's manual entry.
+// Chunk 2b (this addition): free-text understanding on top of it - the
+// T-1/T0/T1 pipeline, ChatMessage, and food-name matching. Still no AI/LLM
+// (that's Chunk 4+) and no composite dishes (Chunk 3) or estimated-dish
+// handling (Chunk 5).
 
 enum DraftStatus {
   OPEN
@@ -350,12 +354,11 @@ enum DraftStatus {
   EXPIRED
 }
 
-/// Which tier produced a draft (§9). `MANUAL` is NOT in the PRD's enum - it's
-/// added here because none of the PRD's members describe "no parsing
-/// happened," which is the only case Chunk 2a's structured endpoints produce.
-/// The rest become reachable starting Chunk 2b (PARSER, CACHE, PRECLASSIFIER
-/// don't apply to a draft itself but round out the shared vocabulary) and
-/// Chunk 4 (LLM_SMALL/LLM_LARGE).
+/// Which tier produced a draft/message (§9). `MANUAL` is NOT in the PRD's
+/// enum - it's added here because none of the PRD's members describe "no
+/// parsing happened," which is the only case Chunk 2a's structured endpoints
+/// produce. Chunk 2b makes PRECLASSIFIER/CACHE/PARSER reachable; Chunk 4 adds
+/// LLM_SMALL/LLM_LARGE.
 enum ParseTier {
   MANUAL
   PRECLASSIFIER
@@ -367,26 +370,26 @@ enum ParseTier {
 
 /// An item is in exactly one resolution state, and that state determines
 /// which fields are required/meaningful (enforced in the service layer, not
-/// the database). Only RESOLVED is reachable in Chunk 2a - UNRESOLVED needs
-/// food-name matching (Chunk 2b) and ESTIMATED_DISH needs the AI-driven
-/// DishCategoryProfile (Chunk 5).
+/// the database). RESOLVED and UNRESOLVED are both reachable from Chunk 2b
+/// (a low/no-confidence food-name match resolves to UNRESOLVED); ESTIMATED_DISH
+/// needs the AI-driven DishCategoryProfile (Chunk 5).
 enum ItemResolution {
   RESOLVED
   UNRESOLVED
   ESTIMATED_DISH
 }
 
-/// Was an amount stated? (§5.1.1a) Only EXPLICIT is reachable in Chunk 2a -
-/// the structured item endpoint requires a quantity. ASSUMED needs the
-/// quantity-resolution ladder (Chunk 4).
+/// Was an amount stated? (§5.1.1a) Only EXPLICIT is reachable through
+/// Chunk 2b - both the structured item endpoint and the T1 grammar require an
+/// explicit quantity. ASSUMED needs the quantity-resolution ladder (Chunk 4).
 enum QuantitySource {
   EXPLICIT
   ASSUMED
 }
 
 /// How a quantity was converted to grams (§5.1.1a). Only DIRECT and
-/// HOUSEHOLD_TABLE are reachable in Chunk 2a - USER_HISTORY/CATALOG_SERVING/
-/// CATEGORY_FALLBACK are ladder steps that need Chunk 4.
+/// HOUSEHOLD_TABLE are reachable through Chunk 2b - USER_HISTORY/
+/// CATALOG_SERVING/CATEGORY_FALLBACK are ladder steps that need Chunk 4.
 enum MassSource {
   DIRECT
   HOUSEHOLD_TABLE
@@ -395,25 +398,26 @@ enum MassSource {
   CATEGORY_FALLBACK
 }
 
-/// Food-resolution confidence band (§12.6). Unused (null) in Chunk 2a - a
-/// draft item's food is chosen by exact id, not fuzzy-matched, so there is
-/// nothing to band yet. Populated starting Chunk 2b.
+/// Food-resolution confidence band (§12.6). Null for Chunk 2a's
+/// exact-id-chosen items (nothing to band); populated by Chunk 2b's fuzzy
+/// food-name matching.
 enum MatchBand {
   HIGH
   MEDIUM
   LOW
 }
 
-/// Groups a user's drafts (and, from Chunk 2b, their chat messages). Not
-/// client-visible yet - get-or-created internally, one per UTC calendar day
-/// per user (see assistant.repository.get_or_create_today_session). Becomes a
-/// real "resume my chat" concept once ChatMessage exists.
+/// Groups a user's drafts and chat messages. Not client-visible yet -
+/// get-or-created internally, one per UTC calendar day per user (see
+/// assistant.repository.get_or_create_today_session). Becomes a real
+/// "resume my chat" concept once a scrollback UI reads `messages` (Chunk 6+).
 model ChatSession {
-  id        String      @id @default(cuid())
-  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id        String        @id @default(cuid())
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   userId    String
-  startedAt DateTime    @default(now())
+  startedAt DateTime      @default(now())
   drafts    MealDraft[]
+  messages  ChatMessage[]
 
   @@index([userId, startedAt])
 }
@@ -430,6 +434,10 @@ model MealDraft {
   name      String
   slot      MealSlot
   items     MealDraftItem[]
+  // Which chat messages rendered this draft as a preview card (the inverse of
+  // ChatMessage.draftId, per the PRD §9 sketch) - unused by anything yet, but
+  // required for the relation to compile.
+  messages  ChatMessage[]
 
   // Always the sum of `items` at write time (§6) - recomputed on every
   // mutation exactly like LoggedMeal's totals, never authored independently.
@@ -476,11 +484,14 @@ model MealDraft {
 ///                    matchScore/matchBand                        set when
 ///                                                                 food-name
 ///                                                                 matched
-///                                                                 (Chunk 2b)
+///                                                                 (Chunk 2b);
+///                                                                 null for a
+///                                                                 structured,
+///                                                                 exact-id
+///                                                                 pick (2a)
 ///                    dishCategory, kcal*                         MUST BE NULL
 ///   UNRESOLVED      rawText                                      REQUIRED
 ///                    everything else                             NULL
-///                    (unreachable until Chunk 2b)
 ///   ESTIMATED_DISH  dishCategory, grams, kcalLow/High/Midpoint,
 ///                    profileVersion                              REQUIRED
 ///                    (unreachable until Chunk 5)
@@ -492,10 +503,10 @@ model MealDraftItem {
 
   food   Food?   @relation(fields: [foodId], references: [id])
   foodId String?
-  // Always present. In Chunk 2a there's no user-typed text to store, so this
-  // is synthesized ("200g Cooked White Rice") for display/debug parity with
-  // the PRD's shape; from Chunk 2b it's what the user actually said, and it's
-  // what a low-confidence match files to the miss-queue (Chunk 3).
+  // Always present. Synthesized ("200g Cooked White Rice") for a structured,
+  // 2a-style item with no user-typed text; from Chunk 2b it's the actual
+  // matched phrase, and for UNRESOLVED items it's what a low-confidence match
+  // will file to the miss-queue (Chunk 3).
   rawText String
 
   quantity Float?
@@ -507,15 +518,17 @@ model MealDraftItem {
   // edits so "the default" stays meaningful.
   defaultGrams Float?
 
-  // Full interpretation persisted, nothing dropped - always null in Chunk 2a,
-  // no grammar exists yet to populate them (Chunk 2b).
+  // Full interpretation persisted, nothing dropped. `prep` is populated by
+  // Chunk 2b's grammar (e.g. "grilled" alongside state=COOKED); `sizeQualifier`
+  // stays null through Chunk 2b - the grammar doesn't attempt to detect it at
+  // all yet, since acting on it needs the base-serving ladder (Chunk 4).
   prep          String?
   sizeQualifier String?
 
-  quantitySource QuantitySource? // drives the est. chip (§5.1.1a) - always EXPLICIT in Chunk 2a
+  quantitySource QuantitySource? // drives the est. chip (§5.1.1a) - always EXPLICIT through Chunk 2b
   massSource     MassSource?     // drives the provenance line
 
-  matchScore Float?     // null in Chunk 2a - food is chosen by exact id, not fuzzy-matched
+  matchScore Float?     // null for a structured, exact-id item (2a); set by Chunk 2b's fuzzy match
   matchBand  MatchBand?
 
   // ESTIMATED_DISH persistence (§7.6.1) - unreachable until Chunk 5.
@@ -529,9 +542,9 @@ model MealDraftItem {
 }
 
 /// Idempotency for mutating requests that must never double-apply on retry
-/// (§9, §12.1). Used only by `confirm` in Chunk 2a (double-tapping
-/// Confirm & Log must not create two LoggedMeals); Chunk 2b reuses it for
-/// `POST /messages`.
+/// (§9, §12.1). Guards `confirm` (double-tapping Confirm & Log must not
+/// create two LoggedMeals) and, from Chunk 2b, `POST /messages` (a retried
+/// send must not double-parse or double-mutate the draft).
 model IdempotencyRecord {
   key    String @id // client-supplied idempotency key
   userId String
@@ -549,4 +562,64 @@ model IdempotencyRecord {
   expiresAt DateTime
 
   @@index([expiresAt])
+}
+
+// --- Chunk 2b: free-text understanding (AI Meal Assistant PRD §7, §9) ------
+
+enum ChatRole {
+  USER
+  ASSISTANT
+}
+
+/// What a message resolved to (§9, §7.5). Only the 6 members Chunk 2b can
+/// actually produce - the other 7 PRD intents (DIARY_QUERY, APP_HELP,
+/// NUTRITION_QA, ADVICE_SEEKING, WELLBEING_FLAG, SOCIAL, UNCLEAR) arrive with
+/// the full 13-intent taxonomy in Chunk 6. Until then, anything the T-1 gate
+/// doesn't recognise as food-parsing-shaped is tagged OTHER.
+enum ChatIntent {
+  LOG_NEW
+  EDIT_ITEM
+  ADD_ITEM
+  REMOVE_ITEM
+  SET_SLOT
+  OTHER
+}
+
+/// One turn of the chat (§9). `content` is the raw text for USER messages and
+/// the scripted reply for ASSISTANT ones. `userId` is denormalized off
+/// `session` purely so the T0 cache lookup (`assistant.repository.
+/// find_cached_message`) doesn't need a join.
+model ChatMessage {
+  id      String      @id @default(cuid())
+  session ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sessionId String
+  user    User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId  String
+
+  role            ChatRole
+  // Idempotency key (§12.1) - null for ASSISTANT rows, which are never
+  // retried independently of the USER message that produced them.
+  clientMessageId String?
+  content         String
+
+  // T0 cache key (§7.4) - hash(normalize(content)); null for ASSISTANT rows
+  // and for USER rows that never attempt a food parse (e.g. a caught
+  // greeting has nothing worth caching).
+  normalizedHash String?
+  tier           ParseTier?
+  intent         ChatIntent?
+  // Which draft this message rendered as a preview card, if any (§9).
+  draftId String?
+  draft   MealDraft? @relation(fields: [draftId], references: [id])
+  // The resolved *input* items for a successful LOG_NEW - {name, slot, items:
+  // [{foodId, quantity, unit, state}]} - reused by a T0 hit instead of
+  // re-running the grammar. Deliberately not pre-computed nutrition: a T0 hit
+  // re-resolves through the same food-catalog lookup every other path uses,
+  // so it can never go stale against a catalog edit. Null for everything else.
+  parseSnapshot Json?
+
+  createdAt DateTime @default(now())
+
+  @@unique([sessionId, clientMessageId])
+  @@index([userId, normalizedHash])
 }

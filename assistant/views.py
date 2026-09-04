@@ -1,5 +1,5 @@
-"""Meal Assistant draft endpoints (PRD §9, §10, §5.2.1) - structured (non-text)
-mutation API, Chunk 2a. `POST /messages` and everything text-driven is Chunk 2b.
+"""Meal Assistant endpoints (PRD §9, §10, §5.2.1) - Chunk 2a's structured
+draft mutation API, plus Chunk 2b's `POST /messages` text pipeline on top.
 """
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ from .serializers import (
     DraftItemUpdateSerializer,
     DraftUpdateSerializer,
     MealDraftSerializer,
+    MessageResponseSerializer,
+    SendMessageSerializer,
     VersionSerializer,
 )
 
@@ -223,3 +225,33 @@ class DraftConfirmView(APIView):
             serializer.validated_data["version"],
         )
         return Response(payload, status=status.HTTP_201_CREATED)
+
+
+class MessageView(APIView):
+    """POST /api/v1/assistant/messages (Chunk 2b) - text in, structured
+    intent out, dispatched into the same draft-mutation functions above.
+    Always 200 (§10.1) - a short-circuited reply, a clarification request, and
+    a created/updated draft are all valid conversational turns, not error
+    states."""
+
+    @extend_schema(
+        operation_id="assistant_messages_create",
+        request=SendMessageSerializer,
+        responses={
+            200: MessageResponseSerializer,
+            400: VALIDATION_ERROR,
+            401: UNAUTHORIZED,
+            409: error_response(
+                "The same clientMessageId was already used for a different "
+                "message.",
+                "idempotency_key_reused",
+            ),
+            500: SERVER_ERROR,
+        },
+    )
+    def post(self, request):
+        serializer = SendMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = services.send_message(request.user.user_id, serializer.validated_data)
+        payload["requestId"] = getattr(request, "request_id", None)
+        return Response(payload)

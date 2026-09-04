@@ -136,6 +136,11 @@ SPECTACULAR_SETTINGS = {
         "SourceEnum": "nutrition.enums.FoodSource",
         "SlotEnum": "nutrition.enums.MealSlot",
         "TypeEnum": "nutrition.enums.ServingUnitType",
+        # `MealDraftSerializer.parseTier` and `MessageResponseSerializer.tier`
+        # share the same ParseTier choice set but auto-derive different
+        # component names ("ParseTierEnum" vs "TierEnum") from their field
+        # names - same issue as StateEnum above.
+        "TierEnum": "chatparser.enums.ParseTier",
     },
 }
 

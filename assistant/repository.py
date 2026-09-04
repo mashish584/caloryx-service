@@ -161,3 +161,31 @@ def save_idempotency_record(
             "expiresAt": expires_at,
         }
     )
+
+
+# -- chat messages (Chunk 2b, §9) --------------------------------------------
+
+
+def create_chat_message(session_id: str, user_id: str, data: Dict[str, Any]) -> Any:
+    payload = dict(
+        data,
+        session={"connect": {"id": session_id}},
+        user={"connect": {"id": user_id}},
+    )
+    if "parseSnapshot" in payload and payload["parseSnapshot"] is not None:
+        payload["parseSnapshot"] = Json(payload["parseSnapshot"])
+    return get_client().chatmessage.create(data=payload)
+
+
+def find_cached_message(user_id: str, normalized_hash: str) -> Optional[Any]:
+    """T0 (§7.4): the most recent successful `LOG_NEW` parse by this user for
+    this exact normalized text, if any. `parseSnapshot` is checked in Python
+    rather than in the query - simpler than a JSON-null filter, and this
+    table is small enough per-user that it doesn't matter."""
+    message = get_client().chatmessage.find_first(
+        where={"userId": user_id, "normalizedHash": normalized_hash, "role": "USER"},
+        order={"createdAt": "desc"},
+    )
+    if message is not None and message.parseSnapshot is not None:
+        return message
+    return None

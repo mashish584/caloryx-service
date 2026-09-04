@@ -1,7 +1,8 @@
-"""Request/response shapes for the Meal Assistant draft API (PRD §9, §10, §5.2.1).
+"""Request/response shapes for the Meal Assistant API (PRD §9, §10, §5.2.1).
 
-Chunk 2a: structured (non-text) endpoints only - items are added by exact
-`foodId`, never by name. Plain `Serializer`s throughout, following
+Chunk 2a: structured (non-text) draft endpoints - items are added by exact
+`foodId`. Chunk 2b adds `POST /messages` on top - free text, dispatching into
+the same draft-mutation functions. Plain `Serializer`s throughout, following
 meals/serializers.py's convention of separate request/response shapes plus
 free `serialize_x()` helpers for Prisma rows.
 """
@@ -11,7 +12,15 @@ from typing import Any, Dict
 
 from rest_framework import serializers
 
-from chatparser import DraftStatus, ItemResolution, MassSource, MatchBand, ParseTier, QuantitySource
+from chatparser import (
+    ChatIntent,
+    DraftStatus,
+    ItemResolution,
+    MassSource,
+    MatchBand,
+    ParseTier,
+    QuantitySource,
+)
 from engine.rounding import round_int
 from meals.serializers import MAX_ITEMS_PER_MEAL, LoggedMealSerializer
 from meals.services import food_per_100g
@@ -98,11 +107,23 @@ class VersionSerializer(serializers.Serializer):
 
 class ConfirmSerializer(serializers.Serializer):
     """POST /drafts/{id}/confirm. `idempotencyKey` guards logging - separate
-    from any message-level idempotency, which doesn't exist until Chunk 2b
-    (§12.1: "messageId guards parsing, the confirm key guards logging")."""
+    from `POST /messages`'s message-level idempotency (§12.1: "messageId
+    guards parsing, the confirm key guards logging")."""
 
     idempotencyKey = serializers.CharField(max_length=128)
     version = serializers.IntegerField(min_value=1)
+
+
+class SendMessageSerializer(serializers.Serializer):
+    """POST /messages (§10, §12.1). `clientMessageId` is the idempotency key
+    for the whole turn. `onOpenDraft` answers the §5.1.1 "add to this meal or
+    start a new one" prompt when a new-meal-shaped message arrives while a
+    draft is already open - omitted on the first attempt, sent on the
+    follow-up once the user has picked."""
+
+    clientMessageId = serializers.CharField(max_length=128)
+    content = serializers.CharField(max_length=2000)
+    onOpenDraft = serializers.ChoiceField(choices=["ADD", "NEW"], required=False)
 
 
 # -- responses ------------------------------------------------------------
@@ -180,6 +201,33 @@ class DailyTotalsSerializer(serializers.Serializer):
 class ConfirmResponseSerializer(serializers.Serializer):
     loggedMeal = LoggedMealSerializer()
     dailyTotals = DailyTotalsSerializer()
+
+
+class NeedsClarificationSerializer(serializers.Serializer):
+    """Populated instead of a mutation whenever text input is genuinely
+    ambiguous (§7.5, §5.1.1) - `reason="ambiguous_target"` (an edit/remove
+    couldn't tell which draft item was meant; `candidates` are item names) or
+    `reason="open_draft"` (a new-meal-shaped message arrived with a draft
+    already open; `candidates` is always `["ADD", "NEW"]`, echoing the
+    `onOpenDraft` values `POST /messages` accepts)."""
+
+    reason = serializers.ChoiceField(choices=["ambiguous_target", "open_draft"])
+    candidates = serializers.ListField(child=serializers.CharField())
+
+
+class MessageResponseSerializer(serializers.Serializer):
+    """POST /messages - 200 on every outcome (§10.1 labels this exact
+    endpoint "200, draft created"; it's a conversational turn, not always a
+    resource creation, unlike /drafts and /confirm)."""
+
+    requestId = serializers.CharField()
+    messageId = serializers.CharField()
+    tier = serializers.ChoiceField(choices=[t.value for t in ParseTier])
+    intent = serializers.ChoiceField(choices=[i.value for i in ChatIntent])
+    assistantText = serializers.CharField()
+    draft = MealDraftSerializer(allow_null=True)
+    unconsumedText = serializers.ListField(child=serializers.CharField())
+    needsClarification = NeedsClarificationSerializer(allow_null=True)
 
 
 # -- serialize_x() helpers ---------------------------------------------------

@@ -111,6 +111,7 @@ PROTECTED = [
     ("patch", "/api/v1/assistant/drafts/draft-1/items/item-1"),
     ("delete", "/api/v1/assistant/drafts/draft-1/items/item-1"),
     ("post", "/api/v1/assistant/drafts/draft-1/confirm"),
+    ("post", "/api/v1/assistant/messages"),
 ]
 
 
@@ -136,6 +137,7 @@ def test_urls_resolve():
         reverse("assistant-drafts-confirm", args=["draft-1"])
         == "/api/v1/assistant/drafts/draft-1/confirm"
     )
+    assert reverse("assistant-messages") == "/api/v1/assistant/messages"
 
 
 def test_creating_a_draft_returns_the_computed_totals(client, guest, monkeypatch):
@@ -279,3 +281,74 @@ def test_confirming_a_draft_returns_the_logged_meal_and_daily_totals(client, gue
     body = response.json()
     assert body["loggedMeal"]["source"] == "CHAT_AI"
     assert body["dailyTotals"]["caloriesKcal"] == 0
+
+
+def test_sending_a_message_creates_a_draft_from_text(client, guest, monkeypatch):
+    food = make_food()
+    monkeypatch.setattr(meals_repository, "get_food", lambda food_id: food)
+    monkeypatch.setattr(meals_repository, "search_foods", lambda query, **kw: [food])
+    monkeypatch.setattr(assistant_repository, "get_open_draft", lambda user_id: None)
+    monkeypatch.setattr(
+        assistant_repository, "get_or_create_today_session", lambda user_id: SimpleNamespace(id="session-1")
+    )
+    monkeypatch.setattr(assistant_repository, "get_idempotency_record", lambda key: None)
+    monkeypatch.setattr(assistant_repository, "save_idempotency_record", lambda *a, **kw: None)
+    monkeypatch.setattr(assistant_repository, "find_cached_message", lambda user_id, h: None)
+    monkeypatch.setattr(
+        assistant_repository,
+        "create_chat_message",
+        lambda session_id, user_id, data: SimpleNamespace(id="msg-1", **data),
+    )
+
+    def create_draft_with_expiry_check(user_id, session_id, draft_data, items_data):
+        item = make_item(food, **{k: v for k, v in items_data[0].items() if k != "foodId"})
+        return make_draft([item], userId=user_id, sessionId=session_id, **draft_data)
+
+    monkeypatch.setattr(
+        assistant_repository, "create_draft_with_expiry_check", create_draft_with_expiry_check
+    )
+
+    response = client.post(
+        "/api/v1/assistant/messages",
+        data={"clientMessageId": "m1", "content": "200g rice"},
+        content_type="application/json",
+        HTTP_AUTHORIZATION=guest,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tier"] == "PARSER"
+    assert body["intent"] == "LOG_NEW"
+    assert body["draft"]["totals"]["caloriesKcal"] == 260
+    assert body["requestId"]
+
+
+def test_sending_a_new_meal_message_while_a_draft_is_open_asks_for_clarification(
+    client, guest, monkeypatch
+):
+    food = make_food()
+    existing_draft = make_draft([make_item(food)])
+    monkeypatch.setattr(assistant_repository, "get_open_draft", lambda user_id: existing_draft)
+    monkeypatch.setattr(assistant_repository, "expire_draft_if_stale", lambda d: d)
+    monkeypatch.setattr(assistant_repository, "get_idempotency_record", lambda key: None)
+    monkeypatch.setattr(assistant_repository, "save_idempotency_record", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        assistant_repository, "get_or_create_today_session", lambda user_id: SimpleNamespace(id="session-1")
+    )
+    monkeypatch.setattr(
+        assistant_repository,
+        "create_chat_message",
+        lambda session_id, user_id, data: SimpleNamespace(id="msg-1", **data),
+    )
+
+    response = client.post(
+        "/api/v1/assistant/messages",
+        data={"clientMessageId": "m2", "content": "1 piece boiled egg"},
+        content_type="application/json",
+        HTTP_AUTHORIZATION=guest,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["needsClarification"] == {"reason": "open_draft", "candidates": ["ADD", "NEW"]}
+    assert body["draft"]["id"] == existing_draft.id
