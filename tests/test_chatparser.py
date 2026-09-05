@@ -8,6 +8,7 @@ from chatparser import (
     band_for_score,
     classify_t1_intent,
     extract_nutrition_qa_food,
+    has_wellbeing_signal,
     hash_normalized,
     is_diary_query_a_trend_question,
     is_non_food_greeting,
@@ -279,3 +280,35 @@ def test_a_close_variant_scores_medium_or_high():
 def test_unrelated_strings_score_low():
     score = score_food_match("banana", "Grilled Chicken Breast")
     assert band_for_score(score) == "LOW"
+
+
+# -- has_wellbeing_signal (§5.6, Chunk 6b) ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "i don't deserve to eat today",
+        "i hate my body so much",
+        "i've been skipping meals all week",
+        "i haven't eaten in three days",
+        "i keep punishing myself for eating",
+        "i feel so guilty about eating that",
+    ],
+)
+def test_wellbeing_signal_triggers_are_caught(text):
+    assert has_wellbeing_signal(normalize_text(text)) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "200g rice",
+        "grilled chicken salad with a tahini dressing",
+        "how do i change my calorie goal",
+        "how many calories do i have left",
+        "thanks",
+    ],
+)
+def test_ordinary_messages_do_not_trigger_the_wellbeing_signal(text):
+    assert has_wellbeing_signal(normalize_text(text)) is False

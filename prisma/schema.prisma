@@ -500,6 +500,11 @@ model ChatSession {
   startedAt DateTime      @default(now())
   drafts    MealDraft[]
   messages  ChatMessage[]
+  // Set once a WELLBEING_FLAG response fires in this session (§5.6: "never
+  // gamify in this state - suppress streak celebrations and deficit-praise
+  // copy for the session"). Forward-declared - no gamification/streak
+  // feature reads this yet, same posture as ParseTier.MANUAL.
+  gamificationSuppressed Boolean @default(false)
 
   @@index([userId, startedAt])
 }
@@ -682,10 +687,7 @@ enum ChatRole {
 /// NUTRITION_QA, ADVICE_SEEKING, WELLBEING_FLAG, SOCIAL, UNCLEAR) arrive with
 /// the full 13-intent taxonomy in Chunk 6. Until then, anything the T-1 gate
 /// doesn't recognise as food-parsing-shaped is tagged OTHER.
-/// The PRD's full 13-intent taxonomy (§5.5), minus WELLBEING_FLAG - held back
-/// deliberately until Chunk 6b actually implements its required behavior
-/// (§5.6), so the model is never offered a classification nothing handles
-/// yet.
+/// The PRD's full 13-intent taxonomy (§5.5, §5.6).
 enum ChatIntent {
   LOG_NEW
   EDIT_ITEM
@@ -696,6 +698,7 @@ enum ChatIntent {
   APP_HELP
   NUTRITION_QA
   ADVICE_SEEKING
+  WELLBEING_FLAG
   SOCIAL
   UNCLEAR
   OTHER

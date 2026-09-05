@@ -204,6 +204,7 @@ def seam(monkeypatch):
         draft_operations=[],
         dish_category_profiles={},
         profiles={},
+        gamification_suppressed_sessions=[],
     )
 
     monkeypatch.setattr(onboarding_repository, "get_profile", lambda user_id, **kw: state.profiles.get(user_id))
@@ -212,6 +213,13 @@ def seam(monkeypatch):
 
     monkeypatch.setattr(
         repository, "get_or_create_today_session", lambda user_id: SimpleNamespace(id="session-1")
+    )
+
+    def set_session_gamification_suppressed(session_id):
+        state.gamification_suppressed_sessions.append(session_id)
+
+    monkeypatch.setattr(
+        repository, "set_session_gamification_suppressed", set_session_gamification_suppressed
     )
 
     def create_draft_with_expiry_check(user_id, session_id, draft_data, items_data):
@@ -2054,3 +2062,89 @@ def test_send_message_t2_non_logging_intent_does_not_refund_quota(seam, monkeypa
     send(seam, "grilled chicken salad with a tahini dressing")
 
     assert seam.quota_counters["user-1"].count == 1
+
+
+# -- WELLBEING_FLAG (Chunk 6b, §5.6) -----------------------------------------
+
+
+def test_send_message_wellbeing_flag_from_t2_is_confirmed_by_t3(seam, monkeypatch):
+    t2_envelope = llm_envelope(intent="WELLBEING_FLAG", items=[])
+    t3_envelope = llm_envelope(intent="LOG_NEW", items=[])  # T3 disagreeing shouldn't matter
+    stub_call_small_model(monkeypatch, result=stub_llm_response(t2_envelope))
+    large_calls = stub_call_large_model(monkeypatch, result=stub_llm_response(t3_envelope))
+
+    response = send(seam, "i've been skipping meals all week and feel awful")
+
+    assert len(large_calls) == 1
+    assert response["tier"] == "LLM_LARGE"
+    assert response["intent"] == "WELLBEING_FLAG"
+    assert response["draft"] is None
+    assert response["gamificationSuppressed"] is True
+    assert response["wellbeingResources"]
+    assert seam.gamification_suppressed_sessions == ["session-1"]
+
+
+def test_send_message_wellbeing_flag_from_t2_survives_a_t3_call_failure(seam, monkeypatch):
+    t2_envelope = llm_envelope(intent="WELLBEING_FLAG", items=[])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(t2_envelope))
+    stub_call_large_model(monkeypatch, exc=LLMCallError("boom"))
+
+    response = send(seam, "i've been skipping meals all week and feel awful")
+
+    assert response["intent"] == "WELLBEING_FLAG"
+
+
+def test_send_message_wellbeing_flag_surfaced_by_t3_after_low_confidence_t2(seam, monkeypatch):
+    t2_envelope = llm_envelope(intent="LOG_NEW", items=[llm_item("something", confidence=0.1)])
+    t3_envelope = llm_envelope(intent="WELLBEING_FLAG", items=[])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(t2_envelope))
+    stub_call_large_model(monkeypatch, result=stub_llm_response(t3_envelope))
+
+    response = send(seam, "i had something weird today")
+
+    assert response["intent"] == "WELLBEING_FLAG"
+
+
+def test_send_message_wellbeing_flag_consumes_quota_only_once(seam, monkeypatch):
+    t2_envelope = llm_envelope(intent="WELLBEING_FLAG", items=[])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(t2_envelope))
+    stub_call_large_model(monkeypatch, result=stub_llm_response(llm_envelope()))
+
+    send(seam, "i've been skipping meals all week and feel awful")
+
+    assert seam.quota_counters["user-1"].count == 1
+
+
+def test_wellbeing_check_all_messages_off_by_default_skips_the_model(seam, monkeypatch):
+    large_calls = stub_call_large_model(
+        monkeypatch, result=stub_llm_response(llm_envelope(intent="WELLBEING_FLAG"))
+    )
+
+    response = send(seam, "200g rice, i don't deserve to eat this")
+
+    assert large_calls == []
+    assert response["intent"] == "LOG_NEW"
+    assert response["draft"] is not None
+
+
+def test_wellbeing_check_all_messages_on_intercepts_a_flagged_message(seam, monkeypatch):
+    stub_call_large_model(monkeypatch, result=stub_llm_response(llm_envelope(intent="WELLBEING_FLAG")))
+
+    with override_settings(WELLBEING_CHECK_ALL_MESSAGES=True):
+        response = send(seam, "200g rice, i don't deserve to eat this")
+
+    assert response["intent"] == "WELLBEING_FLAG"
+    assert response["draft"] is None
+
+
+def test_wellbeing_check_all_messages_on_but_not_confirmed_logs_normally(seam, monkeypatch):
+    large_calls = stub_call_large_model(
+        monkeypatch, result=stub_llm_response(llm_envelope(intent="LOG_NEW"))
+    )
+
+    with override_settings(WELLBEING_CHECK_ALL_MESSAGES=True):
+        response = send(seam, "200g rice, i don't deserve to eat this")
+
+    assert len(large_calls) == 1
+    assert response["intent"] == "LOG_NEW"
+    assert response["draft"] is not None

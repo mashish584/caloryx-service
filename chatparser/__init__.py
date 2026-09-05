@@ -21,6 +21,7 @@ from .normalize import hash_normalized, normalize_text
 from .preclassifier import (
     classify_t1_intent,
     extract_nutrition_qa_food,
+    has_wellbeing_signal,
     is_advice_seeking,
     is_app_help,
     is_diary_query,
@@ -46,6 +47,7 @@ __all__ = [
     "band_for_score",
     "classify_t1_intent",
     "extract_nutrition_qa_food",
+    "has_wellbeing_signal",
     "hash_normalized",
     "is_advice_seeking",
     "is_app_help",

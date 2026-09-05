@@ -240,14 +240,52 @@ def is_unclear(normalized_text: str) -> bool:
     return bool(text) and not any(c.isalpha() for c in text)
 
 
+# -- WELLBEING_FLAG (§5.6, Chunk 6b) ------------------------------------------
+
+# Deliberately high-recall, not precision-tuned: this never classifies
+# WELLBEING_FLAG directly (§5.6: "a keyword classifier is too blunt here") -
+# it only decides whether a message is worth an extra T3 call to actually
+# ask. Overtriggering costs one confirmed-no T3 call; undertriggering is the
+# failure mode that matters ("false negatives matter more than cost").
+_WELLBEING_SIGNAL_TRIGGERS = (
+    "don't deserve to eat",
+    "dont deserve to eat",
+    "don't deserve food",
+    "hate my body",
+    "hate myself",
+    "skipping meals",
+    "skip meals",
+    "haven't eaten in",
+    "havent eaten in",
+    "not eating",
+    "starving myself",
+    "punish myself",
+    "punishing myself",
+    "extreme deficit",
+    "purge",
+    "purging",
+    "binge",
+    "bingeing",
+    "fasting for days",
+    "guilty about eating",
+    "guilty for eating",
+    "feel so guilty",
+)
+
+
+def has_wellbeing_signal(normalized_text: str) -> bool:
+    return any(trigger in normalized_text for trigger in _WELLBEING_SIGNAL_TRIGGERS)
+
+
 # -- dispatch -----------------------------------------------------------------
 
 
 def classify_t1_intent(normalized_text: str) -> Optional[str]:
     """First match wins; `None` means "not recognized here" - the caller
     continues down the pipeline (T1's grammar, then T2/T3), not "classify as
-    OTHER" (§5.5's `ChatIntent` values, minus the logging five and
-    `WELLBEING_FLAG` - Chunk 6b)."""
+    OTHER". Never returns `WELLBEING_FLAG` - that classification only ever
+    comes from a T2/T3 envelope (§5.6), triggered here only indirectly via
+    `has_wellbeing_signal`."""
     if is_non_food_greeting(normalized_text):
         return "SOCIAL"
     if is_app_help(normalized_text):

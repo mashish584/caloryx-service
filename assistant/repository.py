@@ -40,6 +40,15 @@ def get_or_create_today_session(user_id: str) -> Any:
     return get_client().chatsession.create(data={"user": {"connect": {"id": user_id}}})
 
 
+def set_session_gamification_suppressed(session_id: str) -> Any:
+    """§5.6, Chunk 6b - "never gamify in this state... for the session."
+    Sticky for the rest of the session; nothing reads it yet (no
+    gamification feature exists), forward-declared for when one does."""
+    return get_client().chatsession.update(
+        where={"id": session_id}, data={"gamificationSuppressed": True}
+    )
+
+
 # -- drafts ---------------------------------------------------------------
 
 

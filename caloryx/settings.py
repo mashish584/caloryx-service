@@ -203,6 +203,33 @@ AI_QUOTA_WINDOW_HOURS = int(env("AI_QUOTA_WINDOW_HOURS", "24"))
 # to calibrate against yet - same reasoning as the T1->T2 router in Chunk 4a).
 T3_ESCALATION_CONFIDENCE_THRESHOLD = float(env("T3_ESCALATION_CONFIDENCE_THRESHOLD", "0.5"))
 
+# --- Wellbeing safeguards (§5.6, Chunk 6b) ---------------------------------
+# PLACEHOLDER SCAFFOLDING pending clinical/trust-and-safety review (§5.6's own
+# framing: "written here as a requirement, not a finished policy") - do not
+# treat WELLBEING_RESOURCES or the reply text in assistant/services.py as
+# reviewed copy.
+#
+# Off by default: a T1-successful message (real, parseable food) never calls
+# a model today, and this flag is what would change that for every message,
+# not just the ones that already reach a model for other reasons. Flip to
+# true only once the broader keyword net (chatparser.has_wellbeing_signal)
+# and the response copy below have had real review.
+WELLBEING_CHECK_ALL_MESSAGES = env_bool("WELLBEING_CHECK_ALL_MESSAGES", False)
+# This *is* the "remote config" resource list §5.6 asks for, in placeholder
+# form - no real remote-config mechanism exists in this codebase. NEDA's own
+# helpline is permanently disconnected (§5.6's explicit correction) - the
+# National Alliance for Eating Disorders replaces it here. US-only, which the
+# PRD itself says isn't acceptable given India is a primary market - locale
+# expansion is required before this ships for real, not before this chunk
+# compiles.
+WELLBEING_RESOURCES = [
+    {
+        "name": "National Alliance for Eating Disorders Helpline",
+        "region": "US",
+        "phone": "1-866-662-1235",
+    },
+]
+
 # --- Guest sessions -------------------------------------------------------
 # Guest mode is not a Clerk concept, so we mint our own short-lived tokens.
 GUEST_TOKEN_TTL_DAYS = int(env("GUEST_TOKEN_TTL_DAYS", "180"))

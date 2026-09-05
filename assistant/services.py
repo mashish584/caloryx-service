@@ -94,6 +94,17 @@ _ADVICE_SEEKING_REPLY = (
 _UNCLEAR_REPLY = "Not sure I follow — what did you eat?"
 _OTHER_REPLY = "I stick to logging meals — what did you eat?"
 
+# -- WELLBEING_FLAG (Chunk 6b, §5.6) -----------------------------------------
+# PLACEHOLDER COPY - pending clinical/trust-and-safety review (§5.6's own
+# framing: "written here as a requirement, not a finished policy"). No
+# numbers of any kind (calorie targets, deficit maths, fasting durations),
+# no lecturing, no diagnosis - just a short, supportive acknowledgement.
+_WELLBEING_FLAG_REPLY = (
+    "That sounds really hard, and I'm glad you shared it. I'm not the right place for this, "
+    "but you don't have to sit with it alone — reaching out to someone you trust or a support "
+    "line can help. I'm still here whenever you want to log something."
+)
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -663,6 +674,8 @@ class _Outcome:
     needs_clarification: Optional[Dict[str, Any]] = None
     parse_snapshot: Optional[Dict[str, Any]] = None
     quota_exceeded: bool = False
+    gamification_suppressed: bool = False
+    wellbeing_resources: Optional[List[Dict[str, str]]] = None
 
 
 def _apply_edit(user_id: str, draft: Any, edit: "chatparser.ParsedEdit") -> _Outcome:
@@ -1337,6 +1350,21 @@ def _answer_nutrition_qa(food_text: Optional[str]) -> str:
     )
 
 
+def _handle_wellbeing_flag(user_id: str, tier: str) -> _Outcome:
+    """§5.6 - supportive, number-free, never mutates a draft, never blocks
+    logging or quota. Marks the session so a future gamification feature can
+    suppress streak/deficit-praise copy for it (§5.6: "for the session")."""
+    session = repository.get_or_create_today_session(user_id)
+    repository.set_session_gamification_suppressed(session.id)
+    return _Outcome(
+        tier=tier,
+        intent="WELLBEING_FLAG",
+        assistant_text=_WELLBEING_FLAG_REPLY,
+        gamification_suppressed=True,
+        wellbeing_resources=list(settings.WELLBEING_RESOURCES),
+    )
+
+
 def _handle_non_logging_intent(
     user_id: str,
     intent: str,
@@ -1426,16 +1454,29 @@ def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _O
             user_id, normalized, tier="LLM_SMALL", call_fn=call_small_model, counted_to_quota=True
         )
         tier_used = "LLM_SMALL"
-        if envelope is not None and _envelope_confidence(envelope) < settings.T3_ESCALATION_CONFIDENCE_THRESHOLD:
+        t2_wellbeing = envelope is not None and envelope["intent"] == "WELLBEING_FLAG"
+        if envelope is not None and (
+            t2_wellbeing or _envelope_confidence(envelope) < settings.T3_ESCALATION_CONFIDENCE_THRESHOLD
+        ):
             # T3 is a second opinion on a low-confidence T2 *success*, never
             # a rescue for a T2 *failure* (§7.1) - a failure already degrades
             # gracefully without compounding cost on what might be a
-            # provider-wide outage.
+            # provider-wide outage. A T2 WELLBEING_FLAG is the one exception
+            # to "T3 overrides T2" below - always double-checked (§5.6), but
+            # never downgraded by what T3 says or whether it even succeeds
+            # (false negatives matter more than cost).
             t3_envelope = _call_llm(
                 user_id, normalized, tier="LLM_LARGE", call_fn=call_large_model, counted_to_quota=False
             )
             if t3_envelope is not None:
                 envelope, tier_used = t3_envelope, "LLM_LARGE"
+            if t2_wellbeing:
+                return _handle_wellbeing_flag(user_id, tier_used)
+
+        if envelope is not None and envelope["intent"] == "WELLBEING_FLAG":
+            # T2 wasn't confident enough to trust outright, escalated for
+            # that reason alone, and T3 is the one that flagged it.
+            return _handle_wellbeing_flag(user_id, tier_used)
 
         if envelope is not None and envelope["intent"] == "LOG_NEW" and envelope["items"]:
             outcome = _process_t2_new_meal(user_id, envelope, unconsumed, tier=tier_used)
@@ -1450,6 +1491,19 @@ def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _O
                 user_id, envelope["intent"], normalized, tier=tier_used, envelope=envelope
             )
         return _Outcome(tier="PARSER", intent="OTHER", assistant_text=_NO_FOOD_REPLY, unconsumed_text=unconsumed)
+
+    # T1 succeeded - today's free, direct-log path. Off by default
+    # (settings.WELLBEING_CHECK_ALL_MESSAGES): a broad keyword net that, on a
+    # hit, goes straight to T3 (§5.6 - no T2 first, this path wouldn't
+    # otherwise call a model at all) for a real determination before this
+    # message's food gets logged. A keyword hit T3 doesn't confirm never
+    # blocks or alters the log (§5.6: never lock the user out of logging).
+    if settings.WELLBEING_CHECK_ALL_MESSAGES and chatparser.has_wellbeing_signal(normalized):
+        envelope = _call_llm(
+            user_id, normalized, tier="LLM_LARGE", call_fn=call_large_model, counted_to_quota=False
+        )
+        if envelope is not None and envelope["intent"] == "WELLBEING_FLAG":
+            return _handle_wellbeing_flag(user_id, "LLM_LARGE")
 
     items_payload = []
     vectors = []
@@ -1606,6 +1660,8 @@ def send_message(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         "unconsumedText": outcome.unconsumed_text,
         "needsClarification": outcome.needs_clarification,
         "quotaExceeded": outcome.quota_exceeded,
+        "gamificationSuppressed": outcome.gamification_suppressed,
+        "wellbeingResources": outcome.wellbeing_resources,
     }
     repository.save_idempotency_record(
         client_message_id,

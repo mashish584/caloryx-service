@@ -59,10 +59,7 @@ class ChatRole(StrEnum):
 
 
 class ChatIntent(StrEnum):
-    """The PRD's full 13-intent taxonomy (§5.5), minus WELLBEING_FLAG - held
-    back deliberately until Chunk 6b implements its required behavior
-    (§5.6), so nothing can classify a message that way before anything
-    handles it."""
+    """The PRD's full 13-intent taxonomy (§5.5, §5.6)."""
 
     LOG_NEW = "LOG_NEW"
     EDIT_ITEM = "EDIT_ITEM"
@@ -73,6 +70,7 @@ class ChatIntent(StrEnum):
     APP_HELP = "APP_HELP"
     NUTRITION_QA = "NUTRITION_QA"
     ADVICE_SEEKING = "ADVICE_SEEKING"
+    WELLBEING_FLAG = "WELLBEING_FLAG"
     SOCIAL = "SOCIAL"
     UNCLEAR = "UNCLEAR"
     OTHER = "OTHER"

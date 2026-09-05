@@ -241,6 +241,15 @@ class MessageResponseSerializer(serializers.Serializer):
     # class docstring); the client fetches GET /quota separately for the
     # used/limit/resetsAt numbers to render the upgrade sheet.
     quotaExceeded = serializers.BooleanField()
+    # §5.6, Chunk 6b - true once a WELLBEING_FLAG response has fired for this
+    # session; no gamification feature reads this yet (forward-declared).
+    gamificationSuppressed = serializers.BooleanField()
+    # Present only on a WELLBEING_FLAG response (§5.6) - placeholder
+    # scaffolding pending clinical review, not reviewed policy content. The
+    # client decides whether/when to surface these, not this endpoint.
+    wellbeingResources = serializers.ListField(
+        child=serializers.DictField(child=serializers.CharField()), allow_null=True
+    )
 
 
 class QuotaSerializer(serializers.Serializer):
