@@ -102,6 +102,11 @@ def _totals_payload(totals: NutrientVector) -> Dict[str, Any]:
 
 def search_foods(query: str) -> Dict[str, Any]:
     foods = repository.search_foods(query)
+    if not foods and query.strip():
+        # Extends the miss-queue flywheel (§9, I8) to the manual/direct-entry
+        # path, not just chat - a search that comes up empty is exactly as
+        # much a curation signal as an unresolved chat item.
+        repository.file_food_miss(query.strip())
     return {"foods": [serialize_food(f) for f in foods]}
 
 

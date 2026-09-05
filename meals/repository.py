@@ -43,6 +43,47 @@ def create_food(data: Dict[str, Any]) -> Any:
     return get_food(food.id)
 
 
+# -- composite foods (Chunk 3, §7.6) -----------------------------------------
+
+_COMPOSITE_WITH_COMPONENTS = {"components": {"include": {"food": {"include": {"servingUnits": True}}}}}
+
+
+def get_composite_foods() -> List[Any]:
+    return get_client().compositefood.find_many(include=_COMPOSITE_WITH_COMPONENTS)
+
+
+def create_composite_food(data: Dict[str, Any]) -> Any:
+    """Used by `manage.py seed_composite_foods`, not any API endpoint - same
+    seeding-only status as `create_food`."""
+    components = data.pop("components", [])
+    composite = get_client().compositefood.create(data=data)
+    for component in components:
+        get_client().compositefoodcomponent.create(
+            data=dict(component, composite={"connect": {"id": composite.id}})
+        )
+    return get_client().compositefood.find_unique(
+        where={"id": composite.id}, include=_COMPOSITE_WITH_COMPONENTS
+    )
+
+
+# -- miss queue (Chunk 3, §9, I8) --------------------------------------------
+
+
+def file_food_miss(raw_text: str, locale: str = "") -> Any:
+    """Upsert on `(rawText, locale)` - a repeat miss increments `occurrences`
+    rather than creating a duplicate row. `locale` defaults to `""`, never
+    `None`: Postgres unique indexes never consider two NULLs equal, which
+    would silently break this dedupe (see the schema comment on
+    `FoodMissQueue.locale`)."""
+    return get_client().foodmissqueue.upsert(
+        where={"rawText_locale": {"rawText": raw_text, "locale": locale}},
+        data={
+            "create": {"rawText": raw_text, "locale": locale},
+            "update": {"occurrences": {"increment": 1}},
+        },
+    )
+
+
 # -- logged meals -------------------------------------------------------------
 
 

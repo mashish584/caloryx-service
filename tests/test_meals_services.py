@@ -315,3 +315,36 @@ def test_delete_logged_meal_item_recomputes_meal_totals_to_zero_when_last_item_r
 
     assert payload["items"] == []
     assert payload["totals"]["caloriesKcal"] == 0
+
+
+# -- search_foods / miss queue (Chunk 3, §9, I8) -----------------------------
+
+
+def test_search_foods_files_a_miss_when_results_are_empty(monkeypatch):
+    monkeypatch.setattr(repository, "search_foods", lambda query, **kw: [])
+    filed = []
+    monkeypatch.setattr(repository, "file_food_miss", lambda raw_text, **kw: filed.append(raw_text))
+
+    services.search_foods("xyzzyplonk")
+
+    assert filed == ["xyzzyplonk"]
+
+
+def test_search_foods_does_not_file_a_miss_when_results_exist(monkeypatch):
+    monkeypatch.setattr(repository, "search_foods", lambda query, **kw: [make_food()])
+    filed = []
+    monkeypatch.setattr(repository, "file_food_miss", lambda raw_text, **kw: filed.append(raw_text))
+
+    services.search_foods("rice")
+
+    assert filed == []
+
+
+def test_search_foods_does_not_file_a_miss_for_a_blank_query(monkeypatch):
+    monkeypatch.setattr(repository, "search_foods", lambda query, **kw: [])
+    filed = []
+    monkeypatch.setattr(repository, "file_food_miss", lambda raw_text, **kw: filed.append(raw_text))
+
+    services.search_foods("   ")
+
+    assert filed == []

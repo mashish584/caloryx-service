@@ -255,9 +255,10 @@ model Food {
   sodiumMgPer100g      Float?
   cholesterolMgPer100g Float?
 
-  servingUnits    FoodServingUnit[]
-  loggedMealItems LoggedMealItem[]
-  mealDraftItems  MealDraftItem[]
+  servingUnits             FoodServingUnit[]
+  loggedMealItems          LoggedMealItem[]
+  mealDraftItems           MealDraftItem[]
+  compositeFoodComponents  CompositeFoodComponent[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -622,4 +623,86 @@ model ChatMessage {
 
   @@unique([sessionId, clientMessageId])
   @@index([userId, normalizedHash])
+}
+
+// --- Chunk 3: composite foods & miss-queue flywheel (AI Meal Assistant PRD §7.6, §9, I8) ---
+//
+// A named dish ("chicken biryani") is several foods in fixed proportions, not a
+// single catalog row. §7.6: decomposing it is "a catalog lookup, not a language
+// task" - it must never vary run to run, so it's matched and expanded here with
+// no model call, same as everything else through this chunk. `FoodMissQueue`
+// turns every food (or dish) name the catalog can't resolve into curation
+// backlog instead of a silently-dropped signal.
+
+/// A curated dish -> its components, in fixed as-served proportions (§7.6).
+/// Matched by an EXACT, normalized lookup against `name`/`aliases`
+/// (assistant.services._resolve_composite_by_name) - deliberately not the
+/// fuzzy partial-ratio scorer individual foods use, because a single word
+/// that's genuinely part of a composite's name ("dal" in "Dal Chawal") scores
+/// a perfect partial-ratio match and would wrongly swallow a plain mention of
+/// the standalone food. A curator adds real shorthand as an alias instead.
+model CompositeFood {
+  id      String  @id @default(cuid())
+  name    String
+  aliases String[]
+  // Not filtered on yet - no per-user locale context exists in the pipeline.
+  locale  String?
+
+  // Components are defined against ONE serving of this as-served size.
+  servingGrams Float
+  servingLabel String // "1 plate", "1 katori"
+
+  components CompositeFoodComponent[]
+  isCurated  Boolean @default(false)
+  // Declared for §12.7's future cache-key versioning; unused until Chunk 8,
+  // same forward-declared pattern as Chunk 2a's MANUAL ParseTier.
+  catalogVersion Int @default(1)
+
+  @@index([name])
+}
+
+/// One food's share of a composite dish (§7.6). `ratioOfServing` values for a
+/// dish sum to ~1.0 as-served; that invariant is enforced at curation time
+/// (seed/curation tooling), not at runtime. No `yieldFactor` here, deliberately
+/// (PRD v1.5 fix): raw<->cooked conversion happens once, via the per-food
+/// yield table, when `state` differs from the component's food's own
+/// `defaultState` - carrying a second runtime factor here is how
+/// double-application bugs happen.
+model CompositeFoodComponent {
+  id          String        @id @default(cuid())
+  composite   CompositeFood @relation(fields: [compositeId], references: [id], onDelete: Cascade)
+  compositeId String
+  food        Food          @relation(fields: [foodId], references: [id])
+  foodId      String
+
+  ratioOfServing Float
+  // Raw or cooked basis for THIS component as curated - e.g. a component
+  // curated RAW against a food whose defaultState is COOKED still needs
+  // yield conversion at expansion time (assistant.services._expand_composite
+  // reuses meals.services.resolve_item for exactly this).
+  state      FoodState @default(UNSPECIFIED)
+  prep       String?
+  isOptional Boolean   @default(false)
+}
+
+/// Curation backlog (§9, I8) - every food or dish name the catalog can't
+/// resolve, from any entry point (chat's unresolved items, and a manual
+/// catalog search that comes up empty). No curation workflow/UI is built
+/// here; a human works this via `manage.py`/direct DB access - the row
+/// existing is the whole deliverable.
+model FoodMissQueue {
+  id          String   @id @default(cuid())
+  rawText     String
+  occurrences Int      @default(1)
+  // NOT nullable, deliberately (PRD shows `locale String?`): Postgres unique
+  // indexes treat every NULL as distinct from every other NULL, so
+  // `@@unique([rawText, locale])` would silently fail to dedupe repeated
+  // misses with no locale - every upsert would insert a fresh row instead of
+  // incrementing `occurrences`, defeating the point of this model. Empty
+  // string stands in for "no locale" so the uniqueness check actually holds.
+  locale      String   @default("")
+  status      String   @default("PENDING")
+  createdAt   DateTime @default(now())
+
+  @@unique([rawText, locale])
 }

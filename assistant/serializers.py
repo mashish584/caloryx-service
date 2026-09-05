@@ -24,7 +24,7 @@ from chatparser import (
 from engine.rounding import round_int
 from meals.serializers import MAX_ITEMS_PER_MEAL, LoggedMealSerializer
 from meals.services import food_per_100g
-from nutrition import FoodState, MealSlot, NutrientVector, item_nutrition
+from nutrition import FoodState, MealSlot, NutrientVector, apply_yield, item_nutrition
 
 # -- requests -----------------------------------------------------------------
 
@@ -247,8 +247,24 @@ def item_nutrient_vector(item: Any) -> NutrientVector:
     (see the MealDraftItem schema comment) - it's mutable and unconfirmed, so
     freezing it would just be a staleness bug waiting to happen. Public:
     `assistant.services` reuses this for totals recomputation, so there's one
-    place that turns a draft item row into a nutrient vector."""
-    return item_nutrition(food_per_100g(item.food), item.grams)
+    place that turns a draft item row into a nutrient vector.
+
+    `item.grams` is stored on `item.state`'s basis, not necessarily the
+    food's own `defaultState` (§8's per-100g vectors are always on the food's
+    basis) - a raw-curated composite component against a food that defaults
+    to cooked is exactly this case. Converting here, every time, is what
+    keeps this correct without asking every caller to remember to - the
+    conversion is a no-op (`apply_yield` short-circuits) whenever the states
+    already match.
+    """
+    food = item.food
+    basis_grams = apply_yield(
+        item.grams,
+        from_state=FoodState(item.state),
+        to_state=FoodState(food.defaultState),
+        raw_to_cooked_yield=food.rawToCookedYield,
+    )
+    return item_nutrition(food_per_100g(food), basis_grams)
 
 
 def serialize_draft_item(item: Any) -> Dict[str, Any]:

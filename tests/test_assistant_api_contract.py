@@ -287,6 +287,7 @@ def test_sending_a_message_creates_a_draft_from_text(client, guest, monkeypatch)
     food = make_food()
     monkeypatch.setattr(meals_repository, "get_food", lambda food_id: food)
     monkeypatch.setattr(meals_repository, "search_foods", lambda query, **kw: [food])
+    monkeypatch.setattr(meals_repository, "get_composite_foods", lambda: [])
     monkeypatch.setattr(assistant_repository, "get_open_draft", lambda user_id: None)
     monkeypatch.setattr(
         assistant_repository, "get_or_create_today_session", lambda user_id: SimpleNamespace(id="session-1")

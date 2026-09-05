@@ -368,23 +368,92 @@ def _unresolved_item(phrase: "chatparser.ParsedItemPhrase") -> Dict[str, Any]:
     return {"resolution": "UNRESOLVED", "rawText": phrase.raw_text}
 
 
-def _build_item_from_phrase(
+def _resolve_composite_by_name(query: str) -> Optional[Any]:
+    """Exact, normalized match against every composite's `name`/`aliases`
+    (§7.6 - "a catalog lookup, not a language task"). Deliberately NOT the
+    fuzzy partial-ratio scorer individual foods use: a single word that's
+    genuinely part of a composite's name ("dal" in "Dal Chawal") scores a
+    perfect partial-ratio match, which would wrongly expand a plain mention
+    of the standalone food into the composite. A curator adds real shorthand
+    ("biryani") as an alias instead of the system guessing from fragments."""
+    normalized_query = query.strip().lower()
+    for composite in meals_repository.get_composite_foods():
+        names = {composite.name.strip().lower()} | {a.strip().lower() for a in composite.aliases}
+        if normalized_query in names:
+            return composite
+    return None
+
+
+def _expand_composite(
+    composite: Any, quantity: float
+) -> List[Tuple[Dict[str, Any], NutrientVector]]:
+    """A matched dish + a serving count -> one `RESOLVED` payload per
+    component. Each component's mass is `quantity * composite.servingGrams *
+    component.ratioOfServing`, passed through `meals.services.resolve_item`
+    (unit "g", already computed as grams) rather than computed by hand, so a
+    component whose curated `state` differs from its food's own
+    `defaultState` still goes through the same tested yield conversion
+    everything else does."""
+    total_grams = quantity * composite.servingGrams
+    items: List[Tuple[Dict[str, Any], NutrientVector]] = []
+    for component in composite.components:
+        component_grams = total_grams * component.ratioOfServing
+        component_state = component.state if component.state != "UNSPECIFIED" else None
+        resolved, vector = meals_services.resolve_item(
+            component.food, component_grams, "g", component_state
+        )
+        payload = {
+            "resolution": "RESOLVED",
+            "foodId": resolved["foodId"],
+            "rawText": "{} ({})".format(component.food.name, composite.name),
+            "quantity": resolved["quantity"],
+            "unit": resolved["unit"],
+            "grams": resolved["grams"],
+            "state": resolved["state"],
+            "defaultGrams": resolved["grams"],
+            "prep": component.prep,
+            "quantitySource": "EXPLICIT",
+            "massSource": "DIRECT",
+            # The *dish* was matched, not this component individually -
+            # attributing a fuzzy score to it would misrepresent what
+            # actually happened.
+            "matchScore": None,
+            "matchBand": None,
+        }
+        items.append((payload, vector))
+    return items
+
+
+def _build_items_from_phrase(
     phrase: "chatparser.ParsedItemPhrase",
-) -> Tuple[Dict[str, Any], NutrientVector]:
-    """One `ParsedItemPhrase` -> a `MealDraftItem` payload + its nutrient
-    vector. HIGH/MEDIUM band -> RESOLVED (reusing `meals.services.
-    resolve_item` for the actual gram/yield math); LOW/no match, or a matched
-    food whose serving table doesn't have this unit -> UNRESOLVED. Never
-    raises: a parse-quality problem degrades to an unresolved item, not an
-    error (§12.13's "never silently drop, never hard-fail" spirit)."""
+) -> List[Tuple[Dict[str, Any], NutrientVector]]:
+    """One `ParsedItemPhrase` -> one or more `MealDraftItem` payloads (plural:
+    a composite match expands to every component) plus their nutrient
+    vectors. Composite dish name -> expand (§7.6). Otherwise, individual food
+    matching as before: HIGH/MEDIUM band -> RESOLVED; LOW/no match, or a
+    matched food whose serving table doesn't have this unit -> UNRESOLVED and
+    filed to the miss queue (§9, I8). Never raises: a parse-quality problem
+    degrades to an unresolved item, not an error (§12.13's spirit)."""
+    composite = _resolve_composite_by_name(phrase.food_text)
+    if composite is not None:
+        logger.info(
+            "composite expanded dish=%s components=%s curated=%s",
+            composite.name,
+            len(composite.components),
+            composite.isCurated,
+        )
+        return _expand_composite(composite, phrase.quantity)
+
     food, score, band = _resolve_food_by_name(phrase.food_text)
     if food is None or band == "LOW":
-        return _unresolved_item(phrase), ZERO_VECTOR
+        meals_repository.file_food_miss(phrase.food_text)
+        return [(_unresolved_item(phrase), ZERO_VECTOR)]
 
     try:
         resolved, vector = meals_services.resolve_item(food, phrase.quantity, phrase.unit, phrase.state)
     except UnresolvableQuantityError:
-        return _unresolved_item(phrase), ZERO_VECTOR
+        meals_repository.file_food_miss(phrase.food_text)
+        return [(_unresolved_item(phrase), ZERO_VECTOR)]
 
     payload = {
         "resolution": "RESOLVED",
@@ -401,7 +470,7 @@ def _build_item_from_phrase(
         "matchScore": score,
         "matchBand": band,
     }
-    return payload, vector
+    return [(payload, vector)]
 
 
 def _resolve_target_ref(text: str, draft_items: List[Any]) -> Tuple[Optional[Any], bool]:
@@ -461,11 +530,14 @@ def _apply_edit(user_id: str, draft: Any, edit: "chatparser.ParsedEdit") -> _Out
 
     if edit.intent == "ADD_ITEM":
         _load_open_draft_for_mutation(user_id, draft.id, draft.version)
-        item_payload, _ = _build_item_from_phrase(edit.item)
-        updated_row = _add_item_payload(user_id, draft.id, item_payload)
+        items = _build_items_from_phrase(edit.item)
+        updated_row = None
+        for item_payload, _ in items:
+            updated_row = _add_item_payload(user_id, draft.id, item_payload)
+        all_resolved = all(ip["resolution"] == "RESOLVED" for ip, _ in items)
         assistant_text = (
             "Added it to your meal."
-            if item_payload["resolution"] == "RESOLVED"
+            if all_resolved
             else "I couldn't find that food — search for it or tap to edit."
         )
         return _Outcome(
@@ -515,8 +587,8 @@ def _apply_add_phrases(
     _load_open_draft_for_mutation(user_id, draft.id, draft.version)
     updated_row = None
     for phrase in phrases:
-        item_payload, _ = _build_item_from_phrase(phrase)
-        updated_row = _add_item_payload(user_id, draft.id, item_payload)
+        for item_payload, _ in _build_items_from_phrase(phrase):
+            updated_row = _add_item_payload(user_id, draft.id, item_payload)
     return _Outcome(
         tier="PARSER",
         intent="ADD_ITEM",
@@ -560,9 +632,9 @@ def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _O
     items_payload = []
     vectors = []
     for phrase in phrases:
-        item_payload, vector = _build_item_from_phrase(phrase)
-        items_payload.append(item_payload)
-        vectors.append(vector)
+        for item_payload, vector in _build_items_from_phrase(phrase):
+            items_payload.append(item_payload)
+            vectors.append(vector)
 
     resolved_count = sum(1 for ip in items_payload if ip["resolution"] == "RESOLVED")
     confidence = resolved_count / len(items_payload)

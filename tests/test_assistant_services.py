@@ -20,6 +20,7 @@ from common.exceptions import (
 )
 from engine.rounding import round_int
 from meals import repository as meals_repository
+from nutrition import NutrientVector, item_nutrition
 
 REAL_PAST = datetime(2020, 1, 1, tzinfo=timezone.utc)
 REAL_FUTURE = datetime(2099, 1, 1, tzinfo=timezone.utc)
@@ -147,6 +148,8 @@ def make_draft(items, **overrides):
 def seam(monkeypatch):
     state = SimpleNamespace(
         foods={},
+        composites={},
+        food_misses=[],
         draft=None,
         next_item_id=1,
         next_draft_id=1,
@@ -301,6 +304,14 @@ def seam(monkeypatch):
     monkeypatch.setattr(
         meals_repository, "search_foods", lambda query, **kw: list(state.foods.values())
     )
+    monkeypatch.setattr(
+        meals_repository, "get_composite_foods", lambda: list(state.composites.values())
+    )
+
+    def file_food_miss(raw_text, locale=""):
+        state.food_misses.append(raw_text)
+
+    monkeypatch.setattr(meals_repository, "file_food_miss", file_food_miss)
 
     def create_logged_meal(user_id, meal_data, items_data):
         state.create_logged_meal_calls += 1
@@ -351,6 +362,32 @@ def make_egg_food(**overrides):
         fatGPer100g=11.0,
         fiberGPer100g=0.0,
         servingUnits=[serving_unit("piece", 50.0, "COUNTABLE")],
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def make_component(food, ratio, state="UNSPECIFIED", prep=None, is_optional=False):
+    return SimpleNamespace(
+        id="component-{}".format(food.id),
+        foodId=food.id,
+        food=food,
+        ratioOfServing=ratio,
+        state=state,
+        prep=prep,
+        isOptional=is_optional,
+    )
+
+
+def make_composite(**overrides):
+    fields = dict(
+        id="composite-1",
+        name="Egg Fried Rice",
+        aliases=["egg rice"],
+        servingGrams=250.0,
+        servingLabel="1 plate",
+        isCurated=True,
+        components=[],
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -641,6 +678,21 @@ def test_send_message_creates_a_draft_with_mixed_resolved_and_unresolved_items(s
     assert response["draft"]["confidence"] == pytest.approx(0.5)
 
 
+def test_send_message_applies_yield_conversion_for_a_raw_stated_item(seam):
+    """Regression: a plain (non-composite) item stated in a state other than
+    its food's default must still serialize with correctly yield-converted
+    nutrition - not just the composite-expansion path exercised elsewhere.
+    Rice defaults to COOKED with a 3.0 yield, so 100g stated raw is a 300g
+    cooked-equivalent basis for the nutrition lookup."""
+    response = send(seam, "100g raw rice")
+
+    item = response["draft"]["items"][0]
+    assert item["state"] == "RAW"
+    assert item["grams"] == pytest.approx(100.0)
+    expected = item_nutrition(NutrientVector(130.0, 2.7, 28.2, 0.3, 0.4), 300.0)
+    assert item["caloriesKcal"] == round_int(expected.calories_kcal)
+
+
 def test_send_message_t0_cache_hit_skips_the_grammar(seam):
     seam.foods["food-rice"] = make_food()
     content = "200g rice"
@@ -777,3 +829,115 @@ def test_send_message_idempotency_key_reuse_with_different_content_is_rejected(s
     send(seam, "200g rice", client_message_id="m1")
     with pytest.raises(IdempotencyKeyReuseError):
         send(seam, "200g chicken", client_message_id="m1")
+
+
+# -- composite foods (Chunk 3, §7.6) -----------------------------------------
+
+
+def test_send_message_expands_a_composite_dish_into_its_components(seam):
+    rice = make_food()
+    egg = make_egg_food()
+    seam.foods["food-rice"] = rice
+    seam.foods["food-egg"] = egg
+    seam.composites["composite-1"] = make_composite(
+        components=[make_component(rice, 0.7, state="COOKED"), make_component(egg, 0.3, state="COOKED")]
+    )
+
+    response = services.send_message(
+        "user-1", {"clientMessageId": "m1", "content": "1 plate egg fried rice"}
+    )
+
+    assert response["intent"] == "LOG_NEW"
+    items = response["draft"]["items"]
+    assert len(items) == 2
+    rice_item = next(i for i in items if i["foodName"] == "Cooked White Rice")
+    egg_item = next(i for i in items if i["foodName"] == "Boiled Egg")
+
+    assert rice_item["grams"] == pytest.approx(175.0)  # 250 * 0.7
+    assert egg_item["grams"] == pytest.approx(75.0)  # 250 * 0.3
+    assert rice_item["matchBand"] is None  # the dish was matched, not this component
+    assert "(Egg Fried Rice)" in rice_item["rawText"]
+
+    expected_rice = item_nutrition(NutrientVector(130.0, 2.7, 28.2, 0.3, 0.4), 175.0)
+    expected_egg = item_nutrition(NutrientVector(155.0, 13.0, 1.1, 11.0, 0.0), 75.0)
+    assert rice_item["caloriesKcal"] == round_int(expected_rice.calories_kcal)
+    assert egg_item["caloriesKcal"] == round_int(expected_egg.calories_kcal)
+    assert response["draft"]["confidence"] == 1.0  # both components resolved
+
+
+def test_send_message_matches_a_composite_by_alias(seam):
+    rice = make_food()
+    egg = make_egg_food()
+    seam.foods["food-rice"] = rice
+    seam.foods["food-egg"] = egg
+    seam.composites["composite-1"] = make_composite(
+        components=[make_component(rice, 0.7), make_component(egg, 0.3)]
+    )
+
+    response = services.send_message(
+        "user-1", {"clientMessageId": "m1", "content": "1 plate egg rice"}
+    )
+
+    assert len(response["draft"]["items"]) == 2
+
+
+def test_a_single_shared_word_does_not_trigger_composite_expansion(seam):
+    """The regression this chunk's whole design hinges on: partial-ratio
+    fuzzy matching would score "dal" a perfect match against "Dal Chawal"
+    (§7.6's matching is an exact name/alias lookup precisely to avoid this) -
+    a bare "dal" mention must resolve to the plain food, not the composite."""
+    dal = make_food(
+        id="food-dal",
+        name="Toor Dal, Cooked",
+        rawToCookedYield=None,
+        servingUnits=[serving_unit("katori", 150.0)],
+    )
+    rice = make_food()
+    seam.foods["food-dal"] = dal
+    seam.foods["food-rice"] = rice
+    seam.composites["composite-dal-chawal"] = make_composite(
+        id="composite-dal-chawal",
+        name="Dal Chawal",
+        aliases=["dal rice"],
+        servingGrams=300.0,
+        components=[make_component(dal, 0.5, state="COOKED"), make_component(rice, 0.5, state="COOKED")],
+    )
+
+    response = services.send_message("user-1", {"clientMessageId": "m1", "content": "1 katori dal"})
+
+    items = response["draft"]["items"]
+    assert len(items) == 1
+    assert items[0]["foodName"] == "Toor Dal, Cooked"
+
+
+def test_composite_component_state_differing_from_default_applies_yield_conversion(seam):
+    rice = make_food()  # defaultState=COOKED, rawToCookedYield=3.0
+    seam.foods["food-rice"] = rice
+    # Deliberately not named starting with "raw"/"cooked"/etc - the T1 grammar
+    # strips a leading state/prep word from the phrase *before* composite
+    # matching ever sees the remaining text (§7.5), so a dish name starting
+    # with one of those words would never resolve here. That's a grammar
+    # property, not something this test is checking.
+    seam.composites["composite-1"] = make_composite(
+        name="Farmhouse Rice Bowl",
+        servingGrams=100.0,
+        components=[make_component(rice, 1.0, state="RAW")],
+    )
+
+    response = services.send_message(
+        "user-1", {"clientMessageId": "m1", "content": "1 plate farmhouse rice bowl"}
+    )
+
+    item = response["draft"]["items"][0]
+    # The as-curated (raw) mass is what's stored - not the cooked-equivalent
+    # basis used for the nutrition lookup (mirrors how a stated quantity is
+    # never overwritten by its yield-converted basis anywhere else, §8).
+    assert item["grams"] == pytest.approx(100.0)
+    assert item["state"] == "RAW"
+    expected = item_nutrition(NutrientVector(130.0, 2.7, 28.2, 0.3, 0.4), 300.0)
+    assert item["caloriesKcal"] == round_int(expected.calories_kcal)
+
+
+def test_send_message_files_a_miss_for_the_food_text_of_an_unresolved_phrase(seam):
+    services.send_message("user-1", {"clientMessageId": "m1", "content": "50g xyzzyplonk"})
+    assert seam.food_misses == ["xyzzyplonk"]
