@@ -15,6 +15,7 @@ from chatparser import (
     normalize_text,
     parse_edit_command,
     parse_new_item_phrases,
+    redact_pii,
     score_food_match,
 )
 
@@ -36,6 +37,33 @@ def test_hash_normalized_is_stable_and_content_sensitive():
     c = hash_normalized(normalize_text("200g chicken"))
     assert a == b
     assert a != c
+
+
+# -- redact_pii (§12.14, Chunk 8c) ---------------------------------------
+
+
+def test_redact_pii_replaces_an_email_address():
+    assert redact_pii("reach me at john.doe@example.com please") == (
+        "reach me at [redacted-email] please"
+    )
+
+
+def test_redact_pii_replaces_a_dashed_phone_number():
+    assert redact_pii("call me at 987-654-3210 tomorrow") == "call me at [redacted-phone] tomorrow"
+
+
+def test_redact_pii_replaces_a_plus_prefixed_spaced_phone_number():
+    assert redact_pii("my number is +91 98765 43210") == "my number is [redacted-phone]"
+
+
+def test_redact_pii_leaves_ordinary_food_quantities_untouched():
+    text = "200g rice, 1.5 cups milk, 2 eggs, 100g grilled chicken breast"
+    assert redact_pii(text) == text
+
+
+def test_redact_pii_only_touches_the_pii_portion_of_a_mixed_message():
+    text = "log 200g rice, and email me the plan at a@b.com"
+    assert redact_pii(text) == "log 200g rice, and email me the plan at [redacted-email]"
 
 
 # -- T-1 pre-classifier ---------------------------------------------------

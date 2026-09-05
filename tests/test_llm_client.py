@@ -148,6 +148,27 @@ def test_call_small_model_raises_llmcallerror_on_non_json_content(monkeypatch):
         call_small_model("sys", "some content")
 
 
+@override_settings(OPENAI_API_KEY="sk-test")
+def test_non_json_content_is_never_logged_verbatim(monkeypatch, caplog):
+    """Log hygiene (§12.14, Chunk 8c) - the model's raw response body can echo
+    back whatever the user said, so only a length and a hash may be logged."""
+    import openai
+
+    raw_body = "not json, and definitely not john.doe@example.com either"
+    monkeypatch.setattr(
+        openai, "OpenAI", lambda **kw: _FakeOpenAI([], response=_fake_response(raw_body))
+    )
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(LLMCallError):
+            call_small_model("sys", "some content")
+
+    logged_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert raw_body not in logged_text
+    assert "john.doe@example.com" not in logged_text
+    assert "len={}".format(len(raw_body)) in logged_text
+
+
 @override_settings(OPENAI_API_KEY="")
 def test_missing_api_key_raises_llmconfigurationerror():
     with pytest.raises(LLMConfigurationError):

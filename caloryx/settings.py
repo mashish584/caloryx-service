@@ -261,6 +261,13 @@ NORMALIZATION_VERSION = int(env("NORMALIZATION_VERSION", "1"))
 PARSER_VERSION = int(env("PARSER_VERSION", "1"))
 NUTRITION_ENGINE_VERSION = int(env("NUTRITION_ENGINE_VERSION", "1"))
 
+# --- Privacy & retention (§12.14, Chunk 8c) --------------------------------
+# `ChatMessage` TTL - raw phrasing has little value once parsed, so it's kept
+# for a much shorter window than `LoggedMeal` (§12.14). No scheduler exists in
+# this repo (same as every seed_* command) - `manage.py purge_chat_messages`
+# is run by hand or from an external cron, not wired up here.
+CHAT_MESSAGE_RETENTION_DAYS = int(env("CHAT_MESSAGE_RETENTION_DAYS", "30"))
+
 # --- Guest sessions -------------------------------------------------------
 # Guest mode is not a Clerk concept, so we mint our own short-lived tokens.
 GUEST_TOKEN_TTL_DAYS = int(env("GUEST_TOKEN_TTL_DAYS", "180"))

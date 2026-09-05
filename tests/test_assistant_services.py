@@ -1179,6 +1179,23 @@ def stub_call_large_model(monkeypatch, result=None, exc=None):
     return calls
 
 
+def test_call_llm_sends_redacted_content_but_hashes_the_original(seam, monkeypatch):
+    """§12.14 (Chunk 8c): the model never sees raw PII, but the ParseEvent's
+    `inputHash` - and everything else keyed on the message - is unaffected."""
+    envelope = llm_envelope(items=[llm_item("grilled chicken salad", confidence=0.5)])
+    calls = stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+    content = "grilled chicken salad, call me at 987-654-3210"
+
+    send(seam, content)
+
+    assert len(calls) == 1
+    system_prompt, user_content = calls[0]
+    assert "987-654-3210" not in user_content
+    assert "[redacted-phone]" in user_content
+    assert "grilled chicken salad" in user_content  # the food text itself is untouched
+    assert seam.parse_events[0].inputHash == hash_normalized(normalize_text(content))
+
+
 def test_send_message_escalates_to_t2_when_t1_finds_nothing(seam, monkeypatch):
     chicken = make_food(
         id="food-chicken",

@@ -74,4 +74,8 @@ and never for a food you can name normally (e.g. "grilled chicken breast" is \
 never a dishCategory). Still report that dish's serving size, if stated, in \
 its own item's quantity/unit like any other item - there is no separate \
 serving-size field. Leave dishCategory null for every other message.
+
+The message may contain a placeholder like [redacted-email] or \
+[redacted-phone] in place of a contact detail that was removed before \
+reaching you. Never treat one as a food item, a name, or anything to act on.
 """.format(categories=_DISH_CATEGORIES)

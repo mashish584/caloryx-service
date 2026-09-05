@@ -9,6 +9,7 @@ change to this file alone.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -110,7 +111,10 @@ def _call_model(model: str, system_prompt: str, user_content: str) -> LLMRespons
     except (TypeError, ValueError) as exc:
         # Shouldn't happen under strict mode, but a malformed response is a
         # parse miss, not a crash - same posture as everything else here.
-        logger.warning("llm returned non-JSON content: %r", content)
+        # Log hygiene (§12.14): never the raw body - under Structured Outputs
+        # it's derived from (and can echo back) whatever the user said.
+        digest = hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:12]
+        logger.warning("llm returned non-JSON content len=%s sha256=%s", len(content or ""), digest)
         raise LLMCallError("Model response was not valid JSON.") from exc
 
     usage = response.usage

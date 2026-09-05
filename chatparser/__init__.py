@@ -18,6 +18,7 @@ from .enums import (
 )
 from .grammar import ParsedEdit, ParsedItemPhrase, parse_edit_command, parse_new_item_phrases
 from .normalize import hash_normalized, normalize_text
+from .redaction import redact_pii
 from .preclassifier import (
     classify_t1_intent,
     extract_nutrition_qa_food,
@@ -59,5 +60,6 @@ __all__ = [
     "normalize_text",
     "parse_edit_command",
     "parse_new_item_phrases",
+    "redact_pii",
     "score_food_match",
 ]

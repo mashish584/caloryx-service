@@ -1056,9 +1056,13 @@ def _call_llm(
     never a 500 (§11)."""
     input_hash = chatparser.hash_normalized(content)
     started = time.monotonic()
+    # PII redaction (§12.14) applies only to what actually leaves the process -
+    # `input_hash` above (and everything else keyed on `content`) deliberately
+    # stays on the original, unredacted text.
+    redacted_content = chatparser.redact_pii(content)
 
     try:
-        response = call_fn(SYSTEM_PROMPT, content)
+        response = call_fn(SYSTEM_PROMPT, redacted_content)
     except LLMConfigurationError as exc:
         # A deploy-time misconfiguration (no API key), not a per-call
         # failure - still degrades gracefully rather than a 500 (§11), but
