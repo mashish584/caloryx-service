@@ -268,6 +268,12 @@ NUTRITION_ENGINE_VERSION = int(env("NUTRITION_ENGINE_VERSION", "1"))
 # is run by hand or from an external cron, not wired up here.
 CHAT_MESSAGE_RETENTION_DAYS = int(env("CHAT_MESSAGE_RETENTION_DAYS", "30"))
 
+# --- Cost circuit breaker (§11, §12.8, Chunk 8d) ---------------------------
+# Failure-based tripping only - see AiCircuitBreaker's schema comment for why
+# a cost-spike trigger isn't built here (no budget number to compare against).
+AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD = int(env("AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"))
+AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(env("AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS", "60"))
+
 # --- Guest sessions -------------------------------------------------------
 # Guest mode is not a Clerk concept, so we mint our own short-lived tokens.
 GUEST_TOKEN_TTL_DAYS = int(env("GUEST_TOKEN_TTL_DAYS", "180"))

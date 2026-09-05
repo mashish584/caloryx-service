@@ -1061,6 +1061,26 @@ def _call_llm(
     # stays on the original, unredacted text.
     redacted_content = chatparser.redact_pii(content)
 
+    # Cost circuit breaker (§11, Chunk 8d): a recent run of consecutive
+    # transient failures skips the call outright for a cooldown window,
+    # instead of paying a timeout on every message during a real outage.
+    cooldown = timedelta(seconds=settings.AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+    if repository.circuit_breaker_is_open(cooldown):
+        logger.warning("llm call skipped, circuit breaker open user=%s tier=%s", user_id, tier)
+        repository.create_parse_event(
+            user_id,
+            {
+                "inputHash": input_hash,
+                "tier": tier,
+                "intent": "OTHER",
+                "countedToQuota": counted_to_quota,
+                "latencyMs": 0,
+                "confidence": 0.0,
+                "requestId": _request_id_or_none(),
+            },
+        )
+        return None
+
     try:
         response = call_fn(SYSTEM_PROMPT, redacted_content)
     except LLMConfigurationError as exc:
@@ -1084,6 +1104,7 @@ def _call_llm(
         return None
     except LLMCallError as exc:
         logger.warning("llm call failed user=%s tier=%s: %s", user_id, tier, exc)
+        repository.record_llm_call_failure(settings.AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD)
         repository.create_parse_event(
             user_id,
             {
@@ -1097,6 +1118,12 @@ def _call_llm(
             },
         )
         return None
+
+    # A real, successful API-level call is evidence the provider is
+    # reachable - resets/closes the circuit regardless of whether the
+    # envelope goes on to pass our own schema validation below, which is a
+    # different failure mode entirely (see the Chunk 8d plan's reasoning).
+    repository.record_llm_call_success()
 
     serializer = IntentEnvelopeSerializer(data=response.raw_envelope)
     if not serializer.is_valid():

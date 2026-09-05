@@ -23,7 +23,7 @@ from common.exceptions import (
     StaleOperationError,
 )
 from engine.rounding import round_int
-from llm import LLMCallError, LLMResponse
+from llm import LLMCallError, LLMConfigurationError, LLMResponse
 from meals import repository as meals_repository
 from onboarding import repository as onboarding_repository
 from nutrition import NutrientVector, item_nutrition
@@ -208,6 +208,7 @@ def seam(monkeypatch):
         profiles={},
         gamification_suppressed_sessions=[],
         catalog_version=1,
+        circuit_breaker=SimpleNamespace(consecutiveFailures=0, openedAt=None),
     )
 
     monkeypatch.setattr(onboarding_repository, "get_profile", lambda user_id, **kw: state.profiles.get(user_id))
@@ -421,6 +422,31 @@ def seam(monkeypatch):
         return counter, True
 
     monkeypatch.setattr(repository, "try_consume_quota", try_consume_quota)
+
+    # -- assistant.repository: cost circuit breaker (Chunk 8d) ---------------
+
+    def circuit_breaker_is_open(cooldown):
+        row = state.circuit_breaker
+        if row.openedAt is None:
+            return False
+        return datetime.now(timezone.utc) - row.openedAt < cooldown
+
+    monkeypatch.setattr(repository, "circuit_breaker_is_open", circuit_breaker_is_open)
+
+    def record_llm_call_failure(threshold):
+        state.circuit_breaker.consecutiveFailures += 1
+        if state.circuit_breaker.consecutiveFailures >= threshold:
+            state.circuit_breaker.openedAt = datetime.now(timezone.utc)
+        return state.circuit_breaker
+
+    monkeypatch.setattr(repository, "record_llm_call_failure", record_llm_call_failure)
+
+    def record_llm_call_success():
+        state.circuit_breaker.consecutiveFailures = 0
+        state.circuit_breaker.openedAt = None
+        return state.circuit_breaker
+
+    monkeypatch.setattr(repository, "record_llm_call_success", record_llm_call_success)
 
     # -- assistant.repository: L2 global parse cache (Chunk 4c) --------------
 
@@ -2481,3 +2507,110 @@ def test_call_llm_records_the_request_id_on_a_validation_failure(seam, monkeypat
 
     assert len(seam.parse_events) == 1
     assert seam.parse_events[0].requestId == "req-invalid"
+
+
+# -- cost circuit breaker (Chunk 8d, §11, §12.8) ------------------------------
+
+
+@override_settings(AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD=3)
+def test_circuit_breaker_trips_after_the_threshold_and_skips_the_next_call(seam, monkeypatch):
+    calls = stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
+
+    for i in range(3):
+        send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m{}".format(i))
+    assert len(calls) == 3
+    assert seam.circuit_breaker.openedAt is not None
+
+    response = send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m-final")
+
+    assert len(calls) == 3  # the 4th attempt never reached call_fn at all
+    assert response["tier"] == "PARSER"
+    assert response["intent"] == "OTHER"
+    assert len(seam.parse_events) == 4
+    assert seam.parse_events[-1].latencyMs == 0
+    assert not hasattr(seam.parse_events[-1], "model")  # no real call was ever attempted
+
+
+@override_settings(AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD=3)
+def test_circuit_breaker_resets_on_a_successful_call_before_reaching_the_threshold(seam, monkeypatch):
+    stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
+    send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m1")
+    send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m2")
+    assert seam.circuit_breaker.consecutiveFailures == 2
+
+    seam.foods["food-chicken"] = _chicken_food()
+    envelope = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.9)]
+    )
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+    send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m3")
+
+    assert seam.circuit_breaker.consecutiveFailures == 0
+    assert seam.circuit_breaker.openedAt is None
+
+    # A fresh run of failures needs the full threshold again from zero.
+    calls = stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
+    send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m4")
+    send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m5")
+    assert len(calls) == 2
+    assert seam.circuit_breaker.openedAt is None  # still below threshold
+
+
+def test_llm_configuration_error_never_opens_the_circuit_breaker(seam, monkeypatch):
+    def fake(system_prompt, user_content):
+        raise LLMConfigurationError("OPENAI_API_KEY must be set to call the LLM provider.")
+
+    monkeypatch.setattr(services, "call_small_model", fake)
+
+    for i in range(10):
+        send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m{}".format(i))
+
+    assert seam.circuit_breaker.consecutiveFailures == 0
+    assert seam.circuit_breaker.openedAt is None
+
+
+@override_settings(AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD=1, AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS=60)
+def test_circuit_breaker_reopens_on_a_failed_probe_after_cooldown(seam, monkeypatch):
+    stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
+    send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m1")
+    assert seam.circuit_breaker.openedAt is not None
+
+    # Backdate past the cooldown so the next call is attempted for real again.
+    seam.circuit_breaker.openedAt = datetime.now(timezone.utc) - timedelta(seconds=120)
+
+    calls = stub_call_small_model(monkeypatch, exc=LLMCallError("still down"))
+    send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m2")
+
+    assert len(calls) == 1  # the probe call was actually attempted
+    assert seam.circuit_breaker.openedAt is not None  # re-opened, cooldown restarted
+    assert seam.circuit_breaker.openedAt > datetime.now(timezone.utc) - timedelta(seconds=5)
+
+
+@override_settings(AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD=1, AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS=60)
+def test_circuit_breaker_closes_on_a_successful_probe_after_cooldown(seam, monkeypatch):
+    stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
+    send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m1")
+    assert seam.circuit_breaker.openedAt is not None
+
+    seam.circuit_breaker.openedAt = datetime.now(timezone.utc) - timedelta(seconds=120)
+
+    seam.foods["food-chicken"] = _chicken_food()
+    envelope = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.9)]
+    )
+    calls = stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+    send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m2")
+
+    assert len(calls) == 1
+    assert seam.circuit_breaker.consecutiveFailures == 0
+    assert seam.circuit_breaker.openedAt is None
+
+
+def test_validation_failure_neither_opens_nor_resets_the_circuit_breaker(seam, monkeypatch):
+    bad_envelope = llm_envelope(items=[llm_item("chicken", state="sizzling", confidence=0.5)])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(bad_envelope))
+
+    send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert seam.circuit_breaker.consecutiveFailures == 0
+    assert seam.circuit_breaker.openedAt is None

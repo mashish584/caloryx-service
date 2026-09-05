@@ -297,6 +297,47 @@ def try_consume_quota(user_id: str, limit: int, window: timedelta) -> Tuple[Any,
     return counter, consumed
 
 
+# -- Cost circuit breaker (§11, §12.8, Chunk 8d) -----------------------------
+
+
+def circuit_breaker_is_open(cooldown: timedelta) -> bool:
+    """True while a recent run of consecutive LLM call failures is still
+    within its cooldown window - the caller skips the call entirely rather
+    than paying a timeout during a real provider outage."""
+    row = get_client().aicircuitbreaker.find_unique(where={"id": "global"})
+    if row is None or row.openedAt is None:
+        return False
+    return _now() - row.openedAt < cooldown
+
+
+def record_llm_call_failure(threshold: int) -> Any:
+    """Bumps the global consecutive-failure counter and (re-)opens the
+    circuit once it reaches `threshold` - covers both the first trip and a
+    renewed failure on the post-cooldown probe call, which restarts a full
+    cooldown window rather than leaving the old timestamp in place."""
+    client = get_client()
+    row = client.aicircuitbreaker.upsert(
+        where={"id": "global"},
+        data={
+            "create": {"id": "global", "consecutiveFailures": 1},
+            "update": {"consecutiveFailures": {"increment": 1}},
+        },
+    )
+    if row.consecutiveFailures >= threshold:
+        row = client.aicircuitbreaker.update(where={"id": "global"}, data={"openedAt": _now()})
+    return row
+
+
+def record_llm_call_success() -> Any:
+    """A real, successful call is the strongest signal the provider is
+    healthy again - resets the counter and closes the circuit outright,
+    rather than waiting out any remaining cooldown."""
+    return get_client().aicircuitbreaker.upsert(
+        where={"id": "global"},
+        data={"create": {"id": "global"}, "update": {"consecutiveFailures": 0, "openedAt": None}},
+    )
+
+
 # -- L2 global parse cache (Chunk 4c, §7.4) ----------------------------------
 
 

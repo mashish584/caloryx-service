@@ -946,6 +946,25 @@ model AiQuotaCounter {
   updatedAt   DateTime @updatedAt
 }
 
+// Cost circuit breaker (§11, §12.8's third mechanism, Chunk 8d) - one global
+// row, id="global". Trips on repeated *transient* LLM call failures, never a
+// config error (a missing API key fails identically forever - a cooldown
+// can't fix it). While open, `_call_llm` skips the call outright and falls
+// back to the existing graceful degraded response, so chat is never fully
+// unavailable during a real outage (§11) and doesn't pay a timeout on every
+// request. Deliberately failure-based only - a cost-spike trigger needs a
+// real $ budget number this codebase has nothing to calibrate against yet;
+// documented gap, not silently dropped.
+model AiCircuitBreaker {
+  id                  String    @id @default("global")
+  consecutiveFailures Int       @default(0)
+  // Null = closed/healthy. Set = tripped at this timestamp; a fresh failure
+  // on the first post-cooldown probe call re-sets it to now, extending the
+  // cooldown rather than leaving the stale timestamp in place.
+  openedAt            DateTime?
+  updatedAt           DateTime  @updatedAt
+}
+
 /// L2 cache (§7.4) - normalized-hash -> resolved `LOG_NEW` parse, shared
 /// across every user so a common phrasing only ever needs one paid model
 /// call. No `userId`: global and PII-free by construction (the key is a hash
