@@ -278,6 +278,7 @@ def test_confirming_a_draft_returns_the_logged_meal_and_daily_totals(client, gue
 
     monkeypatch.setattr(meals_repository, "create_logged_meal", create_logged_meal)
     monkeypatch.setattr(meals_repository, "list_logged_meals", lambda user_id, **kw: [])
+    monkeypatch.setattr(meals_repository, "get_catalog_version", lambda: 1)
 
     response = client.post(
         "/api/v1/assistant/drafts/draft-1/confirm",
@@ -297,6 +298,7 @@ def test_sending_a_message_creates_a_draft_from_text(client, guest, monkeypatch)
     monkeypatch.setattr(meals_repository, "get_food", lambda food_id: food)
     monkeypatch.setattr(meals_repository, "search_foods", lambda query, **kw: [food])
     monkeypatch.setattr(meals_repository, "get_composite_foods", lambda: [])
+    monkeypatch.setattr(meals_repository, "get_catalog_version", lambda: 1)
     monkeypatch.setattr(assistant_repository, "get_open_draft", lambda user_id: None)
     monkeypatch.setattr(
         assistant_repository, "get_or_create_today_session", lambda user_id: SimpleNamespace(id="session-1")
@@ -341,6 +343,7 @@ def test_sending_a_new_meal_message_while_a_draft_is_open_asks_for_clarification
 ):
     food = make_food()
     existing_draft = make_draft([make_item(food)])
+    monkeypatch.setattr(meals_repository, "get_catalog_version", lambda: 1)
     monkeypatch.setattr(assistant_repository, "get_open_draft", lambda user_id: existing_draft)
     monkeypatch.setattr(assistant_repository, "expire_draft_if_stale", lambda d: d)
     monkeypatch.setattr(assistant_repository, "get_idempotency_record", lambda key: None)
@@ -397,6 +400,7 @@ def test_get_quota_reflects_an_active_window(client, guest, monkeypatch):
 def test_sending_a_message_surfaces_quota_exceeded_without_calling_the_model(
     client, guest, monkeypatch
 ):
+    monkeypatch.setattr(meals_repository, "get_catalog_version", lambda: 1)
     monkeypatch.setattr(assistant_repository, "get_open_draft", lambda user_id: None)
     monkeypatch.setattr(assistant_repository, "get_idempotency_record", lambda key: None)
     monkeypatch.setattr(assistant_repository, "save_idempotency_record", lambda *a, **kw: None)

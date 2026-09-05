@@ -76,6 +76,14 @@ def get_dish_category_profile(category: str) -> Optional[Any]:
     return get_client().dishcategoryprofile.find_unique(where={"category": category})
 
 
+def get_catalog_version() -> int:
+    """Global, curator-bumped catalog version (§12.3, §12.7, Chunk 8a). No row
+    yet means "at its default" - same posture as
+    `DishCategoryProfile.catalogVersion`'s own hardcoded default of 1."""
+    row = get_client().catalogversion.find_unique(where={"id": "global"})
+    return row.version if row is not None else 1
+
+
 def file_food_miss(raw_text: str, locale: str = "") -> Any:
     """Upsert on `(rawText, locale)` - a repeat miss increments `occurrences`
     rather than creating a duplicate row. `locale` defaults to `""`, never

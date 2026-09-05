@@ -568,6 +568,8 @@ def confirm_draft(
             name=draft.name,
             slot=draft.slot,
             source="CHAT_AI",
+            catalogVersion=meals_repository.get_catalog_version(),
+            nutritionEngineVersion=settings.NUTRITION_ENGINE_VERSION,
             **_totals_payload(totals),
         )
         if meal_timestamp is not None:
@@ -1541,6 +1543,24 @@ _NON_LOGGING_INTENTS = (
 )
 
 
+# -- reproducibility & cache-key versioning (Chunk 8a, §12.3, §12.7) --------
+
+
+def _versioned_cache_key(normalized_hash: str) -> str:
+    """Folds catalog/normalization/parser versions into the raw text hash
+    (§12.7) so a catalog edit or a parser/normalization deploy can't keep
+    serving a stale T0/L2 interpretation. Lives here, not in `chatparser`,
+    because `chatparser` is a pure, Django-free package by convention and
+    can't reach `settings`/the DB itself - this is the one layer up that
+    already can. A version bump just stops matching old rows going forward;
+    nothing purges them, same as `IdempotencyRecord`/`MealDraft` expiry."""
+    catalog_version = meals_repository.get_catalog_version()
+    raw = "{}:{}:{}:{}".format(
+        normalized_hash, catalog_version, settings.NORMALIZATION_VERSION, settings.PARSER_VERSION
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _Outcome:
     cached = repository.find_cached_message(user_id, normalized_hash)
     if cached is not None:
@@ -1756,7 +1776,7 @@ def send_message(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
     def _do() -> Dict[str, Any]:
         normalized = chatparser.normalize_text(content)
-        normalized_hash = chatparser.hash_normalized(normalized)
+        normalized_hash = _versioned_cache_key(chatparser.hash_normalized(normalized))
 
         outcome = _process_message(user_id, normalized, normalized_hash, on_open_draft)
 

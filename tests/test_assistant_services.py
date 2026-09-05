@@ -207,6 +207,7 @@ def seam(monkeypatch):
         dish_category_profiles={},
         profiles={},
         gamification_suppressed_sessions=[],
+        catalog_version=1,
     )
 
     monkeypatch.setattr(onboarding_repository, "get_profile", lambda user_id, **kw: state.profiles.get(user_id))
@@ -461,6 +462,7 @@ def seam(monkeypatch):
     monkeypatch.setattr(
         meals_repository, "get_composite_foods", lambda: list(state.composites.values())
     )
+    monkeypatch.setattr(meals_repository, "get_catalog_version", lambda: state.catalog_version)
 
     def file_food_miss(raw_text, locale=""):
         state.food_misses.append(raw_text)
@@ -868,7 +870,7 @@ def test_send_message_t0_cache_hit_skips_the_grammar(seam):
             id="msg-old",
             userId="user-1",
             role="USER",
-            normalizedHash=hash_normalized(normalize_text(content)),
+            normalizedHash=services._versioned_cache_key(hash_normalized(normalize_text(content))),
             parseSnapshot={
                 "name": "Lunch — Rice",
                 "slot": "LUNCH",
@@ -1545,6 +1547,44 @@ def test_send_message_t0_cache_hit_does_not_consume_quota(seam, monkeypatch):
     assert seam.quota_counters["user-1"].count == 1
 
 
+def test_versioned_cache_key_changes_with_the_catalog_version(seam):
+    base = hash_normalized(normalize_text("200g rice"))
+    seam.catalog_version = 1
+    key_v1 = services._versioned_cache_key(base)
+    seam.catalog_version = 2
+    key_v2 = services._versioned_cache_key(base)
+
+    assert key_v1 != key_v2
+
+
+@override_settings(PARSER_VERSION=2)
+def test_versioned_cache_key_changes_with_the_parser_version(seam):
+    base = hash_normalized(normalize_text("200g rice"))
+    with override_settings(PARSER_VERSION=1):
+        key_v1 = services._versioned_cache_key(base)
+    key_v2 = services._versioned_cache_key(base)
+
+    assert key_v1 != key_v2
+
+
+def test_send_message_t0_cache_hit_is_invalidated_by_a_catalog_version_bump(seam, monkeypatch):
+    seam.foods["food-chicken"] = _chicken_food()
+    envelope = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.9)]
+    )
+    calls = stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+    content = "grilled chicken salad with a tahini dressing"
+
+    send(seam, content, client_message_id="m1")
+    seam.draft = None
+    seam.catalog_version = 2  # a curator bumped the catalog between the two sends
+
+    response = send(seam, content, client_message_id="m2")
+
+    assert len(calls) == 2  # the old T0 entry no longer matches - re-parsed, not replayed
+    assert response["tier"] != "CACHE"
+
+
 def test_send_message_l2_cache_hit_for_a_different_user_skips_the_llm_call(seam, monkeypatch):
     seam.foods["food-chicken"] = _chicken_food()
     envelope = llm_envelope(
@@ -1573,7 +1613,7 @@ def test_send_message_l2_cache_hit_for_a_different_user_skips_the_llm_call(seam,
 def test_global_cache_entry_falls_through_when_the_cached_food_no_longer_resolves(seam, monkeypatch):
     seam.foods["food-chicken"] = _chicken_food()
     content = "grilled chicken salad with a tahini dressing"
-    normalized_hash = hash_normalized(normalize_text(content))
+    normalized_hash = services._versioned_cache_key(hash_normalized(normalize_text(content)))
     seam.global_cache[normalized_hash] = SimpleNamespace(
         normalizedHash=normalized_hash,
         snapshot={
@@ -1592,6 +1632,26 @@ def test_global_cache_entry_falls_through_when_the_cached_food_no_longer_resolve
 
     assert len(calls) == 1  # fell through to a fresh T2 call
     assert response["tier"] == "LLM_SMALL"
+
+
+def test_l2_cache_entry_is_unreachable_after_a_catalog_version_bump(seam, monkeypatch):
+    seam.foods["food-chicken"] = _chicken_food()
+    envelope = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.9)]
+    )
+    calls = stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+    content = "grilled chicken salad with a tahini dressing"
+
+    send(seam, content, client_message_id="m1")
+    assert len(calls) == 1
+    assert seam.global_cache  # user-1's parse wrote a global-cache row under v1's key
+    seam.draft = None
+    seam.catalog_version = 2  # a curator bumps the catalog before user-2 ever sends this
+
+    response = services.send_message("user-2", {"clientMessageId": "m2", "content": content})
+
+    assert len(calls) == 2  # the v1-keyed entry doesn't match under v2 - a fresh call, not a hit
+    assert response["tier"] != "CACHE"
 
 
 def test_send_message_escalates_to_t3_on_low_confidence_t2_result(seam, monkeypatch):
@@ -2335,3 +2395,15 @@ def test_confirm_draft_without_any_offline_fields_is_unchanged(seam):
     response = services.confirm_draft("user-1", created["id"], "idem-1", created["version"])
 
     assert response["recomputedFromClientSnapshot"] is False
+
+
+@override_settings(NUTRITION_ENGINE_VERSION=5)
+def test_confirm_draft_stamps_the_current_catalog_and_nutrition_engine_version(seam):
+    seam.catalog_version = 4
+    created = create_lunch_draft(seam)
+
+    services.confirm_draft("user-1", created["id"], "idem-1", created["version"])
+
+    logged_meal = seam.logged_meals[-1]
+    assert logged_meal.catalogVersion == 4
+    assert logged_meal.nutritionEngineVersion == 5

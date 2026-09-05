@@ -118,6 +118,11 @@ class LoggedMealSerializer(serializers.Serializer):
     loggedAt = serializers.DateTimeField()
     totals = LoggedMealTotalsSerializer()
     items = LoggedMealItemSerializer(many=True)
+    # §12.3 (Chunk 8a) - always present (never omitted based on context, same
+    # convention as `recomputedFromClientSnapshot`); `True` only when editing
+    # this meal recomputed against a food-catalog version newer than the one
+    # it was originally logged under.
+    catalogVersionChanged = serializers.BooleanField()
 
 
 class LoggedMealListResponseSerializer(serializers.Serializer):
@@ -184,7 +189,7 @@ def _serialize_item(item: Any) -> Dict[str, Any]:
     }
 
 
-def serialize_logged_meal(meal: Any) -> Dict[str, Any]:
+def serialize_logged_meal(meal: Any, *, catalog_version_changed: bool = False) -> Dict[str, Any]:
     # Rounding happens exactly once, here, at the response boundary (§8) - the
     # stored totals and every stored item stay full-precision so this is the
     # only place kcal/macros are ever rounded.
@@ -204,4 +209,5 @@ def serialize_logged_meal(meal: Any) -> Dict[str, Any]:
             "fiberG": round_int(meal.fiberG) if meal.fiberG is not None else None,
         },
         "items": [_serialize_item(item) for item in meal.items],
+        "catalogVersionChanged": catalog_version_changed,
     }

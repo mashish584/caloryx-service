@@ -323,6 +323,22 @@ model DishCategoryProfile {
   updatedAt DateTime @updatedAt
 }
 
+// Global, curator-bumped catalog version (§12.3, §12.7, Chunk 8a) - one row,
+// id="global". Food/CompositeFood/DishCategoryProfile are all edited by hand
+// (management commands / direct DB access, no admin UI or live curation flow
+// exists), so there is no way to auto-detect "the catalog changed" - this
+// gives curators a real, bumpable number instead (via `bump_catalog_version`)
+// rather than inventing an automatic change-detector this codebase has no
+// infrastructure to support. Read by `LoggedMeal.catalogVersion` at confirm
+// time and folded into the T0/L2 cache key (§12.7) - unrelated to
+// `DishCategoryProfile.catalogVersion`/`CompositeFood.catalogVersion` above,
+// which are each their own still-forward-declared, per-entity concept.
+model CatalogVersion {
+  id        String   @id @default("global")
+  version   Int      @default(1)
+  updatedAt DateTime @updatedAt
+}
+
 /// Household/countable measures, defined per food (§8) - a cup of rice and a
 /// cup of spinach are not the same mass. `g`/`kg` are universal and never
 /// stored here; see nutrition.units.resolve_grams.
@@ -359,6 +375,15 @@ model LoggedMeal {
   carbsG       Float?
   fatG         Float?
   fiberG       Float?
+
+  // Which catalog/nutrition-engine version produced the numbers above (§12.3,
+  // Chunk 8a) - stamped once at write time, never re-derived, so a later
+  // catalog correction can't retroactively reinterpret what this meal's
+  // numbers "really" were. `catalogVersion` comes from the global
+  // `CatalogVersion` singleton at confirm time; `nutritionEngineVersion` from
+  // `settings.NUTRITION_ENGINE_VERSION`.
+  catalogVersion         Int @default(1)
+  nutritionEngineVersion Int @default(1)
 
   items LoggedMealItem[]
 

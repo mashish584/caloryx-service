@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from django.test import override_settings
 
 from common.exceptions import NotFoundError, UnresolvableQuantityError
 from meals import repository, services
@@ -73,6 +74,8 @@ def make_meal(items, **overrides):
         fatG=sum(i.fatG for i in items),
         fiberG=sum(i.fiberG for i in items if i.fiberG is not None) or None,
         items=items,
+        catalogVersion=1,
+        nutritionEngineVersion=1,
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -80,9 +83,17 @@ def make_meal(items, **overrides):
 
 @pytest.fixture
 def seam(monkeypatch):
-    state = SimpleNamespace(foods={}, meal=None, created=None, updated_totals=None, updated_item=None)
+    state = SimpleNamespace(
+        foods={},
+        meal=None,
+        created=None,
+        updated_totals=None,
+        updated_item=None,
+        catalog_version=1,
+    )
 
     monkeypatch.setattr(repository, "get_food", lambda food_id: state.foods.get(food_id))
+    monkeypatch.setattr(repository, "get_catalog_version", lambda: state.catalog_version)
 
     def create_logged_meal(user_id, meal_data, items_data):
         state.created = (user_id, meal_data, items_data)
@@ -94,7 +105,7 @@ def seam(monkeypatch):
             )
             for i, item in enumerate(items_data)
         ]
-        state.meal = make_meal(items, userId=user_id)
+        state.meal = make_meal(items, userId=user_id, **meal_data)
         return state.meal
 
     monkeypatch.setattr(repository, "create_logged_meal", create_logged_meal)
@@ -261,6 +272,20 @@ def test_log_meal_preserves_missing_fiber_as_none_in_the_response(seam):
     assert payload["totals"]["fiberG"] is None
 
 
+@override_settings(NUTRITION_ENGINE_VERSION=2)
+def test_log_meal_stamps_the_current_catalog_and_nutrition_engine_version(seam):
+    seam.foods["food-rice"] = make_food()
+    seam.catalog_version = 3
+
+    services.log_meal(
+        "user-1",
+        {"name": "L", "slot": "LUNCH", "items": [{"foodId": "food-rice", "quantity": 100.0, "unit": "g"}]},
+    )
+
+    assert seam.meal.catalogVersion == 3
+    assert seam.meal.nutritionEngineVersion == 2
+
+
 # -- fetch / delete meal --------------------------------------------------
 
 
@@ -319,6 +344,50 @@ def test_delete_logged_meal_item_recomputes_meal_totals_to_zero_when_last_item_r
 
     assert payload["items"] == []
     assert payload["totals"]["caloriesKcal"] == 0
+
+
+# -- catalog-version drift note on edit (§12.3, Chunk 8a) ---------------------
+
+
+def test_update_logged_meal_item_flags_catalog_version_changed_after_a_bump(seam):
+    seam.foods["food-rice"] = make_food()
+    services.log_meal(
+        "user-1",
+        {"name": "L", "slot": "LUNCH", "items": [{"foodId": "food-rice", "quantity": 100.0, "unit": "g"}]},
+    )
+    item_id = seam.meal.items[0].id
+    seam.catalog_version = 2  # a curator bumped the catalog after this meal was logged
+
+    payload = services.update_logged_meal_item("user-1", seam.meal.id, item_id, {"quantity": 300.0})
+
+    assert payload["catalogVersionChanged"] is True
+
+
+def test_update_logged_meal_item_does_not_flag_catalog_version_changed_when_unbumped(seam):
+    seam.foods["food-rice"] = make_food()
+    services.log_meal(
+        "user-1",
+        {"name": "L", "slot": "LUNCH", "items": [{"foodId": "food-rice", "quantity": 100.0, "unit": "g"}]},
+    )
+    item_id = seam.meal.items[0].id
+
+    payload = services.update_logged_meal_item("user-1", seam.meal.id, item_id, {"quantity": 300.0})
+
+    assert payload["catalogVersionChanged"] is False
+
+
+def test_delete_logged_meal_item_flags_catalog_version_changed_after_a_bump(seam):
+    seam.foods["food-rice"] = make_food()
+    services.log_meal(
+        "user-1",
+        {"name": "L", "slot": "LUNCH", "items": [{"foodId": "food-rice", "quantity": 100.0, "unit": "g"}]},
+    )
+    item_id = seam.meal.items[0].id
+    seam.catalog_version = 2
+
+    payload = services.delete_logged_meal_item("user-1", seam.meal.id, item_id)
+
+    assert payload["catalogVersionChanged"] is True
 
 
 # -- search_foods / miss queue (Chunk 3, §9, I8) -----------------------------

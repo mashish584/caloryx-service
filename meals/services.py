@@ -7,6 +7,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+from django.conf import settings
+
 from common.exceptions import NotFoundError, UnresolvableQuantityError
 from nutrition import (
     FoodState,
@@ -164,7 +166,13 @@ def log_meal(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         resolved_items.append(item)
         vectors.append(vector)
 
-    meal_data = dict(name=data["name"], slot=data["slot"], **_totals_payload(sum_nutrition(vectors)))
+    meal_data = dict(
+        name=data["name"],
+        slot=data["slot"],
+        catalogVersion=repository.get_catalog_version(),
+        nutritionEngineVersion=settings.NUTRITION_ENGINE_VERSION,
+        **_totals_payload(sum_nutrition(vectors)),
+    )
     meal = repository.create_logged_meal(user_id, meal_data, resolved_items)
     logger.info("meal logged user=%s meal=%s items=%s", user_id, meal.id, len(resolved_items))
     return serialize_logged_meal(meal)
@@ -185,6 +193,17 @@ def fetch_logged_meal(user_id: str, meal_id: str) -> Dict[str, Any]:
 def delete_logged_meal(user_id: str, meal_id: str) -> None:
     if not repository.delete_logged_meal(user_id, meal_id):
         raise NotFoundError("Meal not found.", code="meal_not_found")
+
+
+def _catalog_version_changed(meal: Any) -> bool:
+    """§12.3's "shows a note if the result differs from the snapshot" -
+    editing an item already recomputes it against the *current* Food row
+    (see `update_logged_meal_item` above); this just tells the client that
+    the underlying catalog data (not only their own edit) has moved on since
+    the meal was originally logged. Response-only, never persisted - a
+    one-time note the client shows once, same posture as `confirm_draft`'s
+    `recomputedFromClientSnapshot`."""
+    return meal.catalogVersion != repository.get_catalog_version()
 
 
 def _recompute_meal_totals(user_id: str, meal_id: str) -> Any:
@@ -212,7 +231,7 @@ def update_logged_meal_item(
 
     meal = _recompute_meal_totals(user_id, meal_id)
     logger.info("meal item updated user=%s meal=%s item=%s", user_id, meal_id, item_id)
-    return serialize_logged_meal(meal)
+    return serialize_logged_meal(meal, catalog_version_changed=_catalog_version_changed(meal))
 
 
 def delete_logged_meal_item(user_id: str, meal_id: str, item_id: str) -> Dict[str, Any]:
@@ -223,4 +242,4 @@ def delete_logged_meal_item(user_id: str, meal_id: str, item_id: str) -> Dict[st
     repository.delete_logged_meal_item(item_id)
     meal = _recompute_meal_totals(user_id, meal_id)
     logger.info("meal item removed user=%s meal=%s item=%s", user_id, meal_id, item_id)
-    return serialize_logged_meal(meal)
+    return serialize_logged_meal(meal, catalog_version_changed=_catalog_version_changed(meal))

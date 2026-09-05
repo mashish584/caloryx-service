@@ -248,6 +248,19 @@ REPLAY_WINDOW_HOURS = (MAX_QUEUE_AGE_DAYS + 1) * 24
 # §12.5's "beyond epsilon" threshold for the catalog-drift note on confirm.
 NUTRITION_DRIFT_EPSILON_KCAL = float(env("NUTRITION_DRIFT_EPSILON_KCAL", "5"))
 
+# --- Reproducibility & cache-key versioning (§12.3, §12.7, Chunk 8a) -------
+# These three only ever change via a code deploy (editing chatparser's
+# normalization/grammar, or nutrition/calculator.py) - a code-level constant
+# is the honest representation of "changes only when this code changes".
+# The fourth piece of §12.7's cache-key formula, the food catalog's own
+# version, is *not* here - Food/CompositeFood/DishCategoryProfile are edited
+# by hand with no code deploy involved, so it lives in the DB-backed
+# `CatalogVersion` singleton instead (see meals.repository.get_catalog_version
+# and `manage.py bump_catalog_version`).
+NORMALIZATION_VERSION = int(env("NORMALIZATION_VERSION", "1"))
+PARSER_VERSION = int(env("PARSER_VERSION", "1"))
+NUTRITION_ENGINE_VERSION = int(env("NUTRITION_ENGINE_VERSION", "1"))
+
 # --- Guest sessions -------------------------------------------------------
 # Guest mode is not a Clerk concept, so we mint our own short-lived tokens.
 GUEST_TOKEN_TTL_DAYS = int(env("GUEST_TOKEN_TTL_DAYS", "180"))

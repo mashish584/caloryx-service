@@ -54,6 +54,8 @@ def make_meal(items, **overrides):
         fatG=sum(i.fatG for i in items),
         fiberG=sum(i.fiberG for i in items if i.fiberG is not None) or None,
         items=items,
+        catalogVersion=1,
+        nutritionEngineVersion=1,
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -108,6 +110,7 @@ def test_food_search_returns_catalog_matches(client, guest, monkeypatch):
 def test_creating_a_meal_returns_the_computed_totals(client, guest, monkeypatch):
     food = make_food()
     monkeypatch.setattr(meals_repository, "get_food", lambda food_id: food)
+    monkeypatch.setattr(meals_repository, "get_catalog_version", lambda: 1)
 
     def create_logged_meal(user_id, meal_data, items_data):
         item = SimpleNamespace(
