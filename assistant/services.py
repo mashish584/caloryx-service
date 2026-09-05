@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from django.conf import settings
 
 import chatparser
+from common.middleware import current_request_id
 from common.exceptions import (
     DraftNotOpenError,
     DraftVersionConflictError,
@@ -449,6 +450,15 @@ def delete_draft_item(
 def _request_hash(payload: Dict[str, Any]) -> str:
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _request_id_or_none() -> Optional[str]:
+    """Correlation chain (§12.9, Chunk 8b). `"-"` is `common.middleware`'s own
+    sentinel for "no request in flight" - normalized to `None` here so the
+    stored column means "attached to a real request" or nothing, never a
+    placeholder string that looks like data."""
+    request_id = current_request_id()
+    return request_id if request_id != "-" else None
 
 
 def _idempotent(
@@ -1064,6 +1074,7 @@ def _call_llm(
                 "countedToQuota": counted_to_quota,
                 "latencyMs": int((time.monotonic() - started) * 1000),
                 "confidence": 0.0,
+                "requestId": _request_id_or_none(),
             },
         )
         return None
@@ -1078,6 +1089,7 @@ def _call_llm(
                 "countedToQuota": counted_to_quota,
                 "latencyMs": int((time.monotonic() - started) * 1000),
                 "confidence": 0.0,
+                "requestId": _request_id_or_none(),
             },
         )
         return None
@@ -1100,6 +1112,7 @@ def _call_llm(
                 "costMicros": _cost_micros(tier, response.prompt_tokens, response.output_tokens),
                 "latencyMs": response.latency_ms,
                 "confidence": 0.0,
+                "requestId": _request_id_or_none(),
             },
         )
         return None
@@ -1119,6 +1132,7 @@ def _call_llm(
             "costMicros": _cost_micros(tier, response.prompt_tokens, response.output_tokens),
             "latencyMs": response.latency_ms,
             "confidence": confidence,
+            "requestId": _request_id_or_none(),
         },
     )
     return envelope
@@ -1784,6 +1798,7 @@ def send_message(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         # Cache keys are LOG_NEW-only (§7.4) - an edit-shaped message's text has
         # nothing worth caching against, so both fields stay null for it.
         cacheable = outcome.intent == "LOG_NEW"
+        request_id = _request_id_or_none()
         user_message = repository.create_chat_message(
             session.id,
             user_id,
@@ -1796,10 +1811,13 @@ def send_message(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
                 "intent": outcome.intent,
                 "draftId": outcome.draft_id,
                 "parseSnapshot": outcome.parse_snapshot if cacheable else None,
+                "requestId": request_id,
             },
         )
         repository.create_chat_message(
-            session.id, user_id, {"role": "ASSISTANT", "content": outcome.assistant_text}
+            session.id,
+            user_id,
+            {"role": "ASSISTANT", "content": outcome.assistant_text, "requestId": request_id},
         )
 
         return {

@@ -338,6 +338,60 @@ def test_sending_a_message_creates_a_draft_from_text(client, guest, monkeypatch)
     assert body["requestId"]
 
 
+def test_sending_a_message_persists_the_inbound_request_id_on_the_chat_messages(
+    client, guest, monkeypatch
+):
+    """§12.9 (Chunk 8b) end-to-end: a client-supplied X-Request-Id survives the
+    real `RequestIdMiddleware` -> contextvar chain and lands on the persisted
+    `ChatMessage` rows, not just the response header/body."""
+    food = make_food()
+    monkeypatch.setattr(meals_repository, "get_food", lambda food_id: food)
+    monkeypatch.setattr(meals_repository, "search_foods", lambda query, **kw: [food])
+    monkeypatch.setattr(meals_repository, "get_composite_foods", lambda: [])
+    monkeypatch.setattr(meals_repository, "get_catalog_version", lambda: 1)
+    monkeypatch.setattr(assistant_repository, "get_open_draft", lambda user_id: None)
+    monkeypatch.setattr(
+        assistant_repository, "get_or_create_today_session", lambda user_id: SimpleNamespace(id="session-1")
+    )
+    monkeypatch.setattr(assistant_repository, "get_idempotency_record", lambda key: None)
+    monkeypatch.setattr(assistant_repository, "save_idempotency_record", lambda *a, **kw: None)
+    monkeypatch.setattr(assistant_repository, "find_cached_message", lambda user_id, h: None)
+
+    created_messages = []
+
+    def create_chat_message(session_id, user_id, data):
+        message = SimpleNamespace(id="msg-{}".format(len(created_messages) + 1), **data)
+        created_messages.append(message)
+        return message
+
+    monkeypatch.setattr(assistant_repository, "create_chat_message", create_chat_message)
+    monkeypatch.setattr(assistant_repository, "get_serving_preference", lambda *a, **kw: None)
+    monkeypatch.setattr(assistant_repository, "record_serving_observation", lambda *a, **kw: None)
+    monkeypatch.setattr(assistant_repository, "record_draft_operation", lambda *a, **kw: None)
+
+    def create_draft_with_expiry_check(user_id, session_id, draft_data, items_data):
+        item = make_item(food, **{k: v for k, v in items_data[0].items() if k != "foodId"})
+        return make_draft([item], userId=user_id, sessionId=session_id, **draft_data)
+
+    monkeypatch.setattr(
+        assistant_repository, "create_draft_with_expiry_check", create_draft_with_expiry_check
+    )
+
+    response = client.post(
+        "/api/v1/assistant/messages",
+        data={"clientMessageId": "m1", "content": "200g rice"},
+        content_type="application/json",
+        HTTP_AUTHORIZATION=guest,
+        HTTP_X_REQUEST_ID="trace-me-123",
+    )
+
+    assert response.status_code == 200
+    assert response["X-Request-Id"] == "trace-me-123"
+    assert response.json()["requestId"] == "trace-me-123"
+    assert len(created_messages) == 2
+    assert all(m.requestId == "trace-me-123" for m in created_messages)
+
+
 def test_sending_a_new_meal_message_while_a_draft_is_open_asks_for_clarification(
     client, guest, monkeypatch
 ):

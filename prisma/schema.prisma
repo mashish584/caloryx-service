@@ -764,8 +764,12 @@ model ChatMessage {
 
   createdAt DateTime @default(now())
 
+  // Correlation chain (§12.9, Chunk 8b) - see ParseEvent.requestId.
+  requestId String?
+
   @@unique([sessionId, clientMessageId])
   @@index([userId, normalizedHash])
+  @@index([requestId])
 }
 
 // --- Chunk 3: composite foods & miss-queue flywheel (AI Meal Assistant PRD §7.6, §9, I8) ---
@@ -885,8 +889,15 @@ model ParseEvent {
   wasLogged      Boolean    @default(false)
   createdAt      DateTime   @default(now())
 
+  // Correlation chain (§12.9, Chunk 8b) - the HTTP request that triggered
+  // this call, from `common.middleware.RequestIdMiddleware`. Null when there
+  // was no request in flight (e.g. a management command, or a service
+  // function called directly in a test).
+  requestId String?
+
   @@index([inputHash])
   @@index([userId, createdAt])
+  @@index([requestId])
 }
 
 /// Per-user portion learning - the quantity-resolution ladder's step 1 and

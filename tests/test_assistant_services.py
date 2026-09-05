@@ -2407,3 +2407,60 @@ def test_confirm_draft_stamps_the_current_catalog_and_nutrition_engine_version(s
     logged_meal = seam.logged_meals[-1]
     assert logged_meal.catalogVersion == 4
     assert logged_meal.nutritionEngineVersion == 5
+
+
+# -- correlation chain (Chunk 8b, §12.9) --------------------------------------
+
+
+def test_send_message_records_the_request_id_on_both_chat_messages(seam, monkeypatch):
+    monkeypatch.setattr(services, "current_request_id", lambda: "req-abc123")
+
+    send(seam, "200g rice")
+
+    assert len(seam.messages) == 2
+    assert all(m.requestId == "req-abc123" for m in seam.messages)
+
+
+def test_send_message_records_no_request_id_outside_a_request(seam):
+    # `current_request_id`'s real default ("-", no middleware in this test)
+    # is normalized to None - a service function called directly (as every
+    # test in this file does) has no request in flight.
+    send(seam, "200g rice")
+
+    assert len(seam.messages) == 2
+    assert all(m.requestId is None for m in seam.messages)
+
+
+def test_call_llm_records_the_request_id_on_a_successful_parse_event(seam, monkeypatch):
+    monkeypatch.setattr(services, "current_request_id", lambda: "req-success")
+    seam.foods["food-chicken"] = _chicken_food()
+    envelope = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.9)]
+    )
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert len(seam.parse_events) == 1
+    assert seam.parse_events[0].requestId == "req-success"
+
+
+def test_call_llm_records_the_request_id_on_a_call_failure(seam, monkeypatch):
+    monkeypatch.setattr(services, "current_request_id", lambda: "req-failure")
+    stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
+
+    send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert len(seam.parse_events) == 1
+    assert seam.parse_events[0].requestId == "req-failure"
+
+
+def test_call_llm_records_the_request_id_on_a_validation_failure(seam, monkeypatch):
+    monkeypatch.setattr(services, "current_request_id", lambda: "req-invalid")
+    bad_envelope = llm_envelope(items=[llm_item("chicken", state="sizzling", confidence=0.5)])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(bad_envelope))
+
+    send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert len(seam.parse_events) == 1
+    assert seam.parse_events[0].requestId == "req-invalid"
