@@ -466,6 +466,7 @@ model MealDraft {
   // ChatMessage.draftId, per the PRD §9 sketch) - unused by anything yet, but
   // required for the relation to compile.
   messages  ChatMessage[]
+  operations DraftOperation[]
 
   // Always the sum of `items` at write time (§6) - recomputed on every
   // mutation exactly like LoggedMeal's totals, never authored independently.
@@ -567,6 +568,27 @@ model MealDraftItem {
   profileVersion Int?
 
   createdAt DateTime @default(now())
+}
+
+/// Audit trail for every draft mutation (§12.2, Chunk 5a) - concurrency
+/// debugging, a provenance trail for the eval set, and what makes Undo a
+/// later feature rather than a rewrite. `op` deliberately has no CONFIRM/
+/// DISCARD/EXPIRE value (matching the PRD's literal sketch) - those state
+/// transitions stay auditable via MealDraft.status itself.
+model DraftOperation {
+  id      String    @id @default(cuid())
+  draft   MealDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  draftId String
+  op      String // CREATE | EDIT_ITEM | ADD_ITEM | REMOVE_ITEM | SET_SLOT | RENAME
+  // Always "user" today - no scheduled sweeper or other system-initiated
+  // mutation exists in this codebase yet. Reserved for when one does, same
+  // forward-declared-but-unused posture as ParseTier.MANUAL.
+  actor   String
+  payload Json
+  version Int // resulting draft version
+  createdAt DateTime @default(now())
+
+  @@index([draftId, version])
 }
 
 /// Idempotency for mutating requests that must never double-apply on retry

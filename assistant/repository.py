@@ -312,3 +312,18 @@ def bump_global_cache_hit(normalized_hash: str) -> None:
     get_client().globalparsecache.update(
         where={"normalizedHash": normalized_hash}, data={"hitCount": {"increment": 1}}
     )
+
+
+# -- draft operation audit log (Chunk 5a, §12.2) -----------------------------
+
+
+def record_draft_operation(draft_id: str, op: str, payload: Dict[str, Any], version: int) -> Any:
+    return get_client().draftoperation.create(
+        data={
+            "draftId": draft_id,
+            "op": op,
+            "actor": "user",
+            "payload": Json(payload),
+            "version": version,
+        }
+    )

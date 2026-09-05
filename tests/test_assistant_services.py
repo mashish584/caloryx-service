@@ -167,6 +167,7 @@ def seam(monkeypatch):
         quota_counters={},
         global_cache={},
         global_cache_hit_calls=[],
+        draft_operations=[],
     )
 
     # -- assistant.repository ------------------------------------------------
@@ -393,6 +394,15 @@ def seam(monkeypatch):
             entry.hitCount += 1
 
     monkeypatch.setattr(repository, "bump_global_cache_hit", bump_global_cache_hit)
+
+    # -- assistant.repository: draft operation audit log (Chunk 5a) ----------
+
+    def record_draft_operation(draft_id, op, payload, version):
+        entry = SimpleNamespace(draftId=draft_id, op=op, actor="user", payload=payload, version=version)
+        state.draft_operations.append(entry)
+        return entry
+
+    monkeypatch.setattr(repository, "record_draft_operation", record_draft_operation)
 
     # -- meals.repository (confirm -> LoggedMeal handoff) --------------------
 
@@ -1214,13 +1224,18 @@ def test_send_message_t1_partial_match_does_not_call_t2(seam, monkeypatch):
     assert calls == []
 
 
-def test_send_message_open_draft_unrecognized_message_does_not_call_t2(seam, monkeypatch):
+def test_send_message_open_draft_unrecognized_message_calls_t2_for_a_second_opinion(seam, monkeypatch):
+    """Superseded by Chunk 5a: an open-draft message matching neither T1
+    grammar now gets one T2 call (§7.5) before falling back - previously
+    (Chunk 4a) this never escalated at all. A LOG_NEW-classified envelope
+    (the default `llm_envelope()`) still isn't actionable on an open draft,
+    so the outcome is unchanged even though the call now happens."""
     create_lunch_draft(seam)
     calls = stub_call_small_model(monkeypatch, result=stub_llm_response(llm_envelope()))
 
     response = send(seam, "what a lovely day", client_message_id="m2")
 
-    assert calls == []
+    assert len(calls) == 1
     assert response["intent"] == "OTHER"
 
 
@@ -1558,3 +1573,143 @@ def test_send_message_does_not_escalate_to_t3_on_a_t2_call_failure(seam, monkeyp
     assert large_calls == []
     assert response["tier"] == "PARSER"
     assert response["intent"] == "OTHER"
+
+
+# -- conversational edits via AI + DraftOperation audit log (Chunk 5a) -------
+
+
+def test_send_message_ai_edit_set_slot_updates_the_open_draft(seam, monkeypatch):
+    create_lunch_draft(seam)
+    envelope = llm_envelope(intent="SET_SLOT", slot="BREAKFAST")
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "this was actually breakfast, my bad", client_message_id="m2")
+
+    assert response["intent"] == "SET_SLOT"
+    assert response["draft"]["slot"] == "BREAKFAST"
+
+
+def test_send_message_ai_edit_add_item_appends_to_the_open_draft(seam, monkeypatch):
+    create_lunch_draft(seam)  # 200g rice
+    seam.foods["food-chicken"] = _chicken_food()
+    envelope = llm_envelope(
+        intent="ADD_ITEM",
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.9)],
+    )
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "throw in some grilled chicken too please", client_message_id="m2")
+
+    assert response["intent"] == "ADD_ITEM"
+    items = response["draft"]["items"]
+    assert len(items) == 2
+    assert any(i["foodName"] == "Grilled Chicken Breast" for i in items)
+
+
+def test_send_message_ai_edit_edit_item_updates_the_target(seam, monkeypatch):
+    create_lunch_draft(seam)  # 200g rice
+    envelope = llm_envelope(
+        intent="EDIT_ITEM",
+        target_ref="the rice",
+        items=[llm_item("rice", quantity=100, unit="g", confidence=0.9)],
+    )
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "actually I only had half of that rice", client_message_id="m2")
+
+    assert response["intent"] == "EDIT_ITEM"
+    assert response["draft"]["items"][0]["quantity"] == 100.0
+
+
+def test_send_message_ai_edit_remove_item_deletes_the_target(seam, monkeypatch):
+    create_lunch_draft(seam)  # 200g rice
+    envelope = llm_envelope(intent="REMOVE_ITEM", target_ref="the rice")
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "scratch that, I didn't actually eat the rice", client_message_id="m2")
+
+    assert response["intent"] == "REMOVE_ITEM"
+    assert response["draft"]["items"] == []
+
+
+def test_send_message_ai_edit_ambiguous_target_asks_for_clarification(seam, monkeypatch):
+    create_lunch_draft(seam)  # only "Cooked White Rice" on the draft
+    envelope = llm_envelope(intent="REMOVE_ITEM", target_ref="xyzzyplonk")
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "get rid of that thing please", client_message_id="m2")
+
+    assert response["needsClarification"]["reason"] == "ambiguous_target"
+    assert response["draft"]["items"][0]["grams"] == 200.0  # unchanged
+
+
+def test_ai_edit_falls_back_gracefully_on_call_failure(seam, monkeypatch):
+    create_lunch_draft(seam)
+    stub_call_small_model(monkeypatch, exc=LLMCallError("boom"))
+
+    response = send(seam, "this was actually breakfast, my bad", client_message_id="m2")
+
+    assert response["tier"] == "PARSER"
+    assert response["intent"] == "OTHER"
+
+
+def test_ai_edit_falls_back_gracefully_when_envelope_is_not_actionable(seam, monkeypatch):
+    create_lunch_draft(seam)
+    envelope = llm_envelope(intent="LOG_NEW", items=[])  # not actionable on an open draft
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "this was actually breakfast, my bad", client_message_id="m2")
+
+    assert response["intent"] == "OTHER"
+
+
+def test_ai_edit_call_is_quota_exempt(seam, monkeypatch):
+    create_lunch_draft(seam)
+    envelope = llm_envelope(intent="SET_SLOT", slot="BREAKFAST")
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    send(seam, "this was actually breakfast, my bad", client_message_id="m2")
+
+    assert "user-1" not in seam.quota_counters
+    edit_events = [e for e in seam.parse_events if e.intent == "SET_SLOT"]
+    assert len(edit_events) == 1
+    assert edit_events[0].countedToQuota is False
+
+
+def test_ai_edit_does_not_escalate_to_t3_even_on_low_confidence(seam, monkeypatch):
+    create_lunch_draft(seam)
+    seam.foods["food-chicken"] = _chicken_food()
+    envelope = llm_envelope(
+        intent="ADD_ITEM",
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.1)],
+    )
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+    large_calls = stub_call_large_model(monkeypatch, result=stub_llm_response(envelope))
+
+    send(seam, "throw in some grilled chicken too please", client_message_id="m2")
+
+    assert large_calls == []
+
+
+def test_draft_operations_are_recorded_for_every_mutation_type(seam):
+    created = create_lunch_draft(seam)  # CREATE
+    item_id = created["items"][0]["id"]
+    version = created["version"]
+
+    services.add_draft_item(
+        "user-1", created["id"], {"foodId": "food-rice", "quantity": 50.0, "unit": "g", "version": version}
+    )
+    version += 1
+
+    services.update_draft_item("user-1", created["id"], item_id, {"quantity": 100.0, "version": version})
+    version += 1
+
+    services.update_draft("user-1", created["id"], {"slot": "DINNER", "version": version})
+    version += 1
+
+    services.delete_draft_item("user-1", created["id"], item_id, version)
+
+    ops = [op.op for op in seam.draft_operations]
+    assert ops == ["CREATE", "ADD_ITEM", "EDIT_ITEM", "SET_SLOT", "REMOVE_ITEM"]
+    assert seam.draft_operations[0].version == 1
+    assert seam.draft_operations[3].payload == {"slot": "DINNER"}

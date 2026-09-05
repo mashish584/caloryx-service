@@ -198,6 +198,12 @@ def _create_draft_from_items(
         existing = repository.get_open_draft(user_id)
         raise OpenDraftExistsError(details={"draft": serialize_draft(existing)})
     _record_serving_observations(user_id, items_payload)
+    repository.record_draft_operation(
+        created.id,
+        "CREATE",
+        {"name": name, "slot": slot, "parseTier": parse_tier, "itemCount": len(items_payload)},
+        created.version,
+    )
     return created
 
 
@@ -235,9 +241,17 @@ def fetch_draft(user_id: str, draft_id: str) -> Dict[str, Any]:
 
 def update_draft(user_id: str, draft_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     _load_open_draft_for_mutation(user_id, draft_id, data["version"])
-    patch = {k: v for k, v in data.items() if k in ("name", "slot")}
-    patch["version"] = {"increment": 1}
+    fields = {k: v for k, v in data.items() if k in ("name", "slot")}
+    patch = dict(fields, version={"increment": 1})
     updated = repository.update_draft(draft_id, patch)
+    # No CONFIRM/DISCARD/EXPIRE op value (§12.2's literal DraftOperation
+    # sketch) - a version-only bump from elsewhere never reaches this
+    # function, so `fields` is never empty here in practice, but the guard
+    # keeps this honest if that ever changes.
+    if "slot" in fields:
+        repository.record_draft_operation(draft_id, "SET_SLOT", fields, updated.version)
+    if "name" in fields:
+        repository.record_draft_operation(draft_id, "RENAME", fields, updated.version)
     return serialize_draft(updated)
 
 
@@ -260,7 +274,9 @@ def _add_item_payload(user_id: str, draft_id: str, item_payload: Dict[str, Any])
     the item differently (exact `foodId` vs. a fuzzy-matched food name)."""
     repository.create_draft_item(draft_id, item_payload)
     _record_serving_observations(user_id, [item_payload])
-    return _recompute_totals(user_id, draft_id, bump_version=True)
+    updated = _recompute_totals(user_id, draft_id, bump_version=True)
+    repository.record_draft_operation(draft_id, "ADD_ITEM", item_payload, updated.version)
+    return updated
 
 
 def add_draft_item(user_id: str, draft_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -296,6 +312,7 @@ def update_draft_item(
     _record_serving_observations(user_id, [patch])
 
     updated = _recompute_totals(user_id, draft_id, bump_version=True)
+    repository.record_draft_operation(draft_id, "EDIT_ITEM", dict(patch, itemId=item_id), updated.version)
     logger.info("draft item updated user=%s draft=%s item=%s", user_id, draft_id, item_id)
     return serialize_draft(updated)
 
@@ -308,6 +325,7 @@ def delete_draft_item(user_id: str, draft_id: str, item_id: str, version: int) -
 
     repository.delete_draft_item(item_id)
     updated = _recompute_totals(user_id, draft_id, bump_version=True)
+    repository.record_draft_operation(draft_id, "REMOVE_ITEM", {"itemId": item_id}, updated.version)
     logger.info("draft item removed user=%s draft=%s item=%s", user_id, draft_id, item_id)
     return serialize_draft(updated)
 
@@ -656,6 +674,111 @@ def _apply_edit(user_id: str, draft: Any, edit: "chatparser.ParsedEdit") -> _Out
     return _Outcome(tier="PARSER", intent=edit.intent, assistant_text=assistant_text, draft=updated, draft_id=draft.id)
 
 
+def _apply_ai_edit(user_id: str, draft: Any, envelope: Dict[str, Any]) -> Optional[_Outcome]:
+    """The T2-envelope counterpart to `_apply_edit` (Chunk 5a, §7.5) - used
+    when an open-draft message misses both T1's edit grammar and T1's
+    new-item grammar. Returns `None` for anything not actionable here (a
+    LOG_NEW/OTHER-classified envelope, or a missing targetRef/slot/items) so
+    the caller falls back to `_NO_FOOD_REPLY` rather than guessing."""
+    intent = envelope["intent"]
+
+    if intent == "SET_SLOT":
+        if not envelope.get("slot"):
+            return None
+        updated = update_draft(user_id, draft.id, {"slot": envelope["slot"], "version": draft.version})
+        return _Outcome(
+            tier="LLM_SMALL",
+            intent="SET_SLOT",
+            assistant_text="Got it — logged as {}.".format(envelope["slot"].title()),
+            draft=updated,
+            draft_id=draft.id,
+        )
+
+    if intent == "ADD_ITEM":
+        if not envelope["items"]:
+            return None
+        _load_open_draft_for_mutation(user_id, draft.id, draft.version)
+        items_payload, _vectors, unconsumed = _resolve_envelope_items(envelope["items"], user_id)
+        if not items_payload:
+            return None
+        updated_row = None
+        for item_payload in items_payload:
+            updated_row = _add_item_payload(user_id, draft.id, item_payload)
+        all_resolved = all(ip["resolution"] == "RESOLVED" for ip in items_payload)
+        assistant_text = (
+            "Added it to your meal."
+            if all_resolved
+            else "I couldn't find that food — search for it or tap to edit."
+        )
+        return _Outcome(
+            tier="LLM_SMALL",
+            intent="ADD_ITEM",
+            assistant_text=assistant_text,
+            draft=serialize_draft(updated_row),
+            draft_id=draft.id,
+            unconsumed_text=unconsumed,
+        )
+
+    if intent not in ("EDIT_ITEM", "REMOVE_ITEM"):
+        # LOG_NEW/OTHER/etc. on an open-draft message - not actionable here;
+        # the ADD/NEW clarification dance stays a T1-only concept for now
+        # (Chunk 4a's original router-scope note).
+        return None
+
+    target_ref = envelope.get("targetRef")
+    if not target_ref:
+        return None
+
+    target_item, ambiguous = _resolve_target_ref(target_ref, draft.items)
+    if ambiguous:
+        candidates = sorted({i.food.name for i in draft.items if i.resolution == "RESOLVED" and i.food})
+        assistant_text = (
+            "Which one — {}?".format(" or ".join(candidates))
+            if candidates
+            else "I'm not sure which item you mean."
+        )
+        return _Outcome(
+            tier="LLM_SMALL",
+            intent=intent,
+            assistant_text=assistant_text,
+            draft=serialize_draft(draft),
+            draft_id=draft.id,
+            needs_clarification={"reason": "ambiguous_target", "candidates": candidates},
+        )
+
+    if intent == "REMOVE_ITEM":
+        updated = delete_draft_item(user_id, draft.id, target_item.id, draft.version)
+        return _Outcome(
+            tier="LLM_SMALL",
+            intent="REMOVE_ITEM",
+            assistant_text="Removed {}.".format(target_item.food.name),
+            draft=updated,
+            draft_id=draft.id,
+        )
+
+    # EDIT_ITEM - the new quantity/unit/state is carried on the envelope's
+    # own item entry (§7.3's schema has nowhere else to put it); that item's
+    # `food` field is ignored here, redundant with targetRef.
+    if not envelope["items"]:
+        return None
+    phrase = _llm_item_to_phrase(envelope["items"][0])
+    if phrase is None:
+        return None  # no usable quantity+unit to apply - fall back rather than guess
+    updated = update_draft_item(
+        user_id,
+        draft.id,
+        target_item.id,
+        {"quantity": phrase.quantity, "unit": phrase.unit, "version": draft.version},
+    )
+    return _Outcome(
+        tier="LLM_SMALL",
+        intent="EDIT_ITEM",
+        assistant_text="Updated {}.".format(target_item.food.name),
+        draft=updated,
+        draft_id=draft.id,
+    )
+
+
 def _apply_add_phrases(
     user_id: str, draft: Any, phrases: List["chatparser.ParsedItemPhrase"], unconsumed: List[str]
 ) -> _Outcome:
@@ -909,21 +1032,22 @@ def _llm_item_to_phrase(llm_item: Dict[str, Any]) -> Optional["chatparser.Parsed
     )
 
 
-def _process_t2_new_meal(
-    user_id: str, envelope: Dict[str, Any], t1_unconsumed: List[str], tier: str
-) -> _Outcome:
-    """A validated `LOG_NEW` envelope with >=1 item -> the same draft-creation
-    core the T1 path uses. An item with a stated quantity+unit resolves via
+def _resolve_envelope_items(
+    llm_items: List[Dict[str, Any]], user_id: str
+) -> Tuple[List[Dict[str, Any]], List[NutrientVector], List[str]]:
+    """Every item in a validated envelope -> resolved `MealDraftItem` payloads
+    plus their nutrient vectors, and the food names of anything that couldn't
+    be resolved at all. An item with a stated quantity+unit resolves via
     `_llm_item_to_phrase`; one without falls to the quantity-resolution
     ladder (`_resolve_llm_item_without_quantity`, §5.1.1a) before finally
-    being reported unconsumed. `tier` is whichever of LLM_SMALL/LLM_LARGE
-    actually produced `envelope` (Chunk 4c: a low-confidence T2 result may
-    have been overridden by a T3 call - see `_process_new_meal`)."""
+    being reported unconsumed. Shared by the `LOG_NEW` path
+    (`_process_t2_new_meal`) and the AI-edit `ADD_ITEM` path (`_apply_ai_edit`,
+    Chunk 5a) - identical resolution logic either way."""
     items_payload: List[Dict[str, Any]] = []
     vectors: List[NutrientVector] = []
-    unconsumed: List[str] = list(t1_unconsumed)
+    unconsumed: List[str] = []
 
-    for llm_item in envelope["items"]:
+    for llm_item in llm_items:
         phrase = _llm_item_to_phrase(llm_item)
         if phrase is not None:
             for item_payload, vector in _build_items_from_phrase(phrase):
@@ -938,6 +1062,19 @@ def _process_t2_new_meal(
         for item_payload, vector in ladder_items:
             items_payload.append(item_payload)
             vectors.append(vector)
+
+    return items_payload, vectors, unconsumed
+
+
+def _process_t2_new_meal(
+    user_id: str, envelope: Dict[str, Any], t1_unconsumed: List[str], tier: str
+) -> _Outcome:
+    """A validated `LOG_NEW` envelope with >=1 item -> the same draft-creation
+    core the T1 path uses. `tier` is whichever of LLM_SMALL/LLM_LARGE actually
+    produced `envelope` (Chunk 4c: a low-confidence T2 result may have been
+    overridden by a T3 call - see `_process_new_meal`)."""
+    items_payload, vectors, unresolved = _resolve_envelope_items(envelope["items"], user_id)
+    unconsumed = list(t1_unconsumed) + unresolved
 
     if not items_payload:
         return _Outcome(
@@ -1154,6 +1291,19 @@ def _process_message(
                     needs_clarification={"reason": "open_draft", "candidates": ["ADD", "NEW"]},
                 )
         else:
+            # T1's edit grammar and T1's new-item grammar both missed - one
+            # T2 call for a second opinion (Chunk 5a, §7.5). Edits are
+            # quota-exempt even through T2 (§5.1.4) and draft-relative, so
+            # never L2-cacheable (§7.4) - no quota gate, no cache lookup, no
+            # T3 escalation (see the Chunk 5a plan for why `_envelope_confidence`
+            # isn't a meaningful signal for intents that validly have an
+            # empty `items[]`, e.g. SET_SLOT/REMOVE_ITEM).
+            envelope = _call_llm(
+                user_id, normalized, tier="LLM_SMALL", call_fn=call_small_model, counted_to_quota=False
+            )
+            outcome = _apply_ai_edit(user_id, open_draft, envelope) if envelope is not None else None
+            if outcome is not None:
+                return outcome
             return _Outcome(
                 tier="PARSER",
                 intent="OTHER",
