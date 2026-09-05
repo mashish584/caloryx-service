@@ -7,8 +7,8 @@ comparison), this owns reads and writes. Mirrors meals/repository.py.
 from __future__ import annotations
 
 import statistics
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 from prisma import Json
 
@@ -238,4 +238,77 @@ def record_serving_observation(user_id: str, food_id: str, state: str, grams: fl
             "medianGrams": statistics.median(recent),
             "observations": len(recent),
         },
+    )
+
+
+# -- AI quota (Chunk 4c, §5.1.4, §12.8) --------------------------------------
+
+
+def get_quota_counter(user_id: str) -> Optional[Any]:
+    return get_client().aiquotacounter.find_unique(where={"userId": user_id})
+
+
+def try_consume_quota(user_id: str, limit: int, window: timedelta) -> Tuple[Any, bool]:
+    """Atomic check-and-consume (§12.8) with no Redis and no raw SQL: a
+    Postgres `UPDATE ... WHERE` locks the row it's about to touch even under
+    READ COMMITTED, so two concurrent conditional `update_many` calls
+    serialize on the same row rather than both reading a stale count. The
+    two conditions below are mutually exclusive and jointly exhaustive for a
+    given row (its `windowStart` is either still within `window` or not), so
+    at most one of them can ever match - `create` only fires for a user's
+    very first call ever, when no row exists for either to match at all.
+
+    Returns `(counter, consumed)` - `consumed` is whether *this* call's
+    write happened. `False` means an active window already at `limit` -
+    genuinely exhausted, nothing left to write."""
+    client = get_client()
+    now = _now()
+    floor = now - window
+
+    bumped = client.aiquotacounter.update_many(
+        where={"userId": user_id, "windowStart": {"gt": floor}, "count": {"lt": limit}},
+        data={"count": {"increment": 1}},
+    )
+    consumed = bumped.count == 1
+
+    if not consumed:
+        reset = client.aiquotacounter.update_many(
+            where={"userId": user_id, "windowStart": {"lte": floor}},
+            data={"windowStart": now, "count": 1},
+        )
+        consumed = reset.count == 1
+
+    counter = client.aiquotacounter.find_unique(where={"userId": user_id})
+    if counter is None:
+        counter = client.aiquotacounter.create(
+            data={"userId": user_id, "windowStart": now, "count": 1}
+        )
+        consumed = True
+
+    return counter, consumed
+
+
+# -- L2 global parse cache (Chunk 4c, §7.4) ----------------------------------
+
+
+def get_global_cache(normalized_hash: str) -> Optional[Any]:
+    return get_client().globalparsecache.find_unique(where={"normalizedHash": normalized_hash})
+
+
+def save_global_cache(normalized_hash: str, snapshot: Dict[str, Any]) -> Any:
+    """Upsert - a repeat write (a different user's identical phrasing
+    resolving slightly differently, e.g. after a catalog edit) just refreshes
+    the snapshot rather than erroring on the unique constraint."""
+    return get_client().globalparsecache.upsert(
+        where={"normalizedHash": normalized_hash},
+        data={
+            "create": {"normalizedHash": normalized_hash, "snapshot": Json(snapshot)},
+            "update": {"snapshot": Json(snapshot)},
+        },
+    )
+
+
+def bump_global_cache_hit(normalized_hash: str) -> None:
+    get_client().globalparsecache.update(
+        where={"normalizedHash": normalized_hash}, data={"hitCount": {"increment": 1}}
     )

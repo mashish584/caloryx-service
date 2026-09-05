@@ -68,12 +68,14 @@ def reset_cache() -> None:
         _client = None
 
 
-def call_small_model(system_prompt: str, user_content: str) -> LLMResponse:
+def _call_model(model: str, system_prompt: str, user_content: str) -> LLMResponse:
     """One call, one message, the whole intent envelope (§7.3: "never one call
     per food, and never a separate call for naming or slot"). Raises
     `LLMCallError`/`LLMConfigurationError` - it never returns a partial or
     best-effort result, so a caller either has a fully valid envelope or
-    knows unambiguously that it doesn't."""
+    knows unambiguously that it doesn't. Shared by `call_small_model`
+    (T2) and `call_large_model` (T3, Chunk 4c) - only the model name differs,
+    the contract (schema, error handling, telemetry fields) is identical."""
     client = _get_client()
     from openai import OpenAIError  # deferred, same reasoning as _get_client's import
 
@@ -81,7 +83,7 @@ def call_small_model(system_prompt: str, user_content: str) -> LLMResponse:
 
     try:
         response = client.chat.completions.create(
-            model=settings.OPENAI_SMALL_MODEL,
+            model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
@@ -97,7 +99,7 @@ def call_small_model(system_prompt: str, user_content: str) -> LLMResponse:
             },
         )
     except OpenAIError as exc:
-        logger.warning("llm call failed model=%s: %s", settings.OPENAI_SMALL_MODEL, exc)
+        logger.warning("llm call failed model=%s: %s", model, exc)
         raise LLMCallError(str(exc)) from exc
 
     latency_ms = int((time.monotonic() - started) * 1000)
@@ -119,3 +121,14 @@ def call_small_model(system_prompt: str, user_content: str) -> LLMResponse:
         latency_ms=latency_ms,
         model=response.model,
     )
+
+
+def call_small_model(system_prompt: str, user_content: str) -> LLMResponse:
+    """T2 (§7.1) - handles the overwhelming majority of escalations."""
+    return _call_model(settings.OPENAI_SMALL_MODEL, system_prompt, user_content)
+
+
+def call_large_model(system_prompt: str, user_content: str) -> LLMResponse:
+    """T3 (§7.1, Chunk 4c) - a second opinion when T2 succeeds but its own
+    confidence is low. Same contract as `call_small_model`, a bigger model."""
+    return _call_model(settings.OPENAI_LARGE_MODEL, system_prompt, user_content)

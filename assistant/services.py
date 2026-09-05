@@ -27,7 +27,7 @@ from common.exceptions import (
     UnresolvableQuantityError,
 )
 from chatparser.units import UNIT_WORDS
-from llm import LLMCallError, LLMConfigurationError, call_small_model
+from llm import LLMCallError, LLMConfigurationError, call_large_model, call_small_model
 from llm.prompts import SYSTEM_PROMPT
 from meals import repository as meals_repository
 from meals import services as meals_services
@@ -589,6 +589,7 @@ class _Outcome:
     unconsumed_text: List[str] = field(default_factory=list)
     needs_clarification: Optional[Dict[str, Any]] = None
     parse_snapshot: Optional[Dict[str, Any]] = None
+    quota_exceeded: bool = False
 
 
 def _apply_edit(user_id: str, draft: Any, edit: "chatparser.ParsedEdit") -> _Outcome:
@@ -673,51 +674,81 @@ def _apply_add_phrases(
     )
 
 
-def _cost_micros(prompt_tokens: int, output_tokens: int) -> int:
-    input_cost = prompt_tokens * settings.OPENAI_SMALL_MODEL_INPUT_COST_PER_1M_MICROS / 1_000_000
-    output_cost = output_tokens * settings.OPENAI_SMALL_MODEL_OUTPUT_COST_PER_1M_MICROS / 1_000_000
+_COST_SETTINGS_BY_TIER = {
+    "LLM_SMALL": (
+        "OPENAI_SMALL_MODEL_INPUT_COST_PER_1M_MICROS",
+        "OPENAI_SMALL_MODEL_OUTPUT_COST_PER_1M_MICROS",
+    ),
+    "LLM_LARGE": (
+        "OPENAI_LARGE_MODEL_INPUT_COST_PER_1M_MICROS",
+        "OPENAI_LARGE_MODEL_OUTPUT_COST_PER_1M_MICROS",
+    ),
+}
+
+
+def _cost_micros(tier: str, prompt_tokens: int, output_tokens: int) -> int:
+    input_setting, output_setting = _COST_SETTINGS_BY_TIER[tier]
+    input_cost = prompt_tokens * getattr(settings, input_setting) / 1_000_000
+    output_cost = output_tokens * getattr(settings, output_setting) / 1_000_000
     return int(round(input_cost + output_cost))
 
 
-def _call_t2(user_id: str, content: str) -> Optional[Dict[str, Any]]:
-    """Escalates one message to the small model (§7.1's exception layer,
-    triggered only when T1 finds zero phrases - see `_process_new_meal`),
-    validates the response through `IntentEnvelopeSerializer` (§12.4: any
-    failure -> treat as a parse miss, never a partial draft mutation), and
-    writes a `ParseEvent` for the attempt regardless of outcome (§9, I9).
-    Returns the validated envelope dict, or `None` on any failure - a
-    provider outage or a malformed response both degrade to "no food
-    identified," never a 500 (§11)."""
+def _envelope_confidence(envelope: Dict[str, Any]) -> float:
+    items = envelope.get("items") or []
+    return sum(item["confidence"] for item in items) / len(items) if items else 0.0
+
+
+def _call_llm(
+    user_id: str,
+    content: str,
+    tier: str,
+    call_fn: Any,
+    counted_to_quota: bool,
+) -> Optional[Dict[str, Any]]:
+    """Escalates one message to a model (§7.1's exception layer - T2,
+    triggered when T1 finds zero phrases, or T3, triggered by a
+    low-confidence T2 result; see `_process_new_meal`), validates the
+    response through `IntentEnvelopeSerializer` (§12.4: any failure -> treat
+    as a parse miss, never a partial draft mutation), and writes a
+    `ParseEvent` for the attempt regardless of outcome (§9, I9) -
+    `counted_to_quota` records whether *this* call is the one that consumed
+    the message's single quota unit (§5.1.4: quota is per-message, not
+    per-model-call, so a T3 follow-up on the same message is always
+    `False`). Returns the validated envelope dict, or `None` on any failure -
+    a provider outage or a malformed response both degrade gracefully,
+    never a 500 (§11)."""
     input_hash = chatparser.hash_normalized(content)
     started = time.monotonic()
 
     try:
-        response = call_small_model(SYSTEM_PROMPT, content)
+        response = call_fn(SYSTEM_PROMPT, content)
     except LLMConfigurationError as exc:
         # A deploy-time misconfiguration (no API key), not a per-call
-        # failure - still degrades to "no food identified" rather than a
-        # 500 (§11), but at error level since it needs ops attention rather
-        # than being an expected, occasional provider hiccup.
-        logger.error("t2 call skipped, provider not configured user=%s: %s", user_id, exc)
+        # failure - still degrades gracefully rather than a 500 (§11), but
+        # at error level since it needs ops attention rather than being an
+        # expected, occasional provider hiccup.
+        logger.error("llm call skipped, provider not configured user=%s tier=%s: %s", user_id, tier, exc)
         repository.create_parse_event(
             user_id,
             {
                 "inputHash": input_hash,
-                "tier": "LLM_SMALL",
+                "tier": tier,
                 "intent": "OTHER",
+                "countedToQuota": counted_to_quota,
                 "latencyMs": int((time.monotonic() - started) * 1000),
                 "confidence": 0.0,
             },
         )
         return None
     except LLMCallError as exc:
-        logger.warning("t2 call failed user=%s: %s", user_id, exc)
+        logger.warning("llm call failed user=%s tier=%s: %s", user_id, tier, exc)
         repository.create_parse_event(
             user_id,
             {
                 "inputHash": input_hash,
-                "tier": "LLM_SMALL",
+                "tier": tier,
                 "intent": "OTHER",
+                "countedToQuota": counted_to_quota,
                 "latencyMs": int((time.monotonic() - started) * 1000),
                 "confidence": 0.0,
             },
@@ -727,18 +758,19 @@ def _call_t2(user_id: str, content: str) -> Optional[Dict[str, Any]]:
     serializer = IntentEnvelopeSerializer(data=response.raw_envelope)
     if not serializer.is_valid():
         logger.warning(
-            "t2 envelope failed validation user=%s errors=%s", user_id, serializer.errors
+            "llm envelope failed validation user=%s tier=%s errors=%s", user_id, tier, serializer.errors
         )
         repository.create_parse_event(
             user_id,
             {
                 "inputHash": input_hash,
-                "tier": "LLM_SMALL",
+                "tier": tier,
                 "intent": "OTHER",
+                "countedToQuota": counted_to_quota,
                 "model": response.model,
                 "promptTokens": response.prompt_tokens,
                 "outputTokens": response.output_tokens,
-                "costMicros": _cost_micros(response.prompt_tokens, response.output_tokens),
+                "costMicros": _cost_micros(tier, response.prompt_tokens, response.output_tokens),
                 "latencyMs": response.latency_ms,
                 "confidence": 0.0,
             },
@@ -746,18 +778,18 @@ def _call_t2(user_id: str, content: str) -> Optional[Dict[str, Any]]:
         return None
 
     envelope = serializer.validated_data
-    items = envelope.get("items") or []
-    confidence = sum(item["confidence"] for item in items) / len(items) if items else 0.0
+    confidence = _envelope_confidence(envelope)
     repository.create_parse_event(
         user_id,
         {
             "inputHash": input_hash,
-            "tier": "LLM_SMALL",
+            "tier": tier,
             "intent": envelope["intent"],
+            "countedToQuota": counted_to_quota,
             "model": response.model,
             "promptTokens": response.prompt_tokens,
             "outputTokens": response.output_tokens,
-            "costMicros": _cost_micros(response.prompt_tokens, response.output_tokens),
+            "costMicros": _cost_micros(tier, response.prompt_tokens, response.output_tokens),
             "latencyMs": response.latency_ms,
             "confidence": confidence,
         },
@@ -878,13 +910,15 @@ def _llm_item_to_phrase(llm_item: Dict[str, Any]) -> Optional["chatparser.Parsed
 
 
 def _process_t2_new_meal(
-    user_id: str, envelope: Dict[str, Any], t1_unconsumed: List[str]
+    user_id: str, envelope: Dict[str, Any], t1_unconsumed: List[str], tier: str
 ) -> _Outcome:
     """A validated `LOG_NEW` envelope with >=1 item -> the same draft-creation
     core the T1 path uses. An item with a stated quantity+unit resolves via
     `_llm_item_to_phrase`; one without falls to the quantity-resolution
     ladder (`_resolve_llm_item_without_quantity`, §5.1.1a) before finally
-    being reported unconsumed."""
+    being reported unconsumed. `tier` is whichever of LLM_SMALL/LLM_LARGE
+    actually produced `envelope` (Chunk 4c: a low-confidence T2 result may
+    have been overridden by a T3 call - see `_process_new_meal`)."""
     items_payload: List[Dict[str, Any]] = []
     vectors: List[NutrientVector] = []
     unconsumed: List[str] = list(t1_unconsumed)
@@ -907,7 +941,7 @@ def _process_t2_new_meal(
 
     if not items_payload:
         return _Outcome(
-            tier="LLM_SMALL", intent="OTHER", assistant_text=_NO_FOOD_REPLY, unconsumed_text=unconsumed
+            tier=tier, intent="OTHER", assistant_text=_NO_FOOD_REPLY, unconsumed_text=unconsumed
         )
 
     resolved_count = sum(1 for ip in items_payload if ip["resolution"] == "RESOLVED")
@@ -917,52 +951,133 @@ def _process_t2_new_meal(
         items_payload, vectors, envelope["items"][0]["food"], slot
     )
 
-    created = _create_draft_from_items(user_id, name, slot, "LLM_SMALL", confidence, items_payload, vectors)
+    created = _create_draft_from_items(user_id, name, slot, tier, confidence, items_payload, vectors)
+
+    parse_snapshot = None
+    if resolved_count == len(items_payload):
+        # Only a fully-resolved LOG_NEW is worth caching (§7.4) - mirrors the
+        # T1 path exactly, and is what makes this result L1/L2-cacheable
+        # (send_message writes whatever parse_snapshot it's given; Chunk 4a
+        # never populated one from this path, so a T2-resolved meal never
+        # became replayable from cache before this).
+        parse_snapshot = {
+            "name": name,
+            "slot": slot,
+            "items": [
+                {"foodId": ip["foodId"], "quantity": ip["quantity"], "unit": ip["unit"], "state": ip["state"]}
+                for ip in items_payload
+            ],
+        }
 
     return _Outcome(
-        tier="LLM_SMALL",
+        tier=tier,
         intent="LOG_NEW",
         assistant_text="Got it — let me break that down.",
         draft=serialize_draft(created),
         draft_id=created.id,
         unconsumed_text=unconsumed,
+        parse_snapshot=parse_snapshot,
+    )
+
+
+_QUOTA_EXCEEDED_REPLY = 'Quantified meals still work — try "200g rice, 100g chicken".'
+
+
+def _replay_snapshot(
+    user_id: str, snapshot: Dict[str, Any], tier: str, assistant_text: str
+) -> Optional[_Outcome]:
+    """A cached `{name, slot, items}` snapshot (T0 per-user, or L2 global -
+    Chunk 4c - both share this shape, §7.4) -> a freshly-created draft with
+    identical items, no parser or model call involved. Returns `None` when
+    every cached `foodId` has since vanished from the catalog - the caller
+    falls through to a fresh parse rather than creating an empty draft."""
+    items_payload: List[Dict[str, Any]] = []
+    vectors: List[NutrientVector] = []
+    for raw in snapshot["items"]:
+        food = meals_repository.get_food(raw["foodId"])
+        if food is None:
+            continue  # catalog changed since the cache was written
+        item_payload, vector = _resolve_draft_item(food, raw["quantity"], raw["unit"], raw.get("state"))
+        items_payload.append(item_payload)
+        vectors.append(vector)
+    if not items_payload:
+        return None
+
+    created = _create_draft_from_items(
+        user_id, snapshot["name"], snapshot["slot"], tier, 1.0, items_payload, vectors
+    )
+    return _Outcome(
+        tier=tier,
+        intent="LOG_NEW",
+        assistant_text=assistant_text,
+        draft=serialize_draft(created),
+        draft_id=created.id,
     )
 
 
 def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _Outcome:
     cached = repository.find_cached_message(user_id, normalized_hash)
     if cached is not None:
-        snapshot = cached.parseSnapshot
-        items_payload: List[Dict[str, Any]] = []
-        vectors: List[NutrientVector] = []
-        for raw in snapshot["items"]:
-            food = meals_repository.get_food(raw["foodId"])
-            if food is None:
-                continue  # catalog changed since the cache was written
-            item_payload, vector = _resolve_draft_item(food, raw["quantity"], raw["unit"], raw.get("state"))
-            items_payload.append(item_payload)
-            vectors.append(vector)
-        if items_payload:
-            created = _create_draft_from_items(
-                user_id, snapshot["name"], snapshot["slot"], "CACHE", 1.0, items_payload, vectors
-            )
-            return _Outcome(
-                tier="CACHE",
-                intent="LOG_NEW",
-                assistant_text="Got it — logged the same as last time.",
-                draft=serialize_draft(created),
-                draft_id=created.id,
-            )
+        outcome = _replay_snapshot(
+            user_id, cached.parseSnapshot, tier="CACHE", assistant_text="Got it — logged the same as last time."
+        )
+        if outcome is not None:
+            return outcome
         # Cached items no longer resolve against the catalog - fall through to T1.
 
     phrases, unconsumed = chatparser.parse_new_item_phrases(normalized)
     if not phrases:
-        # T1's grammar found nothing at all - the one case 4a escalates to
-        # T2 (§7.1's exception layer; a partial T1 match stays unescalated,
-        # see the Chunk 4a plan's router-scope note).
-        envelope = _call_t2(user_id, normalized)
+        # T1's grammar found nothing at all - from here, in order: L2 global
+        # cache (a shared phrasing another user already paid to resolve),
+        # then the quota gate, then T2, then T3 on a low-confidence T2
+        # result (§7.1's exception layer; a partial T1 match stays
+        # unescalated at every one of these steps - see the Chunk 4a plan's
+        # router-scope note).
+        global_cache = repository.get_global_cache(normalized_hash)
+        if global_cache is not None:
+            outcome = _replay_snapshot(
+                user_id,
+                global_cache.snapshot,
+                tier="CACHE",
+                assistant_text="Got it — logged the same as last time.",
+            )
+            if outcome is not None:
+                repository.bump_global_cache_hit(normalized_hash)
+                return outcome
+            # Cached items no longer resolve against the catalog - fall through.
+
+        window = timedelta(hours=settings.AI_QUOTA_WINDOW_HOURS)
+        _counter, consumed = repository.try_consume_quota(user_id, settings.AI_QUOTA_LIMIT, window)
+        if not consumed:
+            logger.info("assistant_quota_blocked user=%s", user_id)
+            return _Outcome(
+                tier="PARSER",
+                intent="OTHER",
+                assistant_text=_QUOTA_EXCEEDED_REPLY,
+                unconsumed_text=unconsumed,
+                quota_exceeded=True,
+            )
+
+        envelope = _call_llm(
+            user_id, normalized, tier="LLM_SMALL", call_fn=call_small_model, counted_to_quota=True
+        )
+        tier_used = "LLM_SMALL"
+        if envelope is not None and _envelope_confidence(envelope) < settings.T3_ESCALATION_CONFIDENCE_THRESHOLD:
+            # T3 is a second opinion on a low-confidence T2 *success*, never
+            # a rescue for a T2 *failure* (§7.1) - a failure already degrades
+            # gracefully without compounding cost on what might be a
+            # provider-wide outage.
+            t3_envelope = _call_llm(
+                user_id, normalized, tier="LLM_LARGE", call_fn=call_large_model, counted_to_quota=False
+            )
+            if t3_envelope is not None:
+                envelope, tier_used = t3_envelope, "LLM_LARGE"
+
         if envelope is not None and envelope["intent"] == "LOG_NEW" and envelope["items"]:
-            return _process_t2_new_meal(user_id, envelope, unconsumed)
+            outcome = _process_t2_new_meal(user_id, envelope, unconsumed, tier=tier_used)
+            if outcome.intent == "LOG_NEW" and outcome.parse_snapshot is not None:
+                repository.save_global_cache(normalized_hash, outcome.parse_snapshot)
+            return outcome
         return _Outcome(tier="PARSER", intent="OTHER", assistant_text=_NO_FOOD_REPLY, unconsumed_text=unconsumed)
 
     items_payload = []
@@ -1101,6 +1216,7 @@ def send_message(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         "draft": outcome.draft,
         "unconsumedText": outcome.unconsumed_text,
         "needsClarification": outcome.needs_clarification,
+        "quotaExceeded": outcome.quota_exceeded,
     }
     repository.save_idempotency_record(
         client_message_id,
@@ -1111,3 +1227,26 @@ def send_message(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         _now() + timedelta(hours=IDEMPOTENCY_TTL_HOURS),
     )
     return response
+
+
+# -- AI quota (Chunk 4c, §5.1.4, §12.8) --------------------------------------
+
+
+def fetch_quota_status(user_id: str) -> Dict[str, Any]:
+    """GET /quota (§10, §5.1.4's pill) - read-only, never consumes. `resetsAt`
+    is `None` when the user has no active window (never used an AI parse, or
+    their last one has already expired)."""
+    counter = repository.get_quota_counter(user_id)
+    limit = settings.AI_QUOTA_LIMIT
+    window = timedelta(hours=settings.AI_QUOTA_WINDOW_HOURS)
+
+    if counter is None or counter.windowStart <= _now() - window:
+        return {"used": 0, "limit": limit, "remaining": limit, "resetsAt": None}
+
+    used = counter.count
+    return {
+        "used": used,
+        "limit": limit,
+        "remaining": max(0, limit - used),
+        "resetsAt": counter.windowStart + window,
+    }

@@ -169,14 +169,15 @@ CLERK_JWKS_CACHE_SECONDS = int(env("CLERK_JWKS_CACHE_SECONDS", "600"))
 
 # --- OpenAI (T2/T3, AI Meal Assistant PRD §7.3) ---------------------------
 # The small model handles the overwhelming majority of escalations (§7.1);
-# T3 (a larger model for low-confidence T2 results) is Chunk 4b.
+# T3 (a larger model for low-confidence T2 results) is Chunk 4c.
 OPENAI_API_KEY = env("OPENAI_API_KEY")
 OPENAI_SMALL_MODEL = env("OPENAI_SMALL_MODEL", "gpt-4o-mini")
+OPENAI_LARGE_MODEL = env("OPENAI_LARGE_MODEL", "gpt-4o")
 # ~300 per §7.3 - the envelope is a small structured object, not prose.
 OPENAI_MAX_TOKENS = int(env("OPENAI_MAX_TOKENS", "300"))
 OPENAI_TIMEOUT_SECONDS = float(env("OPENAI_TIMEOUT_SECONDS", "10"))
-# Approximate gpt-4o-mini list pricing in micros of USD per 1M tokens - verify
-# against OpenAI's current pricing page before relying on this for real
+# Approximate list pricing in micros of USD per 1M tokens - verify against
+# OpenAI's current pricing page before relying on this for real
 # billing/alerting; it only feeds ParseEvent.costMicros for now, not a charge.
 OPENAI_SMALL_MODEL_INPUT_COST_PER_1M_MICROS = int(
     env("OPENAI_SMALL_MODEL_INPUT_COST_PER_1M_MICROS", "150000")
@@ -184,6 +185,23 @@ OPENAI_SMALL_MODEL_INPUT_COST_PER_1M_MICROS = int(
 OPENAI_SMALL_MODEL_OUTPUT_COST_PER_1M_MICROS = int(
     env("OPENAI_SMALL_MODEL_OUTPUT_COST_PER_1M_MICROS", "600000")
 )
+OPENAI_LARGE_MODEL_INPUT_COST_PER_1M_MICROS = int(
+    env("OPENAI_LARGE_MODEL_INPUT_COST_PER_1M_MICROS", "2500000")
+)
+OPENAI_LARGE_MODEL_OUTPUT_COST_PER_1M_MICROS = int(
+    env("OPENAI_LARGE_MODEL_OUTPUT_COST_PER_1M_MICROS", "10000000")
+)
+
+# --- AI quota & T3 escalation (§5.1.4, §7.1, §12.8, Chunk 4c) --------------
+# 20 LOG_NEW AI parses per rolling 24h for free tier (§5.1.4) - a semi-rolling
+# window (see assistant.repository.try_consume_quota), not a true sliding
+# log. No premium/subscription concept exists in this codebase yet, so this
+# single limit applies to every user until one does.
+AI_QUOTA_LIMIT = int(env("AI_QUOTA_LIMIT", "20"))
+AI_QUOTA_WINDOW_HOURS = int(env("AI_QUOTA_WINDOW_HOURS", "24"))
+# One simple, honestly-scoped threshold (no shadow mode, no corrections data
+# to calibrate against yet - same reasoning as the T1->T2 router in Chunk 4a).
+T3_ESCALATION_CONFIDENCE_THRESHOLD = float(env("T3_ESCALATION_CONFIDENCE_THRESHOLD", "0.5"))
 
 # --- Guest sessions -------------------------------------------------------
 # Guest mode is not a Clerk concept, so we mint our own short-lived tokens.

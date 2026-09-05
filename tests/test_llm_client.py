@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 from django.test import override_settings
 
-from llm import LLMCallError, LLMConfigurationError, call_small_model
+from llm import LLMCallError, LLMConfigurationError, call_large_model, call_small_model
 from llm.client import reset_cache
 
 
@@ -152,3 +152,19 @@ def test_call_small_model_raises_llmcallerror_on_non_json_content(monkeypatch):
 def test_missing_api_key_raises_llmconfigurationerror():
     with pytest.raises(LLMConfigurationError):
         call_small_model("sys", "some content")
+
+
+@override_settings(OPENAI_API_KEY="sk-test", OPENAI_LARGE_MODEL="gpt-4o")
+def test_call_large_model_sends_the_large_model_name(monkeypatch):
+    import openai
+
+    calls = []
+    monkeypatch.setattr(
+        openai, "OpenAI", lambda **kw: _FakeOpenAI(calls, response=_fake_response(_envelope_json()))
+    )
+
+    result = call_large_model("system prompt text", "some content")
+
+    assert len(calls) == 1
+    assert calls[0]["model"] == "gpt-4o"
+    assert result.raw_envelope["intent"] == "LOG_NEW"

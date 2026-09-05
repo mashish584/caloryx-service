@@ -5,7 +5,7 @@ monkeypatched the same way BearerAuthentication's `authx.repository` is.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -114,6 +114,7 @@ PROTECTED = [
     ("delete", "/api/v1/assistant/drafts/draft-1/items/item-1"),
     ("post", "/api/v1/assistant/drafts/draft-1/confirm"),
     ("post", "/api/v1/assistant/messages"),
+    ("get", "/api/v1/assistant/quota"),
 ]
 
 
@@ -140,6 +141,7 @@ def test_urls_resolve():
         == "/api/v1/assistant/drafts/draft-1/confirm"
     )
     assert reverse("assistant-messages") == "/api/v1/assistant/messages"
+    assert reverse("assistant-quota") == "/api/v1/assistant/quota"
 
 
 def test_creating_a_draft_returns_the_computed_totals(client, guest, monkeypatch):
@@ -359,3 +361,64 @@ def test_sending_a_new_meal_message_while_a_draft_is_open_asks_for_clarification
     body = response.json()
     assert body["needsClarification"] == {"reason": "open_draft", "candidates": ["ADD", "NEW"]}
     assert body["draft"]["id"] == existing_draft.id
+
+
+# -- AI quota (Chunk 4c, §5.1.4) ----------------------------------------------
+
+
+def test_get_quota_returns_zero_used_for_a_fresh_user(client, guest, monkeypatch):
+    monkeypatch.setattr(assistant_repository, "get_quota_counter", lambda user_id: None)
+
+    response = client.get("/api/v1/assistant/quota", HTTP_AUTHORIZATION=guest)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {"used": 0, "limit": 20, "remaining": 20, "resetsAt": None}
+
+
+def test_get_quota_reflects_an_active_window(client, guest, monkeypatch):
+    window_start = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0)
+    counter = SimpleNamespace(userId="user-1", windowStart=window_start, count=5)
+    monkeypatch.setattr(assistant_repository, "get_quota_counter", lambda user_id: counter)
+
+    response = client.get("/api/v1/assistant/quota", HTTP_AUTHORIZATION=guest)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["used"] == 5
+    assert body["remaining"] == 15
+    assert body["resetsAt"] == (window_start + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_sending_a_message_surfaces_quota_exceeded_without_calling_the_model(
+    client, guest, monkeypatch
+):
+    monkeypatch.setattr(assistant_repository, "get_open_draft", lambda user_id: None)
+    monkeypatch.setattr(assistant_repository, "get_idempotency_record", lambda key: None)
+    monkeypatch.setattr(assistant_repository, "save_idempotency_record", lambda *a, **kw: None)
+    monkeypatch.setattr(assistant_repository, "find_cached_message", lambda user_id, h: None)
+    monkeypatch.setattr(assistant_repository, "get_global_cache", lambda h: None)
+    monkeypatch.setattr(
+        assistant_repository, "try_consume_quota", lambda user_id, limit, window: (None, False)
+    )
+    monkeypatch.setattr(
+        assistant_repository, "get_or_create_today_session", lambda user_id: SimpleNamespace(id="session-1")
+    )
+    monkeypatch.setattr(
+        assistant_repository,
+        "create_chat_message",
+        lambda session_id, user_id, data: SimpleNamespace(id="msg-1", **data),
+    )
+
+    response = client.post(
+        "/api/v1/assistant/messages",
+        data={"clientMessageId": "m1", "content": "grilled chicken salad with a tahini dressing"},
+        content_type="application/json",
+        HTTP_AUTHORIZATION=guest,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["quotaExceeded"] is True
+    assert body["draft"] is None
+    assert "still work" in body["assistantText"]

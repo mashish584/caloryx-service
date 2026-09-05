@@ -81,6 +81,7 @@ model User {
   chatMessages ChatMessage[]
   parseEvents  ParseEvent[]
   servingPreferences UserServingPreference[]
+  aiQuotaCounter     AiQuotaCounter?
 
   @@index([isGuest, createdAt])
 }
@@ -750,9 +751,10 @@ model ParseEvent {
   inputHash      String
   tier           ParseTier
   intent         ChatIntent
-  // False for every row through Chunk 4b - there is no quota to count against
-  // yet (Chunk 4c). Not a bug: a schema-accurate placeholder, same pattern as
-  // Chunk 2a's `ParseTier.MANUAL`.
+  // True only for the T2 (or T2->T3, once per message - see AiQuotaCounter)
+  // call that actually consumed a unit of AI quota (Chunk 4c); false for
+  // edits, non-food messages, cache hits, and a T3 call that piggybacks on
+  // a message's already-consumed quota.
   countedToQuota Boolean    @default(false)
   model          String?
   promptTokens   Int?
@@ -798,4 +800,37 @@ model UserServingPreference {
   // observations is not implemented (it reintroduces the raw/cooked
   // conflation §16.6 flagged as a bug).
   @@unique([userId, foodId, state])
+}
+
+/// AI-parse quota (§5.1.4, §12.8) - a semi-rolling 24h window, reset on first
+/// use after expiry rather than a true sliding log of individual events.
+/// Deliberate simplification, same posture as `MealDraft`'s app-level
+/// one-open-draft check: no Redis in this stack, so the "locked-row counter"
+/// the PRD offers as the alternative is a conditional `UPDATE ... WHERE` -
+/// Postgres locks the row it's about to modify even under READ COMMITTED, so
+/// two concurrent requests serialize on it without raw SQL or a `FOR UPDATE`
+/// select (see assistant.repository.try_consume_quota).
+model AiQuotaCounter {
+  id          String   @id @default(cuid())
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId      String   @unique
+  windowStart DateTime
+  count       Int      @default(0)
+  updatedAt   DateTime @updatedAt
+}
+
+/// L2 cache (§7.4) - normalized-hash -> resolved `LOG_NEW` parse, shared
+/// across every user so a common phrasing only ever needs one paid model
+/// call. No `userId`: global and PII-free by construction (the key is a hash
+/// of normalized food text, never the raw message or anything user-specific).
+/// `snapshot` is the identical shape `ChatMessage.parseSnapshot` already
+/// uses. Catalog-version invalidation (§7.4, §12.7) is a documented gap here,
+/// same as `CompositeFood.catalogVersion`'s forward-declared-but-unused field.
+model GlobalParseCache {
+  id             String   @id @default(cuid())
+  normalizedHash String   @unique
+  snapshot       Json
+  hitCount       Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 }

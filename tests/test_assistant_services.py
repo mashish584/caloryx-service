@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from django.test import override_settings
 
 from assistant import repository, services
 from chatparser import hash_normalized, normalize_text
@@ -163,6 +164,9 @@ def seam(monkeypatch):
         parse_events=[],
         serving_preferences={},
         record_serving_observation_calls=[],
+        quota_counters={},
+        global_cache={},
+        global_cache_hit_calls=[],
     )
 
     # -- assistant.repository ------------------------------------------------
@@ -346,6 +350,49 @@ def seam(monkeypatch):
         return pref
 
     monkeypatch.setattr(repository, "record_serving_observation", record_serving_observation)
+
+    # -- assistant.repository: AI quota (Chunk 4c) ---------------------------
+
+    def get_quota_counter(user_id):
+        return state.quota_counters.get(user_id)
+
+    monkeypatch.setattr(repository, "get_quota_counter", get_quota_counter)
+
+    def try_consume_quota(user_id, limit, window):
+        now = datetime.now(timezone.utc)
+        counter = state.quota_counters.get(user_id)
+        if counter is None or counter.windowStart <= now - window:
+            counter = SimpleNamespace(userId=user_id, windowStart=now, count=1)
+            state.quota_counters[user_id] = counter
+            return counter, True
+        if counter.count >= limit:
+            return counter, False
+        counter.count += 1
+        return counter, True
+
+    monkeypatch.setattr(repository, "try_consume_quota", try_consume_quota)
+
+    # -- assistant.repository: L2 global parse cache (Chunk 4c) --------------
+
+    def get_global_cache(normalized_hash):
+        return state.global_cache.get(normalized_hash)
+
+    monkeypatch.setattr(repository, "get_global_cache", get_global_cache)
+
+    def save_global_cache(normalized_hash, snapshot):
+        entry = SimpleNamespace(normalizedHash=normalized_hash, snapshot=snapshot, hitCount=0)
+        state.global_cache[normalized_hash] = entry
+        return entry
+
+    monkeypatch.setattr(repository, "save_global_cache", save_global_cache)
+
+    def bump_global_cache_hit(normalized_hash):
+        state.global_cache_hit_calls.append(normalized_hash)
+        entry = state.global_cache.get(normalized_hash)
+        if entry is not None:
+            entry.hitCount += 1
+
+    monkeypatch.setattr(repository, "bump_global_cache_hit", bump_global_cache_hit)
 
     # -- meals.repository (confirm -> LoggedMeal handoff) --------------------
 
@@ -1043,6 +1090,19 @@ def stub_call_small_model(monkeypatch, result=None, exc=None):
     return calls
 
 
+def stub_call_large_model(monkeypatch, result=None, exc=None):
+    calls = []
+
+    def fake(system_prompt, user_content):
+        calls.append((system_prompt, user_content))
+        if exc is not None:
+            raise exc
+        return result
+
+    monkeypatch.setattr(services, "call_large_model", fake)
+    return calls
+
+
 def test_send_message_escalates_to_t2_when_t1_finds_nothing(seam, monkeypatch):
     chicken = make_food(
         id="food-chicken",
@@ -1344,3 +1404,157 @@ def test_explicit_edit_item_correction_records_a_serving_observation(seam):
     send(seam, "rice was actually 100g", client_message_id="m2")
 
     assert seam.record_serving_observation_calls == [("user-1", "food-rice", "COOKED", 100.0)]
+
+
+# -- AI quota, T3 escalation, L2 cache (Chunk 4c, §5.1.4, §7.1, §7.4, §12.8) -
+
+
+def _chicken_food(**overrides):
+    fields = dict(
+        id="food-chicken",
+        name="Grilled Chicken Breast",
+        defaultState="COOKED",
+        rawToCookedYield=1.0,
+        category="PROTEIN",
+        servingUnits=[],
+    )
+    fields.update(overrides)
+    return make_food(**fields)
+
+
+@override_settings(AI_QUOTA_LIMIT=2)
+def test_send_message_quota_allows_up_to_the_limit_then_blocks(seam, monkeypatch):
+    seam.foods["food-chicken"] = _chicken_food()
+    envelope = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.9)]
+    )
+    calls = stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    r1 = send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m1")
+    seam.draft = None  # each send below is meant to start fresh, no open draft in the way
+    r2 = send(seam, "grilled chicken bowl with a spicy dressing", client_message_id="m2")
+    seam.draft = None
+    r3 = send(seam, "grilled chicken wrap with a herb dressing", client_message_id="m3")
+
+    assert r1["quotaExceeded"] is False
+    assert r2["quotaExceeded"] is False
+    assert r3["quotaExceeded"] is True
+    assert r3["tier"] == "PARSER"
+    assert r3["intent"] == "OTHER"
+    assert r3["draft"] is None
+    assert len(calls) == 2  # the third message never reached the model
+
+
+def test_send_message_t0_cache_hit_does_not_consume_quota(seam, monkeypatch):
+    seam.foods["food-chicken"] = _chicken_food()
+    envelope = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.9)]
+    )
+    calls = stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m1")
+    seam.draft = None  # no open draft in the way of the second, cache-hit send
+    response2 = send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m2")
+
+    assert len(calls) == 1  # second send hit the per-user (T0) cache
+    assert response2["tier"] == "CACHE"
+    assert seam.quota_counters["user-1"].count == 1
+
+
+def test_send_message_l2_cache_hit_for_a_different_user_skips_the_llm_call(seam, monkeypatch):
+    seam.foods["food-chicken"] = _chicken_food()
+    envelope = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.9)]
+    )
+    calls = stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+    content = "grilled chicken salad with a tahini dressing"
+
+    send(seam, content, client_message_id="m1")
+    assert len(calls) == 1
+    assert seam.global_cache  # a fully-resolved parse writes a global-cache row
+    # The fake `create_draft_with_expiry_check` tracks one draft slot shared
+    # across every user (not real per-user Postgres semantics) - reset it so
+    # user-2's own draft creation below isn't blocked by user-1's still-open
+    # one; this test is about the global cache, not per-user draft isolation.
+    seam.draft = None
+
+    response = services.send_message("user-2", {"clientMessageId": "m2", "content": content})
+
+    assert len(calls) == 1  # no second model call for user-2's identical text
+    assert response["tier"] == "CACHE"
+    assert "user-2" not in seam.quota_counters
+    assert seam.global_cache_hit_calls
+
+
+def test_global_cache_entry_falls_through_when_the_cached_food_no_longer_resolves(seam, monkeypatch):
+    seam.foods["food-chicken"] = _chicken_food()
+    content = "grilled chicken salad with a tahini dressing"
+    normalized_hash = hash_normalized(normalize_text(content))
+    seam.global_cache[normalized_hash] = SimpleNamespace(
+        normalizedHash=normalized_hash,
+        snapshot={
+            "name": "Lunch — Ghost",
+            "slot": "LUNCH",
+            "items": [{"foodId": "food-ghost", "quantity": 100.0, "unit": "g", "state": "COOKED"}],
+        },
+        hitCount=0,
+    )
+    envelope = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.9)]
+    )
+    calls = stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, content)
+
+    assert len(calls) == 1  # fell through to a fresh T2 call
+    assert response["tier"] == "LLM_SMALL"
+
+
+def test_send_message_escalates_to_t3_on_low_confidence_t2_result(seam, monkeypatch):
+    seam.foods["food-chicken"] = _chicken_food()
+    low_confidence = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.3)]
+    )
+    high_confidence = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.95)]
+    )
+    small_calls = stub_call_small_model(
+        monkeypatch, result=stub_llm_response(low_confidence, model="gpt-4o-mini")
+    )
+    large_calls = stub_call_large_model(
+        monkeypatch, result=stub_llm_response(high_confidence, model="gpt-4o")
+    )
+
+    response = send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert len(small_calls) == 1
+    assert len(large_calls) == 1
+    assert response["tier"] == "LLM_LARGE"
+    events_by_tier = {e.tier: e.countedToQuota for e in seam.parse_events}
+    assert events_by_tier["LLM_SMALL"] is True
+    assert events_by_tier["LLM_LARGE"] is False
+
+
+def test_send_message_does_not_escalate_to_t3_on_high_confidence_t2_result(seam, monkeypatch):
+    seam.foods["food-chicken"] = _chicken_food()
+    envelope = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.9)]
+    )
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+    large_calls = stub_call_large_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert large_calls == []
+    assert response["tier"] == "LLM_SMALL"
+
+
+def test_send_message_does_not_escalate_to_t3_on_a_t2_call_failure(seam, monkeypatch):
+    stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
+    large_calls = stub_call_large_model(monkeypatch, result=stub_llm_response(llm_envelope()))
+
+    response = send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert large_calls == []
+    assert response["tier"] == "PARSER"
+    assert response["intent"] == "OTHER"

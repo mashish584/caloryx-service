@@ -20,6 +20,7 @@ from .serializers import (
     DraftUpdateSerializer,
     MealDraftSerializer,
     MessageResponseSerializer,
+    QuotaSerializer,
     SendMessageSerializer,
     VersionSerializer,
 )
@@ -255,3 +256,15 @@ class MessageView(APIView):
         payload = services.send_message(request.user.user_id, serializer.validated_data)
         payload["requestId"] = getattr(request, "request_id", None)
         return Response(payload)
+
+
+class QuotaView(APIView):
+    """GET /api/v1/assistant/quota (§5.1.4's quota pill, §10, Chunk 4c) -
+    read-only, never consumes a unit itself."""
+
+    @extend_schema(
+        operation_id="assistant_quota_retrieve",
+        responses={200: QuotaSerializer, 401: UNAUTHORIZED, 500: SERVER_ERROR},
+    )
+    def get(self, request):
+        return Response(services.fetch_quota_status(request.user.user_id))

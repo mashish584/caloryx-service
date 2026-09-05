@@ -8,7 +8,7 @@ from drf_spectacular.views import (
     SpectacularSwaggerView,
 )
 
-from assistant.views import DraftCreateView, MessageView
+from assistant.views import DraftCreateView, MessageView, QuotaView
 from common.views import health, readiness
 from meals.views import LoggedMealListCreateView
 
@@ -36,6 +36,8 @@ urlpatterns = [
     # No sibling sub-path under /messages/ (Chunk 2b), so this one needs no
     # trailing-slash split the way /drafts and /meals do.
     path("api/v1/assistant/messages", MessageView.as_view(), name="assistant-messages"),
+    # Same reasoning - a bare leaf path, no sub-paths under it (Chunk 4c).
+    path("api/v1/assistant/quota", QuotaView.as_view(), name="assistant-quota"),
     # Schema is the source of truth for FE type generation (see
     # scripts/export_openapi_schema.sh); docs UIs are for humans only.
     path("api/schema", SpectacularAPIView.as_view(**_open), name="schema"),

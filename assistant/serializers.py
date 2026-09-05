@@ -228,6 +228,20 @@ class MessageResponseSerializer(serializers.Serializer):
     draft = MealDraftSerializer(allow_null=True)
     unconsumedText = serializers.ListField(child=serializers.CharField())
     needsClarification = NeedsClarificationSerializer(allow_null=True)
+    # True only when this message's T1->T2 escalation was blocked by the AI
+    # quota (§5.1.4, Chunk 4c) - the endpoint still returns 200 (see the
+    # class docstring); the client fetches GET /quota separately for the
+    # used/limit/resetsAt numbers to render the upgrade sheet.
+    quotaExceeded = serializers.BooleanField()
+
+
+class QuotaSerializer(serializers.Serializer):
+    """GET /v1/assistant/quota (§5.1.4's quota pill, §10)."""
+
+    used = serializers.IntegerField()
+    limit = serializers.IntegerField()
+    remaining = serializers.IntegerField()
+    resetsAt = serializers.DateTimeField(allow_null=True)
 
 
 # -- internal validation (Chunk 4a, §7.3, §12.4) -----------------------------
