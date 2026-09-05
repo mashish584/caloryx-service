@@ -230,6 +230,55 @@ class MessageResponseSerializer(serializers.Serializer):
     needsClarification = NeedsClarificationSerializer(allow_null=True)
 
 
+# -- internal validation (Chunk 4a, §7.3, §12.4) -----------------------------
+#
+# Not attached to any endpoint's @extend_schema - these validate the LLM's
+# raw response dict before assistant.services trusts any of it, the same
+# schema+domain gate every other input to a draft mutation goes through.
+# OpenAI's `strict: true` structured output already guarantees the JSON
+# *shape* (llm/schema.py); this additionally enforces domain rules strict
+# mode can't (item count, quantity bounds) and the cross-field rules §12.4
+# names explicitly.
+
+
+class IntentEnvelopeItemSerializer(serializers.Serializer):
+    food = serializers.CharField(max_length=200)
+    quantity = serializers.FloatField(min_value=0.01, allow_null=True)
+    unit = serializers.CharField(max_length=50, allow_null=True)
+    state = serializers.ChoiceField(choices=["raw", "cooked"], allow_null=True)
+    prep = serializers.CharField(max_length=50, allow_null=True)
+    sizeQualifier = serializers.ChoiceField(choices=["small", "medium", "large"], allow_null=True)
+    confidence = serializers.FloatField(min_value=0.0, max_value=1.0)
+
+
+class IntentEnvelopeSerializer(serializers.Serializer):
+    intent = serializers.ChoiceField(choices=[i.value for i in ChatIntent])
+    targetRef = serializers.CharField(max_length=200, allow_null=True)
+    slot = serializers.ChoiceField(choices=[s.value for s in MealSlot], allow_null=True)
+    mealName = serializers.CharField(max_length=80, allow_null=True)
+    items = IntentEnvelopeItemSerializer(many=True)
+
+    def validate_items(self, items):
+        if len(items) > MAX_ITEMS_PER_MEAL:
+            raise serializers.ValidationError(
+                "An envelope can have at most {} items.".format(MAX_ITEMS_PER_MEAL)
+            )
+        return items
+
+    def validate(self, attrs):
+        # §12.4: "targetRef only present on edit intents; slot only on
+        # SET_SLOT or LOG_NEW." Unused by anything in 4a (only LOG_NEW is
+        # acted on), enforced now so the contract doesn't loosen in Chunk 5.
+        intent = attrs["intent"]
+        if attrs.get("targetRef") is not None and intent not in ("EDIT_ITEM", "REMOVE_ITEM"):
+            raise serializers.ValidationError(
+                {"targetRef": "targetRef is only valid for EDIT_ITEM/REMOVE_ITEM."}
+            )
+        if attrs.get("slot") is not None and intent not in ("SET_SLOT", "LOG_NEW"):
+            raise serializers.ValidationError({"slot": "slot is only valid for SET_SLOT or LOG_NEW."})
+        return attrs
+
+
 # -- serialize_x() helpers ---------------------------------------------------
 
 

@@ -10,9 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+from django.conf import settings
 
 import chatparser
 from common.exceptions import (
@@ -23,13 +26,21 @@ from common.exceptions import (
     OpenDraftExistsError,
     UnresolvableQuantityError,
 )
+from chatparser.units import UNIT_WORDS
+from llm import LLMCallError, LLMConfigurationError, call_small_model
+from llm.prompts import SYSTEM_PROMPT
 from meals import repository as meals_repository
 from meals import services as meals_services
 from meals.serializers import serialize_logged_meal
 from nutrition import ZERO_VECTOR, NutrientVector, sum_nutrition
 
 from . import repository
-from .serializers import item_nutrient_vector, serialize_daily_totals, serialize_draft
+from .serializers import (
+    IntentEnvelopeSerializer,
+    item_nutrient_vector,
+    serialize_daily_totals,
+    serialize_draft,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -495,14 +506,40 @@ def _resolve_target_ref(text: str, draft_items: List[Any]) -> Tuple[Optional[Any
     return best_item, False
 
 
-def _template_name(sample_food_text: Optional[str], slot: str) -> str:
-    """Minimal placeholder naming - NOT the full §5.1.3 template (dominant
-    protein/grain + form factor for multi-item bowls, plus the model
-    `mealName` free-ride), which is Chunk 4's job. Just enough for a draft
-    created from text to have a name at all."""
-    if sample_food_text:
-        return "{} — {}".format(slot.title(), sample_food_text.title())
-    return "{} meal".format(slot.title())
+def _derive_meal_name(
+    items_payload: List[Dict[str, Any]],
+    vectors: List[NutrientVector],
+    fallback_food_text: Optional[str],
+    slot: str,
+) -> str:
+    """§5.1.3's default naming template: `"{Slot} — {top item by calorie
+    contribution}"`, title-cased, at most 4 words. This is the "simple
+    meals" case only - the fuller "dominant protein/grain + form factor"
+    phrasing needs a `Food.category`/form-factor concept the catalog doesn't
+    have yet, so "top item by calories" is an honestly-scoped proxy for
+    "dominant" rather than a guess at the full algorithm. Used for every
+    new-meal draft (T1 and T2 both) - naming was never tier-specific in the
+    PRD; `fallback_food_text` only fires when nothing resolved at all."""
+    best_food_id: Optional[str] = None
+    best_calories = -1.0
+    for item_payload, vector in zip(items_payload, vectors):
+        if item_payload["resolution"] != "RESOLVED":
+            continue
+        if vector.calories_kcal > best_calories:
+            best_calories = vector.calories_kcal
+            best_food_id = item_payload["foodId"]
+
+    sample = fallback_food_text
+    if best_food_id is not None:
+        food = meals_repository.get_food(best_food_id)
+        if food is not None:
+            sample = food.name
+
+    if not sample:
+        return "{} meal".format(slot.title())
+
+    words = sample.title().split()[:4]
+    return "{} — {}".format(slot.title(), " ".join(words))
 
 
 @dataclass
@@ -599,6 +636,173 @@ def _apply_add_phrases(
     )
 
 
+def _cost_micros(prompt_tokens: int, output_tokens: int) -> int:
+    input_cost = prompt_tokens * settings.OPENAI_SMALL_MODEL_INPUT_COST_PER_1M_MICROS / 1_000_000
+    output_cost = output_tokens * settings.OPENAI_SMALL_MODEL_OUTPUT_COST_PER_1M_MICROS / 1_000_000
+    return int(round(input_cost + output_cost))
+
+
+def _call_t2(user_id: str, content: str) -> Optional[Dict[str, Any]]:
+    """Escalates one message to the small model (§7.1's exception layer,
+    triggered only when T1 finds zero phrases - see `_process_new_meal`),
+    validates the response through `IntentEnvelopeSerializer` (§12.4: any
+    failure -> treat as a parse miss, never a partial draft mutation), and
+    writes a `ParseEvent` for the attempt regardless of outcome (§9, I9).
+    Returns the validated envelope dict, or `None` on any failure - a
+    provider outage or a malformed response both degrade to "no food
+    identified," never a 500 (§11)."""
+    input_hash = chatparser.hash_normalized(content)
+    started = time.monotonic()
+
+    try:
+        response = call_small_model(SYSTEM_PROMPT, content)
+    except LLMConfigurationError as exc:
+        # A deploy-time misconfiguration (no API key), not a per-call
+        # failure - still degrades to "no food identified" rather than a
+        # 500 (§11), but at error level since it needs ops attention rather
+        # than being an expected, occasional provider hiccup.
+        logger.error("t2 call skipped, provider not configured user=%s: %s", user_id, exc)
+        repository.create_parse_event(
+            user_id,
+            {
+                "inputHash": input_hash,
+                "tier": "LLM_SMALL",
+                "intent": "OTHER",
+                "latencyMs": int((time.monotonic() - started) * 1000),
+                "confidence": 0.0,
+            },
+        )
+        return None
+    except LLMCallError as exc:
+        logger.warning("t2 call failed user=%s: %s", user_id, exc)
+        repository.create_parse_event(
+            user_id,
+            {
+                "inputHash": input_hash,
+                "tier": "LLM_SMALL",
+                "intent": "OTHER",
+                "latencyMs": int((time.monotonic() - started) * 1000),
+                "confidence": 0.0,
+            },
+        )
+        return None
+
+    serializer = IntentEnvelopeSerializer(data=response.raw_envelope)
+    if not serializer.is_valid():
+        logger.warning(
+            "t2 envelope failed validation user=%s errors=%s", user_id, serializer.errors
+        )
+        repository.create_parse_event(
+            user_id,
+            {
+                "inputHash": input_hash,
+                "tier": "LLM_SMALL",
+                "intent": "OTHER",
+                "model": response.model,
+                "promptTokens": response.prompt_tokens,
+                "outputTokens": response.output_tokens,
+                "costMicros": _cost_micros(response.prompt_tokens, response.output_tokens),
+                "latencyMs": response.latency_ms,
+                "confidence": 0.0,
+            },
+        )
+        return None
+
+    envelope = serializer.validated_data
+    items = envelope.get("items") or []
+    confidence = sum(item["confidence"] for item in items) / len(items) if items else 0.0
+    repository.create_parse_event(
+        user_id,
+        {
+            "inputHash": input_hash,
+            "tier": "LLM_SMALL",
+            "intent": envelope["intent"],
+            "model": response.model,
+            "promptTokens": response.prompt_tokens,
+            "outputTokens": response.output_tokens,
+            "costMicros": _cost_micros(response.prompt_tokens, response.output_tokens),
+            "latencyMs": response.latency_ms,
+            "confidence": confidence,
+        },
+    )
+    return envelope
+
+
+def _llm_item_to_phrase(llm_item: Dict[str, Any]) -> Optional["chatparser.ParsedItemPhrase"]:
+    """One validated envelope item -> the same `ParsedItemPhrase` T1's own
+    regex grammar already produces, when the model reported a quantity *and*
+    a unit that normalizes through the same `UNIT_WORDS` vocabulary T1 uses
+    (the model might say "grams" in any surface form, not necessarily the
+    canonical string a food's serving table expects). This is what lets
+    every convertible item flow through the unmodified
+    `_build_items_from_phrase` (composite matching, confidence banding,
+    miss-queue filing - all of it) with zero new resolution code. Returns
+    `None` when quantity/unit is missing or unrecognized - treated the same
+    as any other unresolvable item until Chunk 4b's quantity-resolution
+    ladder can do better."""
+    quantity = llm_item.get("quantity")
+    unit_text = llm_item.get("unit")
+    if quantity is None or not unit_text:
+        return None
+    unit = UNIT_WORDS.get(unit_text.strip().lower())
+    if unit is None:
+        return None
+
+    state = llm_item.get("state")
+    return chatparser.ParsedItemPhrase(
+        raw_text=llm_item["food"],
+        quantity=quantity,
+        unit=unit,
+        state=state.upper() if state else None,
+        prep=llm_item.get("prep"),
+        food_text=llm_item["food"],
+    )
+
+
+def _process_t2_new_meal(
+    user_id: str, envelope: Dict[str, Any], t1_unconsumed: List[str]
+) -> _Outcome:
+    """A validated `LOG_NEW` envelope with >=1 item -> the same draft-creation
+    core the T1 path uses. An item with no usable quantity+unit reports its
+    food name as unconsumed text rather than being resolved (no
+    quantity-resolution ladder until Chunk 4b)."""
+    items_payload: List[Dict[str, Any]] = []
+    vectors: List[NutrientVector] = []
+    unconsumed: List[str] = list(t1_unconsumed)
+
+    for llm_item in envelope["items"]:
+        phrase = _llm_item_to_phrase(llm_item)
+        if phrase is None:
+            unconsumed.append(llm_item["food"])
+            continue
+        for item_payload, vector in _build_items_from_phrase(phrase):
+            items_payload.append(item_payload)
+            vectors.append(vector)
+
+    if not items_payload:
+        return _Outcome(
+            tier="LLM_SMALL", intent="OTHER", assistant_text=_NO_FOOD_REPLY, unconsumed_text=unconsumed
+        )
+
+    resolved_count = sum(1 for ip in items_payload if ip["resolution"] == "RESOLVED")
+    confidence = resolved_count / len(items_payload)
+    slot = envelope.get("slot") or _infer_slot(None)
+    name = envelope.get("mealName") or _derive_meal_name(
+        items_payload, vectors, envelope["items"][0]["food"], slot
+    )
+
+    created = _create_draft_from_items(user_id, name, slot, "LLM_SMALL", confidence, items_payload, vectors)
+
+    return _Outcome(
+        tier="LLM_SMALL",
+        intent="LOG_NEW",
+        assistant_text="Got it — let me break that down.",
+        draft=serialize_draft(created),
+        draft_id=created.id,
+        unconsumed_text=unconsumed,
+    )
+
+
 def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _Outcome:
     cached = repository.find_cached_message(user_id, normalized_hash)
     if cached is not None:
@@ -627,6 +831,12 @@ def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _O
 
     phrases, unconsumed = chatparser.parse_new_item_phrases(normalized)
     if not phrases:
+        # T1's grammar found nothing at all - the one case 4a escalates to
+        # T2 (§7.1's exception layer; a partial T1 match stays unescalated,
+        # see the Chunk 4a plan's router-scope note).
+        envelope = _call_t2(user_id, normalized)
+        if envelope is not None and envelope["intent"] == "LOG_NEW" and envelope["items"]:
+            return _process_t2_new_meal(user_id, envelope, unconsumed)
         return _Outcome(tier="PARSER", intent="OTHER", assistant_text=_NO_FOOD_REPLY, unconsumed_text=unconsumed)
 
     items_payload = []
@@ -639,7 +849,7 @@ def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _O
     resolved_count = sum(1 for ip in items_payload if ip["resolution"] == "RESOLVED")
     confidence = resolved_count / len(items_payload)
     slot = _infer_slot(None)
-    name = _template_name(phrases[0].food_text, slot)
+    name = _derive_meal_name(items_payload, vectors, phrases[0].food_text, slot)
 
     created = _create_draft_from_items(user_id, name, slot, "PARSER", confidence, items_payload, vectors)
 

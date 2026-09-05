@@ -79,6 +79,7 @@ model User {
   chatSessions ChatSession[]
   mealDrafts   MealDraft[]
   chatMessages ChatMessage[]
+  parseEvents  ParseEvent[]
 
   @@index([isGuest, createdAt])
 }
@@ -705,4 +706,42 @@ model FoodMissQueue {
   createdAt   DateTime @default(now())
 
   @@unique([rawText, locale])
+}
+
+// --- Chunk 4a: AI intent layer telemetry (AI Meal Assistant PRD §7.3, §9, I9) --
+//
+// The small model handles descriptive input T1's grammar can't parse (§7.1).
+// Cost & quality telemetry are first-class from the moment a model call can
+// happen at all, not an afterthought (I9) - logged here for every T2 call.
+
+/// One model call's cost/quality record (§9). Logged only for T2/T3 calls in
+/// Chunk 4a/4b, not retroactively for T-1/T0/T1 (which already work and cost
+/// nothing) - a deliberate, narrower reading of "from day one" than
+/// instrumenting every tier that predates this chunk.
+model ParseEvent {
+  id             String     @id @default(cuid())
+  user           User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId         String
+  inputHash      String
+  tier           ParseTier
+  intent         ChatIntent
+  // False for every row in Chunk 4a - there is no quota to count against yet
+  // (Chunk 4b). Not a bug: a schema-accurate placeholder, same pattern as
+  // Chunk 2a's `ParseTier.MANUAL`.
+  countedToQuota Boolean    @default(false)
+  model          String?
+  promptTokens   Int?
+  outputTokens   Int?
+  costMicros     Int?
+  latencyMs      Int
+  confidence     Float
+  // Not updated by anything in Chunk 4a - populating these needs tracking a
+  // pre-confirm edit and a completed confirm, which is Chunk 4b or a later
+  // observability pass. Documented gap, not a silent one.
+  wasCorrected   Boolean    @default(false)
+  wasLogged      Boolean    @default(false)
+  createdAt      DateTime   @default(now())
+
+  @@index([inputHash])
+  @@index([userId, createdAt])
 }

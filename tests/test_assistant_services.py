@@ -19,6 +19,7 @@ from common.exceptions import (
     OpenDraftExistsError,
 )
 from engine.rounding import round_int
+from llm import LLMCallError, LLMResponse
 from meals import repository as meals_repository
 from nutrition import NutrientVector, item_nutrition
 
@@ -157,6 +158,7 @@ def seam(monkeypatch):
         logged_meals=[],
         create_logged_meal_calls=0,
         messages=[],
+        parse_events=[],
     )
 
     # -- assistant.repository ------------------------------------------------
@@ -297,6 +299,20 @@ def seam(monkeypatch):
         return None
 
     monkeypatch.setattr(repository, "find_cached_message", find_cached_message)
+
+    # -- assistant.repository: parse telemetry (Chunk 4a) --------------------
+
+    def create_parse_event(user_id, data):
+        event = SimpleNamespace(
+            id="parse-event-{}".format(len(state.parse_events) + 1),
+            userId=user_id,
+            createdAt=datetime.now(timezone.utc),
+            **data,
+        )
+        state.parse_events.append(event)
+        return event
+
+    monkeypatch.setattr(repository, "create_parse_event", create_parse_event)
 
     # -- meals.repository (confirm -> LoggedMeal handoff) --------------------
 
@@ -941,3 +957,199 @@ def test_composite_component_state_differing_from_default_applies_yield_conversi
 def test_send_message_files_a_miss_for_the_food_text_of_an_unresolved_phrase(seam):
     services.send_message("user-1", {"clientMessageId": "m1", "content": "50g xyzzyplonk"})
     assert seam.food_misses == ["xyzzyplonk"]
+
+
+# -- T2 escalation (Chunk 4a: §7.1-§7.3, §9, §12.4, §12.8) -------------------
+
+
+def llm_envelope(intent="LOG_NEW", slot=None, meal_name=None, items=None, target_ref=None):
+    return {
+        "intent": intent,
+        "targetRef": target_ref,
+        "slot": slot,
+        "mealName": meal_name,
+        "items": items if items is not None else [],
+    }
+
+
+def llm_item(food, quantity=None, unit=None, state=None, prep=None, confidence=0.9, size_qualifier=None):
+    return {
+        "food": food,
+        "quantity": quantity,
+        "unit": unit,
+        "state": state,
+        "prep": prep,
+        "sizeQualifier": size_qualifier,
+        "confidence": confidence,
+    }
+
+
+def stub_llm_response(envelope, prompt_tokens=100, output_tokens=50, model="gpt-4o-mini"):
+    return LLMResponse(
+        raw_envelope=envelope,
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+        latency_ms=42,
+        model=model,
+    )
+
+
+def stub_call_small_model(monkeypatch, result=None, exc=None):
+    """`result`/`exc` may be a single value or a list consumed call-by-call
+    (only the list form is used today, but keeping the shape symmetric costs
+    nothing and matches how a multi-call test would extend it)."""
+    calls = []
+
+    def fake(system_prompt, user_content):
+        calls.append((system_prompt, user_content))
+        if exc is not None:
+            raise exc
+        return result
+
+    monkeypatch.setattr(services, "call_small_model", fake)
+    return calls
+
+
+def test_send_message_escalates_to_t2_when_t1_finds_nothing(seam, monkeypatch):
+    chicken = make_food(
+        id="food-chicken",
+        name="Grilled Chicken Breast",
+        defaultState="COOKED",
+        rawToCookedYield=1.0,
+        servingUnits=[],
+    )
+    seam.foods["food-chicken"] = chicken
+    envelope = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", state="cooked", prep="grilled", confidence=0.9)]
+    )
+    calls = stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert len(calls) == 1  # T1 found zero phrases -> exactly one T2 call
+    assert response["tier"] == "LLM_SMALL"
+    assert response["intent"] == "LOG_NEW"
+    items = response["draft"]["items"]
+    assert len(items) == 1
+    assert items[0]["foodName"] == "Grilled Chicken Breast"
+    assert items[0]["resolution"] == "RESOLVED"
+    assert response["draft"]["confidence"] == pytest.approx(1.0)
+
+    assert len(seam.parse_events) == 1
+    event = seam.parse_events[0]
+    assert event.tier == "LLM_SMALL"
+    assert event.intent == "LOG_NEW"
+    assert event.model == "gpt-4o-mini"
+    assert event.promptTokens == 100
+    assert event.outputTokens == 50
+    assert event.costMicros == 45  # 100*0.15 + 50*0.6, in micros-per-token terms
+    assert event.latencyMs == 42
+    assert event.confidence == pytest.approx(0.9)
+
+
+def test_send_message_t2_item_without_quantity_is_reported_as_unconsumed(seam, monkeypatch):
+    envelope = llm_envelope(items=[llm_item("grilled chicken salad", confidence=0.5)])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert response["draft"] is None
+    assert response["tier"] == "LLM_SMALL"
+    assert response["intent"] == "OTHER"
+    assert "grilled chicken salad" in response["unconsumedText"]
+
+
+def test_send_message_t2_call_failure_falls_back_gracefully(seam, monkeypatch):
+    stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
+
+    response = send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert response["draft"] is None
+    assert response["tier"] == "PARSER"
+    assert response["intent"] == "OTHER"
+    assert len(seam.parse_events) == 1
+    assert seam.parse_events[0].tier == "LLM_SMALL"
+    assert seam.parse_events[0].intent == "OTHER"
+
+
+def test_send_message_t2_envelope_validation_failure_falls_back_gracefully(seam, monkeypatch):
+    bad_envelope = llm_envelope(items=[llm_item("chicken", state="sizzling", confidence=0.5)])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(bad_envelope))
+
+    response = send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert response["draft"] is None
+    assert response["tier"] == "PARSER"
+    assert response["intent"] == "OTHER"
+    assert len(seam.parse_events) == 1
+    assert seam.parse_events[0].intent == "OTHER"
+    assert seam.parse_events[0].model == "gpt-4o-mini"  # the call itself succeeded
+
+
+def test_send_message_t2_non_log_new_intent_falls_back_gracefully(seam, monkeypatch):
+    envelope = llm_envelope(intent="OTHER", items=[])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert response["draft"] is None
+    assert response["tier"] == "PARSER"
+    assert response["intent"] == "OTHER"
+
+
+def test_send_message_t2_uses_envelope_slot_and_meal_name_when_present(seam, monkeypatch):
+    chicken = make_food(id="food-chicken", name="Grilled Chicken Breast", defaultState="COOKED", rawToCookedYield=1.0, servingUnits=[])
+    seam.foods["food-chicken"] = chicken
+    envelope = llm_envelope(
+        slot="BREAKFAST",
+        meal_name="Custom Meal Name",
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.9)],
+    )
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert response["draft"]["slot"] == "BREAKFAST"
+    assert response["draft"]["name"] == "Custom Meal Name"
+
+
+def test_send_message_t1_partial_match_does_not_call_t2(seam, monkeypatch):
+    calls = stub_call_small_model(monkeypatch, result=stub_llm_response(llm_envelope()))
+
+    send(seam, "200g rice and blah")
+
+    assert calls == []
+
+
+def test_send_message_open_draft_unrecognized_message_does_not_call_t2(seam, monkeypatch):
+    create_lunch_draft(seam)
+    calls = stub_call_small_model(monkeypatch, result=stub_llm_response(llm_envelope()))
+
+    response = send(seam, "what a lovely day", client_message_id="m2")
+
+    assert calls == []
+    assert response["intent"] == "OTHER"
+
+
+def test_derive_meal_name_picks_the_highest_calorie_resolved_item(seam):
+    seam.foods["food-rice"] = make_food(id="food-rice", name="Cooked White Rice")
+    seam.foods["food-chicken"] = make_food(id="food-chicken", name="Grilled Chicken Breast")
+    items_payload = [
+        {"resolution": "RESOLVED", "foodId": "food-rice", "rawText": "100g rice"},
+        {"resolution": "RESOLVED", "foodId": "food-chicken", "rawText": "150g chicken"},
+        {"resolution": "UNRESOLVED", "rawText": "50g xyzzyplonk"},
+    ]
+    vectors = [
+        NutrientVector(130.0, 2.7, 28.2, 0.3, 0.4),
+        NutrientVector(250.0, 40.0, 0.0, 8.0, 0.0),
+        NutrientVector(0.0, 0.0, 0.0, 0.0, 0.0),
+    ]
+
+    name = services._derive_meal_name(items_payload, vectors, None, "LUNCH")
+
+    assert name == "Lunch — Grilled Chicken Breast"
+
+
+def test_derive_meal_name_falls_back_when_nothing_resolved():
+    name = services._derive_meal_name([], [], None, "SNACK")
+    assert name == "Snack meal"

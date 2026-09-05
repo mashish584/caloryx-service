@@ -167,6 +167,24 @@ CLERK_AUDIENCE = env("CLERK_AUDIENCE") or None
 CLERK_LEEWAY_SECONDS = int(env("CLERK_LEEWAY_SECONDS", "30"))
 CLERK_JWKS_CACHE_SECONDS = int(env("CLERK_JWKS_CACHE_SECONDS", "600"))
 
+# --- OpenAI (T2/T3, AI Meal Assistant PRD §7.3) ---------------------------
+# The small model handles the overwhelming majority of escalations (§7.1);
+# T3 (a larger model for low-confidence T2 results) is Chunk 4b.
+OPENAI_API_KEY = env("OPENAI_API_KEY")
+OPENAI_SMALL_MODEL = env("OPENAI_SMALL_MODEL", "gpt-4o-mini")
+# ~300 per §7.3 - the envelope is a small structured object, not prose.
+OPENAI_MAX_TOKENS = int(env("OPENAI_MAX_TOKENS", "300"))
+OPENAI_TIMEOUT_SECONDS = float(env("OPENAI_TIMEOUT_SECONDS", "10"))
+# Approximate gpt-4o-mini list pricing in micros of USD per 1M tokens - verify
+# against OpenAI's current pricing page before relying on this for real
+# billing/alerting; it only feeds ParseEvent.costMicros for now, not a charge.
+OPENAI_SMALL_MODEL_INPUT_COST_PER_1M_MICROS = int(
+    env("OPENAI_SMALL_MODEL_INPUT_COST_PER_1M_MICROS", "150000")
+)
+OPENAI_SMALL_MODEL_OUTPUT_COST_PER_1M_MICROS = int(
+    env("OPENAI_SMALL_MODEL_OUTPUT_COST_PER_1M_MICROS", "600000")
+)
+
 # --- Guest sessions -------------------------------------------------------
 # Guest mode is not a Clerk concept, so we mint our own short-lived tokens.
 GUEST_TOKEN_TTL_DAYS = int(env("GUEST_TOKEN_TTL_DAYS", "180"))

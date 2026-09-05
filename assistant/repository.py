@@ -189,3 +189,10 @@ def find_cached_message(user_id: str, normalized_hash: str) -> Optional[Any]:
     if message is not None and message.parseSnapshot is not None:
         return message
     return None
+
+
+# -- parse telemetry (Chunk 4a, §9, I9) --------------------------------------
+
+
+def create_parse_event(user_id: str, data: Dict[str, Any]) -> Any:
+    return get_client().parseevent.create(data=dict(data, userId=user_id))
