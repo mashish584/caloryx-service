@@ -15,6 +15,7 @@ from chatparser import hash_normalized, normalize_text
 from common.exceptions import (
     DraftNotOpenError,
     DraftVersionConflictError,
+    EstimatedDishNotEditableError,
     IdempotencyKeyReuseError,
     NotFoundError,
     OpenDraftExistsError,
@@ -110,14 +111,46 @@ def make_unresolved_item(**overrides):
     return SimpleNamespace(**fields)
 
 
+def make_estimated_dish_item(**overrides):
+    fields = dict(
+        id="item-1",
+        draftId="draft-1",
+        resolution="ESTIMATED_DISH",
+        foodId=None,
+        food=None,
+        rawText="estimated dish",
+        quantity=300.0,
+        unit="g",
+        grams=300.0,
+        state="UNSPECIFIED",
+        defaultGrams=300.0,
+        prep=None,
+        sizeQualifier=None,
+        quantitySource=None,
+        massSource=None,
+        matchScore=None,
+        matchBand=None,
+        dishCategory="SPICED_CURRY",
+        kcalLow=300.0,
+        kcalHigh=550.0,
+        kcalMidpoint=425.0,
+        profileVersion=1,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
 def item_from_payload(state, item_data):
     """Builds a fake `MealDraftItem` row from a service-produced payload dict
-    (RESOLVED - has `foodId` - or UNRESOLVED - doesn't), the way the real
-    repository's `create_draft_item`/`create_draft_with_expiry_check` would."""
+    (RESOLVED - has `foodId`; ESTIMATED_DISH - has `dishCategory`; or
+    UNRESOLVED - neither), the way the real repository's
+    `create_draft_item`/`create_draft_with_expiry_check` would."""
     item_id = "item-{}".format(state.next_item_id)
     state.next_item_id += 1
     if item_data.get("resolution") == "UNRESOLVED":
         return make_unresolved_item(id=item_id, **item_data)
+    if item_data.get("resolution") == "ESTIMATED_DISH":
+        return make_estimated_dish_item(id=item_id, **item_data)
     food = state.foods[item_data["foodId"]]
     return make_item(food, id=item_id, **{k: v for k, v in item_data.items() if k != "foodId"})
 
@@ -168,6 +201,7 @@ def seam(monkeypatch):
         global_cache={},
         global_cache_hit_calls=[],
         draft_operations=[],
+        dish_category_profiles={},
     )
 
     # -- assistant.repository ------------------------------------------------
@@ -418,18 +452,28 @@ def seam(monkeypatch):
         state.food_misses.append(raw_text)
 
     monkeypatch.setattr(meals_repository, "file_food_miss", file_food_miss)
+    monkeypatch.setattr(
+        meals_repository,
+        "get_dish_category_profile",
+        lambda category: state.dish_category_profiles.get(category),
+    )
 
     def create_logged_meal(user_id, meal_data, items_data):
         state.create_logged_meal_calls += 1
-        items = [
-            SimpleNamespace(
+        items = []
+        for i, item in enumerate(items_data):
+            fields = dict(
                 id="lmi-{}".format(i),
-                foodId=item["foodId"],
-                food=state.foods[item["foodId"]],
-                **{k: v for k, v in item.items() if k != "foodId"},
+                foodId=None,
+                dishCategory=None,
+                kcalLow=None,
+                kcalHigh=None,
+                profileVersion=None,
+                rawText=None,
+                food=state.foods.get(item["foodId"]) if "foodId" in item else None,
             )
-            for i, item in enumerate(items_data)
-        ]
+            fields.update(item)
+            items.append(SimpleNamespace(**fields))
         meal = SimpleNamespace(
             id="meal-{}".format(state.create_logged_meal_calls),
             userId=user_id,
@@ -1052,12 +1096,15 @@ def test_send_message_files_a_miss_for_the_food_text_of_an_unresolved_phrase(sea
 # -- T2 escalation (Chunk 4a: §7.1-§7.3, §9, §12.4, §12.8) -------------------
 
 
-def llm_envelope(intent="LOG_NEW", slot=None, meal_name=None, items=None, target_ref=None):
+def llm_envelope(
+    intent="LOG_NEW", slot=None, meal_name=None, items=None, target_ref=None, dish_category=None
+):
     return {
         "intent": intent,
         "targetRef": target_ref,
         "slot": slot,
         "mealName": meal_name,
+        "dishCategory": dish_category,
         "items": items if items is not None else [],
     }
 
@@ -1713,3 +1760,161 @@ def test_draft_operations_are_recorded_for_every_mutation_type(seam):
     assert ops == ["CREATE", "ADD_ITEM", "EDIT_ITEM", "SET_SLOT", "REMOVE_ITEM"]
     assert seam.draft_operations[0].version == 1
     assert seam.draft_operations[3].payload == {"slot": "DINNER"}
+
+
+# -- estimated-dish handling (Chunk 5b, §7.6.1) ------------------------------
+
+
+def make_dish_profile(**overrides):
+    fields = dict(caloriesKcalP25Per100g=120.0, caloriesKcalP75Per100g=220.0, catalogVersion=1)
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_resolve_estimated_dish_with_a_stated_serving(seam):
+    seam.dish_category_profiles["SPICED_CURRY"] = make_dish_profile()
+
+    result = services._resolve_estimated_dish(
+        "SPICED_CURRY", llm_item("misal pav", quantity=250, unit="g", confidence=0.7)
+    )
+
+    assert result is not None
+    payload, vector = result
+    assert payload["resolution"] == "ESTIMATED_DISH"
+    assert payload["dishCategory"] == "SPICED_CURRY"
+    assert payload["grams"] == pytest.approx(250.0)
+    assert payload["kcalLow"] == pytest.approx(300.0)  # 120 * 2.5
+    assert payload["kcalHigh"] == pytest.approx(550.0)  # 220 * 2.5
+    assert payload["kcalMidpoint"] == pytest.approx(425.0)
+    assert vector.calories_kcal == pytest.approx(425.0)
+    assert vector.protein_g is None
+    assert seam.food_misses == ["misal pav"]  # files regardless of outcome (§7.6)
+
+
+def test_resolve_estimated_dish_defaults_serving_when_unstated(seam):
+    seam.dish_category_profiles["SPICED_CURRY"] = make_dish_profile()
+
+    payload, _vector = services._resolve_estimated_dish(
+        "SPICED_CURRY", llm_item("misal pav", confidence=0.7)
+    )
+
+    assert payload["grams"] == pytest.approx(300.0)
+    assert payload["quantity"] == pytest.approx(300.0)
+    assert payload["unit"] == "g"
+
+
+def test_resolve_estimated_dish_defaults_serving_on_an_unrecognized_unit(seam):
+    seam.dish_category_profiles["SPICED_CURRY"] = make_dish_profile()
+
+    payload, _vector = services._resolve_estimated_dish(
+        "SPICED_CURRY", llm_item("misal pav", quantity=2, unit="bowls", confidence=0.7)
+    )
+
+    assert payload["grams"] == pytest.approx(300.0)
+
+
+def test_resolve_estimated_dish_returns_none_for_an_unknown_category(seam):
+    result = services._resolve_estimated_dish(
+        "SPICED_CURRY", llm_item("some mystery dish", confidence=0.5)
+    )
+
+    assert result is None
+    assert seam.food_misses == ["some mystery dish"]  # still files, even unresolved
+
+
+def test_send_message_log_new_with_dish_category_creates_an_estimated_dish_item(seam, monkeypatch):
+    seam.dish_category_profiles["SPICED_CURRY"] = make_dish_profile()
+    envelope = llm_envelope(
+        dish_category="SPICED_CURRY",
+        items=[llm_item("misal pav", quantity=300, unit="g", confidence=0.6)],
+    )
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "I had some misal pav for lunch today")
+
+    assert response["intent"] == "LOG_NEW"
+    items = response["draft"]["items"]
+    assert len(items) == 1
+    item = items[0]
+    assert item["isEstimatedDish"] is True
+    assert item["dishCategory"] == "SPICED_CURRY"
+    assert item["kcalLow"] == round_int(360.0)  # 120 * 3
+    assert item["kcalHigh"] == round_int(660.0)  # 220 * 3
+    assert item["proteinG"] is None
+    assert response["draft"]["totals"]["caloriesKcal"] == round_int(510.0)  # midpoint
+    assert response["draft"]["totals"]["proteinG"] is None  # nothing else on the draft
+
+
+def test_send_message_ai_edit_add_item_with_dish_category(seam, monkeypatch):
+    create_lunch_draft(seam)  # 200g rice open draft
+    seam.dish_category_profiles["FRIED_SNACK"] = make_dish_profile(
+        caloriesKcalP25Per100g=250.0, caloriesKcalP75Per100g=400.0
+    )
+    envelope = llm_envelope(
+        intent="ADD_ITEM",
+        dish_category="FRIED_SNACK",
+        items=[llm_item("some pakoras", confidence=0.6)],
+    )
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "also throw in some pakoras on the side", client_message_id="m2")
+
+    assert response["intent"] == "ADD_ITEM"
+    items = response["draft"]["items"]
+    assert len(items) == 2
+    dish_item = next(i for i in items if i["isEstimatedDish"])
+    assert dish_item["dishCategory"] == "FRIED_SNACK"
+
+
+def test_update_draft_item_rejects_an_estimated_dish_item(seam):
+    seam.dish_category_profiles["SPICED_CURRY"] = make_dish_profile()
+    payload, vector = services._resolve_estimated_dish(
+        "SPICED_CURRY", llm_item("misal pav", quantity=300, unit="g", confidence=0.6)
+    )
+    created = services._create_draft_from_items(
+        "user-1", "Lunch", "LUNCH", "LLM_SMALL", 1.0, [payload], [vector]
+    )
+
+    with pytest.raises(EstimatedDishNotEditableError):
+        services.update_draft_item(
+            "user-1", created.id, created.items[0].id, {"quantity": 500.0, "version": created.version}
+        )
+
+
+def test_confirm_draft_converts_an_estimated_dish_item_recomputed_against_current_profile(seam):
+    seam.dish_category_profiles["SPICED_CURRY"] = make_dish_profile()
+    payload, vector = services._resolve_estimated_dish(
+        "SPICED_CURRY", llm_item("misal pav", quantity=300, unit="g", confidence=0.6)
+    )
+    created = services._create_draft_from_items(
+        "user-1", "Lunch", "LUNCH", "LLM_SMALL", 1.0, [payload], [vector]
+    )
+
+    # The profile changes between draft creation and confirm - confirm must
+    # recompute fresh (§12.5), not trust the draft's own stored range.
+    seam.dish_category_profiles["SPICED_CURRY"] = make_dish_profile(
+        caloriesKcalP25Per100g=200.0, caloriesKcalP75Per100g=300.0, catalogVersion=2
+    )
+
+    response = services.confirm_draft("user-1", created.id, "idem-1", created.version)
+
+    item = response["loggedMeal"]["items"][0]
+    assert item["isEstimatedDish"] is True
+    assert item["caloriesKcal"] == round_int(750.0)  # (200+300)/2 * 3
+    assert item["proteinG"] is None
+
+
+def test_confirm_draft_drops_an_estimated_dish_item_when_its_profile_is_gone(seam):
+    seam.dish_category_profiles["SPICED_CURRY"] = make_dish_profile()
+    payload, vector = services._resolve_estimated_dish(
+        "SPICED_CURRY", llm_item("misal pav", quantity=300, unit="g", confidence=0.6)
+    )
+    created = services._create_draft_from_items(
+        "user-1", "Lunch", "LUNCH", "LLM_SMALL", 1.0, [payload], [vector]
+    )
+
+    del seam.dish_category_profiles["SPICED_CURRY"]
+
+    response = services.confirm_draft("user-1", created.id, "idem-1", created.version)
+
+    assert response["loggedMeal"]["items"] == []

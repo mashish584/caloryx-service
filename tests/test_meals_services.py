@@ -50,6 +50,10 @@ def make_item(food, **overrides):
         carbsG=56.4,
         fatG=0.6,
         fiberG=0.8,
+        dishCategory=None,
+        kcalLow=None,
+        kcalHigh=None,
+        profileVersion=None,
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)

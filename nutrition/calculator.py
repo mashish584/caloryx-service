@@ -9,7 +9,7 @@ rounding each one first would have produced.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
 
 from .enums import FoodState
 
@@ -29,22 +29,34 @@ def _sum_optional(a: Optional[float], b: Optional[float]) -> Optional[float]:
 @dataclass(frozen=True)
 class NutrientVector:
     calories_kcal: float
-    protein_g: float
-    carbs_g: float
-    fat_g: float
+    # Optional like `fiber_g` (Chunk 5b): an estimated-dish item (§7.6.1) has
+    # a deterministic calorie midpoint but no macro breakdown at all - "—" in
+    # the UI, not a guessed zero. Every other caller still passes concrete
+    # floats, so this only ever matters for that one new case.
+    protein_g: Optional[float]
+    carbs_g: Optional[float]
+    fat_g: Optional[float]
     fiber_g: Optional[float] = None
 
     def __add__(self, other: "NutrientVector") -> "NutrientVector":
         return NutrientVector(
             calories_kcal=self.calories_kcal + other.calories_kcal,
-            protein_g=self.protein_g + other.protein_g,
-            carbs_g=self.carbs_g + other.carbs_g,
-            fat_g=self.fat_g + other.fat_g,
+            protein_g=_sum_optional(self.protein_g, other.protein_g),
+            carbs_g=_sum_optional(self.carbs_g, other.carbs_g),
+            fat_g=_sum_optional(self.fat_g, other.fat_g),
             fiber_g=_sum_optional(self.fiber_g, other.fiber_g),
         )
 
 
-ZERO_VECTOR = NutrientVector(0.0, 0.0, 0.0, 0.0, None)
+# Macros start unknown, not zero (Chunk 5b) - matching `fiber_g`'s existing
+# value here. This is the fold's identity element for `sum_nutrition`: a
+# concrete starting zero would silently turn the *first* unknown macro it
+# combines with into a false confirmed zero (`_sum_optional(0.0, None) ==
+# 0.0`), whereas starting from unknown correctly propagates
+# (`_sum_optional(None, None) is None`, `_sum_optional(None, 5.4) == 5.4`) -
+# the same numeric answer as before whenever at least one real vector has a
+# known value, and an honest `None` only when none of them do.
+ZERO_VECTOR = NutrientVector(0.0, None, None, None, None)
 
 
 def item_nutrition(per_100g: NutrientVector, grams: float) -> NutrientVector:
@@ -65,6 +77,19 @@ def sum_nutrition(vectors: Iterable[NutrientVector]) -> NutrientVector:
     for vector in vectors:
         total = total + vector
     return total
+
+
+def estimated_dish_nutrition(
+    p25_per_100g: float, p75_per_100g: float, grams: float
+) -> Tuple[float, float, float]:
+    """A `DishCategoryProfile`'s per-100g p25-p75 band x grams -> `(kcal_low,
+    kcal_high, kcal_midpoint)` (§7.6.1). The one formula both the message-time
+    resolution and the confirm-time recompute call, so an estimated dish's
+    range math exists in exactly one place - never the model's own number."""
+    factor = grams / 100.0
+    kcal_low = p25_per_100g * factor
+    kcal_high = p75_per_100g * factor
+    return kcal_low, kcal_high, (kcal_low + kcal_high) / 2.0
 
 
 def apply_yield(

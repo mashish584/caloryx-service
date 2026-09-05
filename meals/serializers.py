@@ -12,7 +12,7 @@ from typing import Any, Dict
 from rest_framework import serializers
 
 from engine.rounding import round_int
-from nutrition import FoodSource, FoodState, LoggedMealSource, MealSlot, ServingUnitType
+from nutrition import DishCategory, FoodSource, FoodState, LoggedMealSource, MealSlot, ServingUnitType
 
 # §12.4 of the AI PRD bounds a draft at 25 items; nothing about that cap is
 # chat-specific, so the same ceiling applies to a manually-entered meal.
@@ -81,24 +81,32 @@ class LoggedMealItemUpdateSerializer(serializers.Serializer):
 
 class LoggedMealItemSerializer(serializers.Serializer):
     id = serializers.CharField()
-    foodId = serializers.CharField()
-    foodName = serializers.CharField()
-    quantity = serializers.FloatField()
-    unit = serializers.CharField()
+    # Nullable for an estimated-dish row (§7.6.1, Chunk 5b) - it has no Food
+    # relation at all, only a curated DishCategoryProfile behind its number.
+    isEstimatedDish = serializers.BooleanField()
+    foodId = serializers.CharField(allow_null=True)
+    foodName = serializers.CharField(allow_null=True)
+    dishCategory = serializers.ChoiceField(choices=[c.value for c in DishCategory], allow_null=True)
+    quantity = serializers.FloatField(allow_null=True)
+    unit = serializers.CharField(allow_null=True)
     grams = serializers.FloatField()
     state = serializers.ChoiceField(choices=[s.value for s in FoodState])
     caloriesKcal = serializers.IntegerField()
-    proteinG = serializers.IntegerField()
-    carbsG = serializers.IntegerField()
-    fatG = serializers.IntegerField()
+    # A range instead of a point value for an estimated dish (§7.6.1) - null
+    # for a regular resolved item, which has no range, only a figure.
+    kcalLow = serializers.IntegerField(allow_null=True)
+    kcalHigh = serializers.IntegerField(allow_null=True)
+    proteinG = serializers.IntegerField(allow_null=True)
+    carbsG = serializers.IntegerField(allow_null=True)
+    fatG = serializers.IntegerField(allow_null=True)
     fiberG = serializers.IntegerField(allow_null=True)
 
 
 class LoggedMealTotalsSerializer(serializers.Serializer):
     caloriesKcal = serializers.IntegerField()
-    proteinG = serializers.IntegerField()
-    carbsG = serializers.IntegerField()
-    fatG = serializers.IntegerField()
+    proteinG = serializers.IntegerField(allow_null=True)
+    carbsG = serializers.IntegerField(allow_null=True)
+    fatG = serializers.IntegerField(allow_null=True)
     fiberG = serializers.IntegerField(allow_null=True)
 
 
@@ -135,15 +143,40 @@ def serialize_food(food: Any) -> Dict[str, Any]:
 
 
 def _serialize_item(item: Any) -> Dict[str, Any]:
+    if item.dishCategory is not None:
+        # Estimated dish (§7.6.1, Chunk 5b) - no Food relation, a range
+        # instead of a point value, macros unknown rather than guessed.
+        return {
+            "id": item.id,
+            "isEstimatedDish": True,
+            "foodId": None,
+            "foodName": None,
+            "dishCategory": item.dishCategory,
+            "quantity": item.quantity,
+            "unit": item.unit,
+            "grams": item.grams,
+            "state": item.state,
+            "caloriesKcal": round_int(item.caloriesKcal),
+            "kcalLow": round_int(item.kcalLow),
+            "kcalHigh": round_int(item.kcalHigh),
+            "proteinG": None,
+            "carbsG": None,
+            "fatG": None,
+            "fiberG": None,
+        }
     return {
         "id": item.id,
+        "isEstimatedDish": False,
         "foodId": item.foodId,
         "foodName": item.food.name,
+        "dishCategory": None,
         "quantity": item.quantity,
         "unit": item.unit,
         "grams": item.grams,
         "state": item.state,
         "caloriesKcal": round_int(item.caloriesKcal),
+        "kcalLow": None,
+        "kcalHigh": None,
         "proteinG": round_int(item.proteinG),
         "carbsG": round_int(item.carbsG),
         "fatG": round_int(item.fatG),
@@ -163,9 +196,11 @@ def serialize_logged_meal(meal: Any) -> Dict[str, Any]:
         "loggedAt": meal.loggedAt.isoformat(),
         "totals": {
             "caloriesKcal": round_int(meal.caloriesKcal),
-            "proteinG": round_int(meal.proteinG),
-            "carbsG": round_int(meal.carbsG),
-            "fatG": round_int(meal.fatG),
+            # Nullable like fiberG (Chunk 5b): a meal made entirely of
+            # estimated-dish items has no known macro totals (§7.6.1).
+            "proteinG": round_int(meal.proteinG) if meal.proteinG is not None else None,
+            "carbsG": round_int(meal.carbsG) if meal.carbsG is not None else None,
+            "fatG": round_int(meal.fatG) if meal.fatG is not None else None,
             "fiberG": round_int(meal.fiberG) if meal.fiberG is not None else None,
         },
         "items": [_serialize_item(item) for item in meal.items],

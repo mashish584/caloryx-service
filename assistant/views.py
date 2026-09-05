@@ -166,7 +166,13 @@ class DraftItemDetailView(APIView):
                 "No such draft or item for this user.", "draft_not_found", "draft_item_not_found"
             ),
             409: _MUTATION_ERRORS[409],
-            422: _INVALID_QUANTITY,
+            422: error_response(
+                "Either the quantity could not be resolved to a mass, or this "
+                "item is an estimated dish and can't be adjusted directly - "
+                "see `error.code` (`invalid_quantity` | `estimated_dish_not_editable`).",
+                "invalid_quantity",
+                "estimated_dish_not_editable",
+            ),
             500: SERVER_ERROR,
         },
     )

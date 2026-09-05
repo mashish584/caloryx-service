@@ -8,6 +8,14 @@ interpolate per-request data into this string.
 """
 from __future__ import annotations
 
+from nutrition import DishCategory
+
+# Computed once at import time from the closed enum, not per-request - the
+# resulting string is still fully static, so provider-side prompt caching
+# (§7.3) is unaffected; this just keeps the prompt from silently drifting out
+# of sync with the schema's own category list.
+_DISH_CATEGORIES = ", ".join(c.value for c in DishCategory)
+
 SYSTEM_PROMPT = """\
 You interpret natural-language descriptions of meals for a food-logging app. \
 Your only job is text-to-structured-intent extraction. You never compute, \
@@ -36,4 +44,14 @@ is obvious from the items - otherwise leave it null.
 Classify the message's intent as LOG_NEW for a new meal description. If the \
 message is not attempting to describe food being eaten, classify it as \
 OTHER and return an empty items list.
-"""
+
+If a named dish has no obvious ingredient breakdown you're confident about \
+(e.g. "misal pav", "some biryani" when it isn't a food you can name \
+ingredients for), do not invent an ingredient list. Instead set dishCategory \
+to the closest match from this fixed list: {categories}. Only use this when \
+you are not confident in a plain ingredient breakdown - never alongside one, \
+and never for a food you can name normally (e.g. "grilled chicken breast" is \
+never a dishCategory). Still report that dish's serving size, if stated, in \
+its own item's quantity/unit like any other item - there is no separate \
+serving-size field. Leave dishCategory null for every other message.
+""".format(categories=_DISH_CATEGORIES)

@@ -15,6 +15,7 @@ from nutrition import (
     ServingUnit,
     UnknownServingUnitError,
     apply_yield,
+    estimated_dish_nutrition,
     item_nutrition,
     resolve_grams,
     sum_nutrition,
@@ -88,6 +89,42 @@ def resolve_item(
         "fiberG": nutrition.fiber_g,
     }
     return item, nutrition
+
+
+def resolve_estimated_dish_item(
+    dish_category: str, quantity: float, unit: str, grams: float, raw_text: str
+) -> Optional[Tuple[Dict[str, Any], NutrientVector]]:
+    """An estimated dish's confirm-time counterpart to `resolve_item` (§7.6.1,
+    §12.5) - recomputes fresh against the *current* `DishCategoryProfile`
+    rather than trusting the draft's stored range, exactly like a resolved
+    item recomputes against the current `Food` row. Returns `None` when the
+    category's profile has since been removed - dropped silently at confirm,
+    the same posture the RESOLVED path already has for a since-deleted food."""
+    profile = repository.get_dish_category_profile(dish_category)
+    if profile is None:
+        return None
+
+    kcal_low, kcal_high, kcal_mid = estimated_dish_nutrition(
+        profile.caloriesKcalP25Per100g, profile.caloriesKcalP75Per100g, grams
+    )
+    vector = NutrientVector(kcal_mid, None, None, None, None)
+    item = {
+        "rawText": raw_text,
+        "quantity": quantity,
+        "unit": unit,
+        "grams": grams,
+        "state": FoodState.UNSPECIFIED.value,
+        "caloriesKcal": kcal_mid,
+        "proteinG": None,
+        "carbsG": None,
+        "fatG": None,
+        "fiberG": None,
+        "dishCategory": dish_category,
+        "kcalLow": kcal_low,
+        "kcalHigh": kcal_high,
+        "profileVersion": profile.catalogVersion,
+    }
+    return item, vector
 
 
 def _totals_payload(totals: NutrientVector) -> Dict[str, Any]:

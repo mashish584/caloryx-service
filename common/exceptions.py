@@ -84,6 +84,17 @@ class UnresolvableQuantityError(DomainError):
     message = "Could not resolve this item's quantity to a mass."
 
 
+class EstimatedDishNotEditableError(DomainError):
+    """Adjust Portion doesn't apply to an estimated-dish item (assistant app,
+    PRD §7.6.1) - its mockup offers only "Break into ingredients"/"Find this
+    food," never a quantity slider. 422, same "well-formed request, domain
+    data can't satisfy it" framing as `UnresolvableQuantityError`."""
+
+    code = "estimated_dish_not_editable"
+    status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+    message = "This item is an estimated dish and can't be adjusted directly."
+
+
 class OpenDraftExistsError(DomainError):
     """One open draft per user (assistant app, PRD §9, §12.2) - raised instead
     of silently starting a second one or clobbering the first. Callers attach

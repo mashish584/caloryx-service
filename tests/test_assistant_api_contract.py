@@ -265,6 +265,11 @@ def test_confirming_a_draft_returns_the_logged_meal_and_daily_totals(client, gue
             id="lmi-1",
             foodId=food.id,
             food=food,
+            dishCategory=None,
+            kcalLow=None,
+            kcalHigh=None,
+            profileVersion=None,
+            rawText=None,
             **{k: v for k, v in items_data[0].items() if k != "foodId"},
         )
         return SimpleNamespace(

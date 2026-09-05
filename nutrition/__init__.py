@@ -7,8 +7,16 @@ amount; nothing here ever accepts a pre-computed calorie number, which is the
 structural half of the PRD's header principle - "the nutrition database
 determines what a meal contains" - that this package exists to enforce.
 """
-from .calculator import NutrientVector, NutritionError, ZERO_VECTOR, apply_yield, item_nutrition, sum_nutrition
-from .enums import FoodCategory, FoodSource, FoodState, LoggedMealSource, MealSlot, ServingUnitType
+from .calculator import (
+    NutrientVector,
+    NutritionError,
+    ZERO_VECTOR,
+    apply_yield,
+    estimated_dish_nutrition,
+    item_nutrition,
+    sum_nutrition,
+)
+from .enums import DishCategory, FoodCategory, FoodSource, FoodState, LoggedMealSource, MealSlot, ServingUnitType
 from .units import (
     CATEGORY_FALLBACK_GRAMS,
     SIZE_QUALIFIER_MULTIPLIERS,
@@ -19,6 +27,7 @@ from .units import (
 
 __all__ = [
     "CATEGORY_FALLBACK_GRAMS",
+    "DishCategory",
     "FoodCategory",
     "FoodSource",
     "FoodState",
@@ -32,6 +41,7 @@ __all__ = [
     "UnknownServingUnitError",
     "ZERO_VECTOR",
     "apply_yield",
+    "estimated_dish_nutrition",
     "item_nutrition",
     "resolve_grams",
     "sum_nutrition",

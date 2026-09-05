@@ -24,7 +24,7 @@ from chatparser import (
 from engine.rounding import round_int
 from meals.serializers import MAX_ITEMS_PER_MEAL, LoggedMealSerializer
 from meals.services import food_per_100g
-from nutrition import FoodState, MealSlot, NutrientVector, apply_yield, item_nutrition
+from nutrition import DishCategory, FoodState, MealSlot, NutrientVector, apply_yield, item_nutrition
 
 # -- requests -----------------------------------------------------------------
 
@@ -144,8 +144,10 @@ class PerGramSerializer(serializers.Serializer):
 class MealDraftItemSerializer(serializers.Serializer):
     id = serializers.CharField()
     resolution = serializers.ChoiceField(choices=[r.value for r in ItemResolution])
+    isEstimatedDish = serializers.BooleanField()
     foodId = serializers.CharField(allow_null=True)
     foodName = serializers.CharField(allow_null=True)
+    dishCategory = serializers.ChoiceField(choices=[c.value for c in DishCategory], allow_null=True)
     rawText = serializers.CharField()
     quantity = serializers.FloatField(allow_null=True)
     unit = serializers.CharField(allow_null=True)
@@ -158,6 +160,10 @@ class MealDraftItemSerializer(serializers.Serializer):
     massSource = serializers.ChoiceField(choices=[s.value for s in MassSource], allow_null=True)
     matchBand = serializers.ChoiceField(choices=[b.value for b in MatchBand], allow_null=True)
     caloriesKcal = serializers.IntegerField(allow_null=True)
+    # A range instead of a point value for an estimated dish (§7.6.1) - null
+    # for every other resolution.
+    kcalLow = serializers.IntegerField(allow_null=True)
+    kcalHigh = serializers.IntegerField(allow_null=True)
     proteinG = serializers.IntegerField(allow_null=True)
     carbsG = serializers.IntegerField(allow_null=True)
     fatG = serializers.IntegerField(allow_null=True)
@@ -167,9 +173,11 @@ class MealDraftItemSerializer(serializers.Serializer):
 
 class MealDraftTotalsSerializer(serializers.Serializer):
     caloriesKcal = serializers.IntegerField()
-    proteinG = serializers.IntegerField()
-    carbsG = serializers.IntegerField()
-    fatG = serializers.IntegerField()
+    # Nullable like fiberG (Chunk 5b): a draft made entirely of estimated-dish
+    # items has no known macro totals at all (§7.6.1).
+    proteinG = serializers.IntegerField(allow_null=True)
+    carbsG = serializers.IntegerField(allow_null=True)
+    fatG = serializers.IntegerField(allow_null=True)
     fiberG = serializers.IntegerField(allow_null=True)
 
 
@@ -192,9 +200,9 @@ class DailyTotalsSerializer(serializers.Serializer):
     deliberately doesn't reach into yet."""
 
     caloriesKcal = serializers.IntegerField()
-    proteinG = serializers.IntegerField()
-    carbsG = serializers.IntegerField()
-    fatG = serializers.IntegerField()
+    proteinG = serializers.IntegerField(allow_null=True)
+    carbsG = serializers.IntegerField(allow_null=True)
+    fatG = serializers.IntegerField(allow_null=True)
     fiberG = serializers.IntegerField(allow_null=True)
 
 
@@ -270,6 +278,9 @@ class IntentEnvelopeSerializer(serializers.Serializer):
     targetRef = serializers.CharField(max_length=200, allow_null=True)
     slot = serializers.ChoiceField(choices=[s.value for s in MealSlot], allow_null=True)
     mealName = serializers.CharField(max_length=80, allow_null=True)
+    # Estimated-dish path (§7.6.1, Chunk 5b) - top-level, associated with
+    # `items[0]` at the service layer, not a per-item field.
+    dishCategory = serializers.ChoiceField(choices=[c.value for c in DishCategory], allow_null=True)
     items = IntentEnvelopeItemSerializer(many=True)
 
     def validate_items(self, items):
@@ -320,6 +331,11 @@ def item_nutrient_vector(item: Any) -> NutrientVector:
     conversion is a no-op (`apply_yield` short-circuits) whenever the states
     already match.
     """
+    if item.resolution == ItemResolution.ESTIMATED_DISH.value:
+        # No Food relation at all - the midpoint is the number (§7.6.1),
+        # macros are unknown rather than guessed.
+        return NutrientVector(item.kcalMidpoint, None, None, None, None)
+
     food = item.food
     basis_grams = apply_yield(
         item.grams,
@@ -331,14 +347,43 @@ def item_nutrient_vector(item: Any) -> NutrientVector:
 
 
 def serialize_draft_item(item: Any) -> Dict[str, Any]:
+    if item.resolution == ItemResolution.ESTIMATED_DISH.value:
+        return {
+            "id": item.id,
+            "resolution": item.resolution,
+            "isEstimatedDish": True,
+            "foodId": None,
+            "foodName": None,
+            "dishCategory": item.dishCategory,
+            "rawText": item.rawText,
+            "quantity": item.quantity,
+            "unit": item.unit,
+            "grams": item.grams,
+            "state": item.state,
+            "defaultGrams": item.defaultGrams,
+            "quantitySource": item.quantitySource,
+            "massSource": item.massSource,
+            "matchBand": None,
+            "caloriesKcal": round_int(item.kcalMidpoint),
+            "kcalLow": round_int(item.kcalLow),
+            "kcalHigh": round_int(item.kcalHigh),
+            "proteinG": None,
+            "carbsG": None,
+            "fatG": None,
+            "fiberG": None,
+            "perGram": None,
+        }
+
     if item.resolution != ItemResolution.RESOLVED.value or item.food is None:
         # Unreachable in Chunk 2a (every item is RESOLVED with a food), kept
         # so this helper doesn't need rewriting when Chunk 2b/5 land.
         return {
             "id": item.id,
             "resolution": item.resolution,
+            "isEstimatedDish": False,
             "foodId": None,
             "foodName": None,
+            "dishCategory": None,
             "rawText": item.rawText,
             "quantity": item.quantity,
             "unit": item.unit,
@@ -349,6 +394,8 @@ def serialize_draft_item(item: Any) -> Dict[str, Any]:
             "massSource": item.massSource,
             "matchBand": item.matchBand,
             "caloriesKcal": None,
+            "kcalLow": None,
+            "kcalHigh": None,
             "proteinG": None,
             "carbsG": None,
             "fatG": None,
@@ -360,8 +407,10 @@ def serialize_draft_item(item: Any) -> Dict[str, Any]:
     return {
         "id": item.id,
         "resolution": item.resolution,
+        "isEstimatedDish": False,
         "foodId": item.foodId,
         "foodName": item.food.name,
+        "dishCategory": None,
         "rawText": item.rawText,
         "quantity": item.quantity,
         "unit": item.unit,
@@ -372,6 +421,8 @@ def serialize_draft_item(item: Any) -> Dict[str, Any]:
         "massSource": item.massSource,
         "matchBand": item.matchBand,
         "caloriesKcal": round_int(nutrition.calories_kcal),
+        "kcalLow": None,
+        "kcalHigh": None,
         "proteinG": round_int(nutrition.protein_g),
         "carbsG": round_int(nutrition.carbs_g),
         "fatG": round_int(nutrition.fat_g),
@@ -391,9 +442,12 @@ def serialize_draft(draft: Any) -> Dict[str, Any]:
         "confidence": draft.confidence,
         "totals": {
             "caloriesKcal": round_int(draft.caloriesKcal),
-            "proteinG": round_int(draft.proteinG),
-            "carbsG": round_int(draft.carbsG),
-            "fatG": round_int(draft.fatG),
+            # Nullable like fiberG (Chunk 5b): a draft made up entirely of
+            # estimated-dish items has no known macro totals at all - "—" in
+            # the UI, not a guessed zero (§7.6.1).
+            "proteinG": round_int(draft.proteinG) if draft.proteinG is not None else None,
+            "carbsG": round_int(draft.carbsG) if draft.carbsG is not None else None,
+            "fatG": round_int(draft.fatG) if draft.fatG is not None else None,
             "fiberG": round_int(draft.fiberG) if draft.fiberG is not None else None,
         },
         "items": [serialize_draft_item(item) for item in draft.items],
@@ -401,10 +455,12 @@ def serialize_draft(draft: Any) -> Dict[str, Any]:
 
 
 def serialize_daily_totals(totals: NutrientVector) -> Dict[str, Any]:
+    # Nullable like fiberG (Chunk 5b): a day made up entirely of estimated-
+    # dish meals has no known macro totals at all (§7.6.1).
     return {
         "caloriesKcal": round_int(totals.calories_kcal),
-        "proteinG": round_int(totals.protein_g),
-        "carbsG": round_int(totals.carbs_g),
-        "fatG": round_int(totals.fat_g),
+        "proteinG": round_int(totals.protein_g) if totals.protein_g is not None else None,
+        "carbsG": round_int(totals.carbs_g) if totals.carbs_g is not None else None,
+        "fatG": round_int(totals.fat_g) if totals.fat_g is not None else None,
         "fiberG": round_int(totals.fiber_g) if totals.fiber_g is not None else None,
     }

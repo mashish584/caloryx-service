@@ -47,3 +47,16 @@ class FoodCategory(StrEnum):
     VEGETABLE = "VEGETABLE"
     DRESSING = "DRESSING"
     OIL = "OIL"
+
+
+class DishCategory(StrEnum):
+    """Estimated-dish handling for an uncurated composite (PRD §7.6.1) - a
+    closed, curated starter set. Adding a category is a curation change (new
+    enum value + a seeded `DishCategoryProfile`), same posture as
+    `CompositeFood`."""
+
+    SPICED_CURRY = "SPICED_CURRY"
+    FRIED_SNACK = "FRIED_SNACK"
+    CREAMY_PASTA = "CREAMY_PASTA"
+    CLEAR_SOUP = "CLEAR_SOUP"
+    GRAIN_BOWL = "GRAIN_BOWL"

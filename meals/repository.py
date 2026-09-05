@@ -69,6 +69,13 @@ def create_composite_food(data: Dict[str, Any]) -> Any:
 # -- miss queue (Chunk 3, §9, I8) --------------------------------------------
 
 
+def get_dish_category_profile(category: str) -> Optional[Any]:
+    """Curated per-100g calorie band for an estimated dish (§7.6.1, Chunk
+    5b). `None` means no confident category has a profile yet - the caller
+    treats that as "no confident category -> no number," not a crash."""
+    return get_client().dishcategoryprofile.find_unique(where={"category": category})
+
+
 def file_food_miss(raw_text: str, locale: str = "") -> Any:
     """Upsert on `(rawText, locale)` - a repeat miss increments `occurrences`
     rather than creating a duplicate row. `locale` defaults to `""`, never

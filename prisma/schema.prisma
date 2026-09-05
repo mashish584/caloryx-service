@@ -293,6 +293,36 @@ enum FoodCategory {
   OIL
 }
 
+/// Estimated-dish handling for an uncurated composite (§7.6.1, Chunk 5b) - a
+/// closed, curated starter set. Adding a category is a curation change (new
+/// enum value + a seeded DishCategoryProfile row), same posture as
+/// CompositeFood.
+enum DishCategory {
+  SPICED_CURRY
+  FRIED_SNACK
+  CREAMY_PASTA
+  CLEAR_SOUP
+  GRAIN_BOWL
+}
+
+/// Curated per-100g calorie band per dish category (§7.6.1) - what makes an
+/// "estimated" number deterministic instead of model-authored. The model
+/// supplies only a category + serving size; this profile supplies the
+/// number. Only calories get a range - macros are null for an estimated dish
+/// (§9's MealDraftItem field list has no macro-range fields), not guessed.
+model DishCategoryProfile {
+  id                     String       @id @default(cuid())
+  category               DishCategory @unique
+  caloriesKcalP25Per100g Float
+  caloriesKcalP75Per100g Float
+  // Forward-declared for §12.7's future cache-key versioning, same pattern
+  // as CompositeFood.catalogVersion - unused as a cache key until Chunk 8,
+  // but already carried on every MealDraftItem.profileVersion it produces.
+  catalogVersion Int @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
 /// Household/countable measures, defined per food (§8) - a cup of rice and a
 /// cup of spinach are not the same mass. `g`/`kg` are universal and never
 /// stored here; see nutrition.units.resolve_grams.
@@ -323,9 +353,11 @@ model LoggedMeal {
   // Always the sum of `items` at write time (§6) - ingredients are the source
   // of truth; this is a render cache, never an independently authored number.
   caloriesKcal Float
-  proteinG     Float
-  carbsG       Float
-  fatG         Float
+  // Nullable like fiberG (Chunk 5b): a meal made entirely of estimated-dish
+  // items (§7.6.1) has no known macro totals at all - unknown, not zero.
+  proteinG     Float?
+  carbsG       Float?
+  fatG         Float?
   fiberG       Float?
 
   items LoggedMealItem[]
@@ -337,13 +369,23 @@ model LoggedMeal {
 }
 
 model LoggedMealItem {
-  id     String     @id @default(cuid())
-  meal   LoggedMeal @relation(fields: [mealId], references: [id], onDelete: Cascade)
+  id     String      @id @default(cuid())
+  meal   LoggedMeal  @relation(fields: [mealId], references: [id], onDelete: Cascade)
   mealId String
-  food   Food       @relation(fields: [foodId], references: [id])
-  foodId String
+  // Nullable (Chunk 5b) - null iff this is an estimated-dish row
+  // (`dishCategory != null`), which has no Food relation at all.
+  food   Food?       @relation(fields: [foodId], references: [id])
+  foodId String?
 
-  quantity Float     // as entered, in `unit`
+  // Only populated for an estimated-dish row - a resolved row's display name
+  // still comes from food.name, exactly as before this chunk.
+  rawText String?
+
+  // Always populated (unlike MealDraftItem's nullable version) - an
+  // estimated dish always resolves to a concrete serving (stated, or the
+  // §7.6.1 default) by the time it reaches a LoggedMealItem row; there is no
+  // UNRESOLVED-shaped row in this model to leave them null for.
+  quantity Float
   unit     String    // "g", "katori", "piece"...
   // Resolved mass FROM `quantity`+`unit`, in `state` (as entered) - what the
   // item shows the user, not a defaultState-basis figure. Any raw<->cooked
@@ -353,14 +395,26 @@ model LoggedMealItem {
   grams    Float
   state    FoodState @default(UNSPECIFIED)
 
-  // Computed once at write time from food.*Per100g x grams/100 (§8) and never
-  // re-derived silently, so a later catalog edit can't retroactively rewrite a
-  // past meal (full snapshot/versioning is a later chunk - §12.3).
+  // Computed once at write time (§8) and never re-derived silently, so a
+  // later catalog edit can't retroactively rewrite a past meal (full
+  // snapshot/versioning is a later chunk - §12.3). For a resolved item, from
+  // food.*Per100g x grams/100; for an estimated dish, from the current
+  // DishCategoryProfile (§7.6.1) - either way, recomputed fresh at confirm,
+  // never carried over from the draft's own numbers (§12.5).
   caloriesKcal Float
-  proteinG     Float
-  carbsG       Float
-  fatG         Float
+  // Null for an estimated dish - macros unknown, not zero (§7.6.1).
+  proteinG     Float?
+  carbsG       Float?
+  fatG         Float?
   fiberG       Float?
+
+  // ESTIMATED_DISH persistence (§7.6.1) - kept in the frozen snapshot
+  // (§12.3) so a meal's history view shows the same range it did at log
+  // time, not just the midpoint that counted toward totals.
+  dishCategory   String?
+  kcalLow        Float?
+  kcalHigh       Float?
+  profileVersion Int?
 
   createdAt DateTime @default(now())
 }
@@ -471,9 +525,11 @@ model MealDraft {
   // Always the sum of `items` at write time (§6) - recomputed on every
   // mutation exactly like LoggedMeal's totals, never authored independently.
   caloriesKcal Float
-  proteinG     Float
-  carbsG       Float
-  fatG         Float
+  // Nullable like fiberG (Chunk 5b): a draft made entirely of estimated-dish
+  // items (§7.6.1) has no known macro totals at all - unknown, not zero.
+  proteinG     Float?
+  carbsG       Float?
+  fatG         Float?
   fiberG       Float?
 
   parseTier  ParseTier @default(MANUAL)

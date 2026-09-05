@@ -21,6 +21,7 @@ import chatparser
 from common.exceptions import (
     DraftNotOpenError,
     DraftVersionConflictError,
+    EstimatedDishNotEditableError,
     IdempotencyKeyReuseError,
     NotFoundError,
     OpenDraftExistsError,
@@ -37,6 +38,9 @@ from nutrition import (
     SIZE_QUALIFIER_MULTIPLIERS,
     ZERO_VECTOR,
     NutrientVector,
+    UnknownServingUnitError,
+    estimated_dish_nutrition,
+    resolve_grams,
     sum_nutrition,
 )
 
@@ -66,6 +70,10 @@ _SLOT_WINDOWS = [
 
 _GREETING_REPLY = "Hey \U0001F44B What did you eat?"
 _NO_FOOD_REPLY = "I couldn't work out what food that was — try naming the dish, or search for it."
+# §7.6.1's own worked example ("Misal Pav... ~300g") - used for an estimated
+# dish whose item has no stated quantity+unit, or an unrecognized one (only
+# g/kg are meaningful for a dish with no serving-unit table of its own).
+_DISH_DEFAULT_SERVING_GRAMS = 300.0
 
 
 def _now() -> datetime:
@@ -120,8 +128,16 @@ def _totals_payload(totals: NutrientVector) -> Dict[str, Any]:
     }
 
 
+_TOTALED_RESOLUTIONS = ("RESOLVED", "ESTIMATED_DISH")
+
+
 def _draft_totals(draft: Any) -> NutrientVector:
-    return sum_nutrition(item_nutrient_vector(item) for item in draft.items if item.resolution == "RESOLVED")
+    # An estimated dish counts toward totals at its midpoint (§7.6.1) -
+    # excluding it would understate the day, a worse error than a flagged
+    # approximation.
+    return sum_nutrition(
+        item_nutrient_vector(item) for item in draft.items if item.resolution in _TOTALED_RESOLUTIONS
+    )
 
 
 def _recompute_totals(user_id: str, draft_id: str, *, bump_version: bool) -> Any:
@@ -299,6 +315,12 @@ def update_draft_item(
     item = repository.get_draft_item(user_id, draft_id, item_id)
     if item is None:
         raise NotFoundError("Item not found.", code="draft_item_not_found")
+    if item.resolution == "ESTIMATED_DISH":
+        # Adjust Portion doesn't apply to an estimated dish (§7.6.1's own
+        # mockup offers only "Break into ingredients"/"Find this food," never
+        # a quantity slider) - reject explicitly rather than crash below on
+        # a `None` food.
+        raise EstimatedDishNotEditableError()
 
     food = item.food
     quantity = data.get("quantity", item.quantity)
@@ -370,15 +392,29 @@ def confirm_draft(
 
     # Server authority (§12.5): recompute fresh from the current catalog
     # rather than trusting the draft's live-computed-but-still-client-visible
-    # numbers. Only RESOLVED items convert into LoggedMealItem rows.
+    # numbers. Only RESOLVED/ESTIMATED_DISH items convert into LoggedMealItem
+    # rows - UNRESOLVED never does, same as before this chunk.
     items_payload: List[Dict[str, Any]] = []
     vectors: List[NutrientVector] = []
     for item in draft.items:
-        if item.resolution != "RESOLVED" or item.food is None:
-            continue
-        resolved, vector = meals_services.resolve_item(item.food, item.quantity, item.unit, item.state)
-        items_payload.append(resolved)
-        vectors.append(vector)
+        if item.resolution == "RESOLVED" and item.food is not None:
+            resolved, vector = meals_services.resolve_item(
+                item.food, item.quantity, item.unit, item.state
+            )
+            items_payload.append(resolved)
+            vectors.append(vector)
+        elif item.resolution == "ESTIMATED_DISH":
+            # Recomputed against the *current* DishCategoryProfile, exactly
+            # like a RESOLVED item recomputes against the current Food row -
+            # never the draft's own stored range (§12.5). A since-removed
+            # profile drops the item silently, same posture as a
+            # since-deleted food in the RESOLVED branch above.
+            resolved_dish = meals_services.resolve_estimated_dish_item(
+                item.dishCategory, item.quantity, item.unit, item.grams, item.rawText
+            )
+            if resolved_dish is not None:
+                items_payload.append(resolved_dish[0])
+                vectors.append(resolved_dish[1])
 
     meal_data = dict(
         name=draft.name,
@@ -698,7 +734,7 @@ def _apply_ai_edit(user_id: str, draft: Any, envelope: Dict[str, Any]) -> Option
         if not envelope["items"]:
             return None
         _load_open_draft_for_mutation(user_id, draft.id, draft.version)
-        items_payload, _vectors, unconsumed = _resolve_envelope_items(envelope["items"], user_id)
+        items_payload, _vectors, unconsumed = _resolve_envelope_items_with_dish(envelope, user_id)
         if not items_payload:
             return None
         updated_row = None
@@ -1032,6 +1068,55 @@ def _llm_item_to_phrase(llm_item: Dict[str, Any]) -> Optional["chatparser.Parsed
     )
 
 
+def _resolve_estimated_dish(
+    dish_category: str, llm_item: Dict[str, Any]
+) -> Optional[Tuple[Dict[str, Any], NutrientVector]]:
+    """The envelope's `dishCategory` + its associated item -> an
+    `ESTIMATED_DISH` payload (§7.6.1) - never a fabricated ingredient list,
+    never a model-authored number. Files the dish name to `FoodMissQueue`
+    regardless of outcome (§7.6: "the dish files to FoodMissQueue
+    regardless"). Returns `None` when no confident category has a curated
+    profile yet ("no confident category -> no number," §7.6.1) - the caller
+    reports the item unconsumed, not a crash or a guessed number."""
+    dish_name = llm_item["food"]
+    meals_repository.file_food_miss(dish_name)
+
+    profile = meals_repository.get_dish_category_profile(dish_category)
+    if profile is None:
+        return None
+
+    quantity = llm_item.get("quantity")
+    unit = llm_item.get("unit")
+    grams = None
+    if quantity is not None and unit:
+        try:
+            grams = resolve_grams(quantity, unit, [])
+        except UnknownServingUnitError:
+            grams = None
+    if grams is None:
+        quantity, unit, grams = _DISH_DEFAULT_SERVING_GRAMS, "g", _DISH_DEFAULT_SERVING_GRAMS
+
+    kcal_low, kcal_high, kcal_mid = estimated_dish_nutrition(
+        profile.caloriesKcalP25Per100g, profile.caloriesKcalP75Per100g, grams
+    )
+    payload = {
+        "resolution": "ESTIMATED_DISH",
+        "rawText": dish_name,
+        "quantity": quantity,
+        "unit": unit,
+        "grams": grams,
+        "state": "UNSPECIFIED",
+        "defaultGrams": grams,
+        "dishCategory": dish_category,
+        "kcalLow": kcal_low,
+        "kcalHigh": kcal_high,
+        "kcalMidpoint": kcal_mid,
+        "profileVersion": profile.catalogVersion,
+    }
+    vector = NutrientVector(kcal_mid, None, None, None, None)
+    return payload, vector
+
+
 def _resolve_envelope_items(
     llm_items: List[Dict[str, Any]], user_id: str
 ) -> Tuple[List[Dict[str, Any]], List[NutrientVector], List[str]]:
@@ -1066,6 +1151,40 @@ def _resolve_envelope_items(
     return items_payload, vectors, unconsumed
 
 
+def _resolve_envelope_items_with_dish(
+    envelope: Dict[str, Any], user_id: str
+) -> Tuple[List[Dict[str, Any]], List[NutrientVector], List[str]]:
+    """`_resolve_envelope_items`, plus the estimated-dish path (§7.6.1,
+    Chunk 5b): when `envelope["dishCategory"]` is set and there's at least
+    one item, `items[0]` is that dish (its own `food` field is otherwise
+    unused - `targetRef`-style redundancy, same reasoning as `EDIT_ITEM`'s
+    item-0 in 5a) and goes through `_resolve_estimated_dish` instead of the
+    normal food/ladder resolution; every remaining item is unaffected. A
+    pure pass-through to `_resolve_envelope_items` when no dish is present."""
+    dish_category = envelope.get("dishCategory")
+    llm_items = envelope["items"]
+    if not dish_category or not llm_items:
+        return _resolve_envelope_items(llm_items, user_id)
+
+    items_payload: List[Dict[str, Any]] = []
+    vectors: List[NutrientVector] = []
+    unconsumed: List[str] = []
+
+    dish_item = llm_items[0]
+    resolved = _resolve_estimated_dish(dish_category, dish_item)
+    if resolved is not None:
+        items_payload.append(resolved[0])
+        vectors.append(resolved[1])
+    else:
+        unconsumed.append(dish_item["food"])
+
+    rest_payload, rest_vectors, rest_unconsumed = _resolve_envelope_items(llm_items[1:], user_id)
+    items_payload.extend(rest_payload)
+    vectors.extend(rest_vectors)
+    unconsumed.extend(rest_unconsumed)
+    return items_payload, vectors, unconsumed
+
+
 def _process_t2_new_meal(
     user_id: str, envelope: Dict[str, Any], t1_unconsumed: List[str], tier: str
 ) -> _Outcome:
@@ -1073,7 +1192,7 @@ def _process_t2_new_meal(
     core the T1 path uses. `tier` is whichever of LLM_SMALL/LLM_LARGE actually
     produced `envelope` (Chunk 4c: a low-confidence T2 result may have been
     overridden by a T3 call - see `_process_new_meal`)."""
-    items_payload, vectors, unresolved = _resolve_envelope_items(envelope["items"], user_id)
+    items_payload, vectors, unresolved = _resolve_envelope_items_with_dish(envelope, user_id)
     unconsumed = list(t1_unconsumed) + unresolved
 
     if not items_payload:

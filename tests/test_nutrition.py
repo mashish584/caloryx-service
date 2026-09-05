@@ -13,6 +13,7 @@ from nutrition import (
     ServingUnit,
     UnknownServingUnitError,
     apply_yield,
+    estimated_dish_nutrition,
     item_nutrition,
     resolve_grams,
     sum_nutrition,
@@ -152,3 +153,48 @@ def test_category_fallback_grams_covers_every_food_category():
     assert CATEGORY_FALLBACK_GRAMS[FoodCategory.VEGETABLE] == 80.0
     assert CATEGORY_FALLBACK_GRAMS[FoodCategory.DRESSING] == 20.0
     assert CATEGORY_FALLBACK_GRAMS[FoodCategory.OIL] == 5.0
+
+
+# -- estimated-dish handling (§7.6.1, Chunk 5b) -------------------------------
+
+
+def test_estimated_dish_nutrition_scales_linearly_with_grams():
+    low, high, mid = estimated_dish_nutrition(100.0, 200.0, 300.0)
+    assert low == pytest.approx(300.0)
+    assert high == pytest.approx(600.0)
+    assert mid == pytest.approx(450.0)
+
+
+def test_estimated_dish_nutrition_midpoint_is_the_mean_of_the_bounds():
+    low, high, mid = estimated_dish_nutrition(120.0, 220.0, 100.0)
+    assert mid == pytest.approx((low + high) / 2.0)
+
+
+# -- NutrientVector macro-nullability (§7.6.1, Chunk 5b) ----------------------
+
+
+def test_nutrient_vector_add_propagates_none_macros_like_fiber():
+    known = NutrientVector(100.0, 5.0, 10.0, 2.0, 1.0)
+    unknown = NutrientVector(50.0, None, None, None, None)
+
+    total = known + unknown
+
+    assert total.calories_kcal == pytest.approx(150.0)
+    # One known + one unknown -> the known value, not zero (§8's existing
+    # fiber precedent, now applied to every macro).
+    assert total.protein_g == pytest.approx(5.0)
+    assert total.carbs_g == pytest.approx(10.0)
+    assert total.fat_g == pytest.approx(2.0)
+    assert total.fiber_g == pytest.approx(1.0)
+
+
+def test_nutrient_vector_add_of_two_unknowns_stays_unknown():
+    a = NutrientVector(50.0, None, None, None, None)
+    b = NutrientVector(70.0, None, None, None, None)
+
+    total = a + b
+
+    assert total.calories_kcal == pytest.approx(120.0)
+    assert total.protein_g is None
+    assert total.carbs_g is None
+    assert total.fat_g is None

@@ -7,11 +7,12 @@ fact. Strict mode requires every property to be listed in `required` (there is
 no true "optional key" - a field the model may omit is expressed as a
 nullable type instead) and `additionalProperties: false` on every object.
 
-No `dishCategory` field: that's §7.6.1's estimated-dish path (Chunk 5's AI
-half). Only the 6 `ChatIntent` members Chunk 2b defined are offered - the
-other 7 don't exist anywhere else in this system yet either (Chunk 6).
+Only the 6 `ChatIntent` members Chunk 2b defined are offered - the other 7
+don't exist anywhere else in this system yet either (Chunk 6).
 """
 from __future__ import annotations
+
+from nutrition import DishCategory
 
 _INTENT_ITEM_SCHEMA = {
     "type": "object",
@@ -51,8 +52,17 @@ INTENT_ENVELOPE_SCHEMA = {
         # Optional - free-rides on this call (§5.1.3), takes precedence over
         # the deterministic template when present.
         "mealName": {"type": ["string", "null"]},
+        # Set only for a named dish with no confident ingredient breakdown -
+        # an uncurated composite (§7.6.1). Top-level, not per-item: at most
+        # one estimated dish per message, matching §7.3's own illustrative
+        # envelope. Its serving size still goes in the corresponding item's
+        # own `quantity`/`unit` - there is no separate size field here.
+        "dishCategory": {
+            "type": ["string", "null"],
+            "enum": [c.value for c in DishCategory] + [None],
+        },
         "items": {"type": "array", "items": _INTENT_ITEM_SCHEMA},
     },
-    "required": ["intent", "targetRef", "slot", "mealName", "items"],
+    "required": ["intent", "targetRef", "slot", "mealName", "dishCategory", "items"],
     "additionalProperties": False,
 }
