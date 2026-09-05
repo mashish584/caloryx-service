@@ -272,12 +272,9 @@ def test_confirming_a_draft_returns_the_logged_meal_and_daily_totals(client, gue
             rawText=None,
             **{k: v for k, v in items_data[0].items() if k != "foodId"},
         )
-        return SimpleNamespace(
-            id="meal-1",
-            loggedAt=datetime.now(timezone.utc),
-            items=[item],
-            **meal_data,
-        )
+        meal_fields = dict(id="meal-1", loggedAt=datetime.now(timezone.utc), items=[item])
+        meal_fields.update(meal_data)  # meal_data's own loggedAt (if any) wins
+        return SimpleNamespace(**meal_fields)
 
     monkeypatch.setattr(meals_repository, "create_logged_meal", create_logged_meal)
     monkeypatch.setattr(meals_repository, "list_logged_meals", lambda user_id, **kw: [])

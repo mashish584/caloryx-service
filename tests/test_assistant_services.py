@@ -4,7 +4,7 @@ never reached; `assistant.repository` and `meals.repository` are the seams
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +19,8 @@ from common.exceptions import (
     IdempotencyKeyReuseError,
     NotFoundError,
     OpenDraftExistsError,
+    OperationExpiredError,
+    StaleOperationError,
 )
 from engine.rounding import round_int
 from llm import LLMCallError, LLMResponse
@@ -486,13 +488,14 @@ def seam(monkeypatch):
             )
             fields.update(item)
             items.append(SimpleNamespace(**fields))
-        meal = SimpleNamespace(
+        meal_fields = dict(
             id="meal-{}".format(state.create_logged_meal_calls),
             userId=user_id,
             loggedAt=datetime.now(timezone.utc),
             items=items,
-            **meal_data,
         )
+        meal_fields.update(meal_data)  # meal_data's own loggedAt (if any) wins
+        meal = SimpleNamespace(**meal_fields)
         state.logged_meals.append(meal)
         return meal
 
@@ -2148,3 +2151,187 @@ def test_wellbeing_check_all_messages_on_but_not_confirmed_logs_normally(seam, m
     assert len(large_calls) == 1
     assert response["intent"] == "LOG_NEW"
     assert response["draft"] is not None
+
+
+# -- offline queue & sync (Chunk 7, §12.12) ----------------------------------
+
+
+def test_idempotent_replays_the_stored_response_for_a_repeated_op_id(seam):
+    calls = []
+
+    def fn():
+        calls.append(1)
+        return {"ok": True}
+
+    r1 = services._idempotent("op-1", "user-1", {"a": 1}, 200, fn)
+    r2 = services._idempotent("op-1", "user-1", {"a": 1}, 200, fn)
+
+    assert r1 == r2 == {"ok": True}
+    assert len(calls) == 1
+
+
+def test_idempotent_raises_on_mismatched_payload_reuse(seam):
+    services._idempotent("op-2", "user-1", {"a": 1}, 200, lambda: {"ok": True})
+
+    with pytest.raises(IdempotencyKeyReuseError):
+        services._idempotent("op-2", "user-1", {"a": 2}, 200, lambda: {"ok": True})
+
+
+def test_idempotent_without_an_op_id_always_reruns(seam):
+    calls = []
+
+    def fn():
+        calls.append(1)
+        return {"ok": True}
+
+    services._idempotent(None, "user-1", {"a": 1}, 200, fn)
+    services._idempotent(None, "user-1", {"a": 1}, 200, fn)
+
+    assert len(calls) == 2
+
+
+def test_create_draft_with_a_repeated_op_id_does_not_create_twice(seam):
+    seam.foods["food-rice"] = make_food()
+    payload = {
+        "name": "Lunch",
+        "slot": "LUNCH",
+        "items": [{"foodId": "food-rice", "quantity": 200.0, "unit": "g"}],
+        "opId": "op-create-1",
+    }
+
+    r1 = services.create_draft("user-1", payload)
+    r2 = services.create_draft("user-1", payload)
+
+    assert r1 == r2
+    assert seam.next_draft_id == 2  # only one draft was actually created
+
+
+def test_add_draft_item_with_a_repeated_op_id_does_not_add_twice(seam):
+    created = create_lunch_draft(seam)
+    payload = {
+        "foodId": "food-rice",
+        "quantity": 50.0,
+        "unit": "g",
+        "version": created["version"],
+        "opId": "op-add-1",
+    }
+
+    r1 = services.add_draft_item("user-1", created["id"], payload)
+    r2 = services.add_draft_item("user-1", created["id"], payload)
+
+    assert r1 == r2
+    assert len(r1["items"]) == 2  # rice + one added item, not two
+
+
+def test_update_draft_item_with_a_repeated_op_id_does_not_mutate_twice(seam):
+    created = create_lunch_draft(seam, quantity=100.0)
+    item_id = created["items"][0]["id"]
+    payload = {"quantity": 300.0, "version": created["version"], "opId": "op-edit-1"}
+
+    r1 = services.update_draft_item("user-1", created["id"], item_id, payload)
+    r2 = services.update_draft_item("user-1", created["id"], item_id, payload)
+
+    assert r1 == r2
+    assert r1["items"][0]["quantity"] == 300.0
+
+
+def test_delete_draft_item_with_a_repeated_op_id_does_not_remove_twice(seam):
+    created = create_lunch_draft(seam)
+    item_id = created["items"][0]["id"]
+
+    r1 = services.delete_draft_item("user-1", created["id"], item_id, created["version"], "op-remove-1")
+    r2 = services.delete_draft_item("user-1", created["id"], item_id, created["version"], "op-remove-1")
+
+    assert r1 == r2
+    assert r1["items"] == []
+
+
+def test_update_draft_with_a_repeated_op_id_does_not_rename_twice(seam):
+    created = create_lunch_draft(seam)
+    payload = {"name": "Dinner", "version": created["version"], "opId": "op-slot-1"}
+
+    r1 = services.update_draft("user-1", created["id"], payload)
+    r2 = services.update_draft("user-1", created["id"], payload)
+
+    assert r1 == r2
+    assert r1["version"] == created["version"] + 1  # bumped once, not twice
+
+
+def test_confirm_draft_with_a_hard_expired_meal_timestamp_is_rejected(seam):
+    created = create_lunch_draft(seam)
+    old_timestamp = datetime.now(timezone.utc) - timedelta(days=40)
+
+    with pytest.raises(OperationExpiredError):
+        services.confirm_draft(
+            "user-1", created["id"], "idem-1", created["version"], meal_timestamp=old_timestamp
+        )
+
+    assert seam.create_logged_meal_calls == 0
+
+
+def test_confirm_draft_with_a_stale_meal_timestamp_requires_confirmation(seam):
+    created = create_lunch_draft(seam)
+    stale_timestamp = datetime.now(timezone.utc) - timedelta(days=10)
+
+    with pytest.raises(StaleOperationError):
+        services.confirm_draft(
+            "user-1", created["id"], "idem-1", created["version"], meal_timestamp=stale_timestamp
+        )
+    assert seam.create_logged_meal_calls == 0
+
+    response = services.confirm_draft(
+        "user-1",
+        created["id"],
+        "idem-2",
+        created["version"],
+        meal_timestamp=stale_timestamp,
+        stale_confirmed=True,
+    )
+    assert response["loggedMeal"]["loggedAt"] == stale_timestamp.isoformat()
+
+
+def test_confirm_draft_with_a_recent_meal_timestamp_needs_no_confirmation(seam):
+    created = create_lunch_draft(seam)
+    recent_timestamp = datetime.now(timezone.utc) - timedelta(days=1)
+
+    response = services.confirm_draft(
+        "user-1", created["id"], "idem-1", created["version"], meal_timestamp=recent_timestamp
+    )
+
+    assert response["loggedMeal"]["loggedAt"] == recent_timestamp.isoformat()
+
+
+def test_confirm_draft_flags_a_significant_nutrition_snapshot_drift(seam):
+    created = create_lunch_draft(seam)  # 200g cooked rice = 260 kcal
+
+    response = services.confirm_draft(
+        "user-1",
+        created["id"],
+        "idem-1",
+        created["version"],
+        nutrition_snapshot={"caloriesKcal": 100.0},
+    )
+
+    assert response["recomputedFromClientSnapshot"] is True
+
+
+def test_confirm_draft_does_not_flag_a_close_nutrition_snapshot(seam):
+    created = create_lunch_draft(seam)  # 200g cooked rice = 260 kcal
+
+    response = services.confirm_draft(
+        "user-1",
+        created["id"],
+        "idem-1",
+        created["version"],
+        nutrition_snapshot={"caloriesKcal": 258.0},
+    )
+
+    assert response["recomputedFromClientSnapshot"] is False
+
+
+def test_confirm_draft_without_any_offline_fields_is_unchanged(seam):
+    created = create_lunch_draft(seam)
+
+    response = services.confirm_draft("user-1", created["id"], "idem-1", created["version"])
+
+    assert response["recomputedFromClientSnapshot"] is False

@@ -202,7 +202,11 @@ class DraftItemDetailView(APIView):
         serializer = VersionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         payload = services.delete_draft_item(
-            request.user.user_id, draft_id, item_id, serializer.validated_data["version"]
+            request.user.user_id,
+            draft_id,
+            item_id,
+            serializer.validated_data["version"],
+            serializer.validated_data.get("opId"),
         )
         return Response(payload)
 
@@ -219,6 +223,14 @@ class DraftConfirmView(APIView):
             400: VALIDATION_ERROR,
             401: UNAUTHORIZED,
             **_MUTATION_ERRORS,
+            422: error_response(
+                "A queued/offline `mealTimestamp` is either too old to sync "
+                "(over `MAX_QUEUE_AGE_DAYS`) or old enough to need explicit "
+                "confirmation (over `STALE_QUEUE_AGE_DAYS`) - see `error.code` "
+                "(`operation_expired` | `operation_stale`).",
+                "operation_expired",
+                "operation_stale",
+            ),
             500: SERVER_ERROR,
         },
     )
@@ -230,6 +242,9 @@ class DraftConfirmView(APIView):
             draft_id,
             serializer.validated_data["idempotencyKey"],
             serializer.validated_data["version"],
+            meal_timestamp=serializer.validated_data.get("mealTimestamp"),
+            stale_confirmed=serializer.validated_data.get("staleConfirmed", False),
+            nutrition_snapshot=serializer.validated_data.get("nutritionSnapshot"),
         )
         return Response(payload, status=status.HTTP_201_CREATED)
 

@@ -13,7 +13,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from django.conf import settings
 
@@ -25,6 +25,8 @@ from common.exceptions import (
     IdempotencyKeyReuseError,
     NotFoundError,
     OpenDraftExistsError,
+    OperationExpiredError,
+    StaleOperationError,
     UnresolvableQuantityError,
 )
 from chatparser.units import UNIT_WORDS
@@ -257,24 +259,35 @@ def create_draft(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     """POST /drafts (§4's "fully quantified" use case, chat-shaped). One open
     draft per user (§9, §12.2) - enforced by transactional lazy expiry at
     write time; see assistant.repository.create_draft_with_expiry_check for
-    why there's no DB-level constraint backing it yet."""
-    items_input = data["items"]
-    items_payload: List[Dict[str, Any]] = []
-    vectors: List[NutrientVector] = []
-    for raw in items_input:
-        food = meals_repository.get_food(raw["foodId"])
-        if food is None:
-            raise NotFoundError(
-                "Food not found.", code="food_not_found", details={"foodId": raw["foodId"]}
-            )
-        item_payload, vector = _resolve_draft_item(food, raw["quantity"], raw["unit"], raw.get("state"))
-        items_payload.append(item_payload)
-        vectors.append(vector)
+    why there's no DB-level constraint backing it yet. `opId` (optional,
+    §12.12) makes a queued-offline retry of this call idempotent."""
 
-    slot = data.get("slot") or _infer_slot(data.get("localHour"))
-    created = _create_draft_from_items(user_id, data["name"], slot, "MANUAL", 1.0, items_payload, vectors)
-    logger.info("draft created user=%s draft=%s items=%s", user_id, created.id, len(items_payload))
-    return serialize_draft(created)
+    def _do() -> Dict[str, Any]:
+        items_input = data["items"]
+        items_payload: List[Dict[str, Any]] = []
+        vectors: List[NutrientVector] = []
+        for raw in items_input:
+            food = meals_repository.get_food(raw["foodId"])
+            if food is None:
+                raise NotFoundError(
+                    "Food not found.", code="food_not_found", details={"foodId": raw["foodId"]}
+                )
+            item_payload, vector = _resolve_draft_item(food, raw["quantity"], raw["unit"], raw.get("state"))
+            items_payload.append(item_payload)
+            vectors.append(vector)
+
+        slot = data.get("slot") or _infer_slot(data.get("localHour"))
+        created = _create_draft_from_items(user_id, data["name"], slot, "MANUAL", 1.0, items_payload, vectors)
+        logger.info("draft created user=%s draft=%s items=%s", user_id, created.id, len(items_payload))
+        return serialize_draft(created)
+
+    return _idempotent(
+        data.get("opId"),
+        user_id,
+        {"op": "CREATE_DRAFT", "name": data["name"], "slot": data.get("slot"), "items": data["items"]},
+        201,
+        _do,
+    )
 
 
 def fetch_draft(user_id: str, draft_id: str) -> Dict[str, Any]:
@@ -286,19 +299,28 @@ def fetch_draft(user_id: str, draft_id: str) -> Dict[str, Any]:
 
 
 def update_draft(user_id: str, draft_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    _load_open_draft_for_mutation(user_id, draft_id, data["version"])
-    fields = {k: v for k, v in data.items() if k in ("name", "slot")}
-    patch = dict(fields, version={"increment": 1})
-    updated = repository.update_draft(draft_id, patch)
-    # No CONFIRM/DISCARD/EXPIRE op value (§12.2's literal DraftOperation
-    # sketch) - a version-only bump from elsewhere never reaches this
-    # function, so `fields` is never empty here in practice, but the guard
-    # keeps this honest if that ever changes.
-    if "slot" in fields:
-        repository.record_draft_operation(draft_id, "SET_SLOT", fields, updated.version)
-    if "name" in fields:
-        repository.record_draft_operation(draft_id, "RENAME", fields, updated.version)
-    return serialize_draft(updated)
+    def _do() -> Dict[str, Any]:
+        _load_open_draft_for_mutation(user_id, draft_id, data["version"])
+        fields = {k: v for k, v in data.items() if k in ("name", "slot")}
+        patch = dict(fields, version={"increment": 1})
+        updated = repository.update_draft(draft_id, patch)
+        # No CONFIRM/DISCARD/EXPIRE op value (§12.2's literal DraftOperation
+        # sketch) - a version-only bump from elsewhere never reaches this
+        # function, so `fields` is never empty here in practice, but the guard
+        # keeps this honest if that ever changes.
+        if "slot" in fields:
+            repository.record_draft_operation(draft_id, "SET_SLOT", fields, updated.version)
+        if "name" in fields:
+            repository.record_draft_operation(draft_id, "RENAME", fields, updated.version)
+        return serialize_draft(updated)
+
+    return _idempotent(
+        data.get("opId"),
+        user_id,
+        {"op": "SET_SLOT", "draftId": draft_id, "name": data.get("name"), "slot": data.get("slot")},
+        200,
+        _do,
+    )
 
 
 def discard_draft(user_id: str, draft_id: str, version: int) -> Dict[str, Any]:
@@ -326,60 +348,99 @@ def _add_item_payload(user_id: str, draft_id: str, item_payload: Dict[str, Any])
 
 
 def add_draft_item(user_id: str, draft_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    _load_open_draft_for_mutation(user_id, draft_id, data["version"])
-    food = meals_repository.get_food(data["foodId"])
-    if food is None:
-        raise NotFoundError(
-            "Food not found.", code="food_not_found", details={"foodId": data["foodId"]}
-        )
-    item_payload, _ = _resolve_draft_item(food, data["quantity"], data["unit"], data.get("state"))
-    updated = _add_item_payload(user_id, draft_id, item_payload)
-    logger.info("draft item added user=%s draft=%s", user_id, draft_id)
-    return serialize_draft(updated)
+    def _do() -> Dict[str, Any]:
+        _load_open_draft_for_mutation(user_id, draft_id, data["version"])
+        food = meals_repository.get_food(data["foodId"])
+        if food is None:
+            raise NotFoundError(
+                "Food not found.", code="food_not_found", details={"foodId": data["foodId"]}
+            )
+        item_payload, _ = _resolve_draft_item(food, data["quantity"], data["unit"], data.get("state"))
+        updated = _add_item_payload(user_id, draft_id, item_payload)
+        logger.info("draft item added user=%s draft=%s", user_id, draft_id)
+        return serialize_draft(updated)
+
+    return _idempotent(
+        data.get("opId"),
+        user_id,
+        {
+            "op": "ADD_ITEM",
+            "draftId": draft_id,
+            "foodId": data["foodId"],
+            "quantity": data["quantity"],
+            "unit": data["unit"],
+            "state": data.get("state"),
+        },
+        201,
+        _do,
+    )
 
 
 def update_draft_item(
     user_id: str, draft_id: str, item_id: str, data: Dict[str, Any]
 ) -> Dict[str, Any]:
-    _load_open_draft_for_mutation(user_id, draft_id, data["version"])
-    item = repository.get_draft_item(user_id, draft_id, item_id)
-    if item is None:
-        raise NotFoundError("Item not found.", code="draft_item_not_found")
-    if item.resolution == "ESTIMATED_DISH":
-        # Adjust Portion doesn't apply to an estimated dish (§7.6.1's own
-        # mockup offers only "Break into ingredients"/"Find this food," never
-        # a quantity slider) - reject explicitly rather than crash below on
-        # a `None` food.
-        raise EstimatedDishNotEditableError()
+    def _do() -> Dict[str, Any]:
+        _load_open_draft_for_mutation(user_id, draft_id, data["version"])
+        item = repository.get_draft_item(user_id, draft_id, item_id)
+        if item is None:
+            raise NotFoundError("Item not found.", code="draft_item_not_found")
+        if item.resolution == "ESTIMATED_DISH":
+            # Adjust Portion doesn't apply to an estimated dish (§7.6.1's own
+            # mockup offers only "Break into ingredients"/"Find this food," never
+            # a quantity slider) - reject explicitly rather than crash below on
+            # a `None` food.
+            raise EstimatedDishNotEditableError()
 
-    food = item.food
-    quantity = data.get("quantity", item.quantity)
-    unit = data.get("unit", item.unit)
-    state = data.get("state", item.state)
-    patch, _ = _resolve_draft_item(food, quantity, unit, state)
-    # `defaultGrams` is the baseline Adjust Portion deltas are computed
-    # against (§5.2.1) - fixed at creation, never moved by an edit.
-    patch.pop("defaultGrams")
-    repository.update_draft_item(item_id, patch)
-    _record_serving_observations(user_id, [patch])
+        food = item.food
+        quantity = data.get("quantity", item.quantity)
+        unit = data.get("unit", item.unit)
+        state = data.get("state", item.state)
+        patch, _ = _resolve_draft_item(food, quantity, unit, state)
+        # `defaultGrams` is the baseline Adjust Portion deltas are computed
+        # against (§5.2.1) - fixed at creation, never moved by an edit.
+        patch.pop("defaultGrams")
+        repository.update_draft_item(item_id, patch)
+        _record_serving_observations(user_id, [patch])
 
-    updated = _recompute_totals(user_id, draft_id, bump_version=True)
-    repository.record_draft_operation(draft_id, "EDIT_ITEM", dict(patch, itemId=item_id), updated.version)
-    logger.info("draft item updated user=%s draft=%s item=%s", user_id, draft_id, item_id)
-    return serialize_draft(updated)
+        updated = _recompute_totals(user_id, draft_id, bump_version=True)
+        repository.record_draft_operation(draft_id, "EDIT_ITEM", dict(patch, itemId=item_id), updated.version)
+        logger.info("draft item updated user=%s draft=%s item=%s", user_id, draft_id, item_id)
+        return serialize_draft(updated)
+
+    return _idempotent(
+        data.get("opId"),
+        user_id,
+        {
+            "op": "EDIT_ITEM",
+            "draftId": draft_id,
+            "itemId": item_id,
+            "quantity": data.get("quantity"),
+            "unit": data.get("unit"),
+            "state": data.get("state"),
+        },
+        200,
+        _do,
+    )
 
 
-def delete_draft_item(user_id: str, draft_id: str, item_id: str, version: int) -> Dict[str, Any]:
-    _load_open_draft_for_mutation(user_id, draft_id, version)
-    item = repository.get_draft_item(user_id, draft_id, item_id)
-    if item is None:
-        raise NotFoundError("Item not found.", code="draft_item_not_found")
+def delete_draft_item(
+    user_id: str, draft_id: str, item_id: str, version: int, op_id: Optional[str] = None
+) -> Dict[str, Any]:
+    def _do() -> Dict[str, Any]:
+        _load_open_draft_for_mutation(user_id, draft_id, version)
+        item = repository.get_draft_item(user_id, draft_id, item_id)
+        if item is None:
+            raise NotFoundError("Item not found.", code="draft_item_not_found")
 
-    repository.delete_draft_item(item_id)
-    updated = _recompute_totals(user_id, draft_id, bump_version=True)
-    repository.record_draft_operation(draft_id, "REMOVE_ITEM", {"itemId": item_id}, updated.version)
-    logger.info("draft item removed user=%s draft=%s item=%s", user_id, draft_id, item_id)
-    return serialize_draft(updated)
+        repository.delete_draft_item(item_id)
+        updated = _recompute_totals(user_id, draft_id, bump_version=True)
+        repository.record_draft_operation(draft_id, "REMOVE_ITEM", {"itemId": item_id}, updated.version)
+        logger.info("draft item removed user=%s draft=%s item=%s", user_id, draft_id, item_id)
+        return serialize_draft(updated)
+
+    return _idempotent(
+        op_id, user_id, {"op": "REMOVE_ITEM", "draftId": draft_id, "itemId": item_id}, 200, _do
+    )
 
 
 # -- confirm (§9, §12.1, §12.5) -----------------------------------------------
@@ -388,6 +449,44 @@ def delete_draft_item(user_id: str, draft_id: str, item_id: str, version: int) -
 def _request_hash(payload: Dict[str, Any]) -> str:
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _idempotent(
+    op_id: Optional[str],
+    user_id: str,
+    request_payload: Dict[str, Any],
+    status_code: int,
+    fn: Callable[[], Dict[str, Any]],
+    ttl_hours: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Shared opId-based idempotency (§12.1, §12.12) - a double-tap (or a
+    queued-offline retry, §12.12) with the same key replays the original
+    response rather than re-running `fn`, which is what makes every mutating
+    endpoint safe for a client to blindly retry. `op_id=None` runs `fn()`
+    directly with no bookkeeping at all - idempotency is opt-in per request
+    (every structured endpoint's own `opId` field is optional), so a caller
+    that never sends one - today's online path - is completely unaffected.
+    `ttl_hours` defaults to `settings.REPLAY_WINDOW_HOURS` (§12.12's
+    `MAX_QUEUE_AGE + retry tail`); `send_message` is the one caller that
+    passes its own shorter window, since descriptive/AI chat input isn't a
+    queueable `opType` at all."""
+    if op_id is None:
+        return fn()
+    if ttl_hours is None:
+        ttl_hours = settings.REPLAY_WINDOW_HOURS
+
+    request_hash = _request_hash(request_payload)
+    record = repository.get_idempotency_record(op_id)
+    if record is not None and record.expiresAt > _now():
+        if record.requestHash != request_hash:
+            raise IdempotencyKeyReuseError()
+        return dict(record.responseBody)
+
+    response = fn()
+    repository.save_idempotency_record(
+        op_id, user_id, request_hash, response, status_code, _now() + timedelta(hours=ttl_hours)
+    )
+    return response
 
 
 def _today_start() -> datetime:
@@ -403,74 +502,109 @@ def _daily_totals(user_id: str) -> NutrientVector:
 
 
 def confirm_draft(
-    user_id: str, draft_id: str, idempotency_key: str, version: int
+    user_id: str,
+    draft_id: str,
+    idempotency_key: str,
+    version: int,
+    meal_timestamp: Optional[datetime] = None,
+    stale_confirmed: bool = False,
+    nutrition_snapshot: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """POST /drafts/{id}/confirm. Idempotency guards logging (§12.1) - a
     double-tap with the same key replays the original response rather than
     creating a second LoggedMeal; the draft's own OPEN->CONFIRMED transition
     is the second, state-machine-level line of defense once the idempotency
-    record itself has expired (§7, `IdempotencyRecord.expiresAt`)."""
-    request_hash = _request_hash({"draftId": draft_id, "version": version})
+    record itself has expired (§7, `IdempotencyRecord.expiresAt`).
 
-    record = repository.get_idempotency_record(idempotency_key)
-    if record is not None and record.expiresAt > _now():
-        if record.requestHash != request_hash:
-            raise IdempotencyKeyReuseError()
-        return dict(record.responseBody)
+    §12.12's queued-replay fields, all optional and `None`/`False` on today's
+    online path: `meal_timestamp` is when the user actually ate (not when
+    this call reached the server) - validated against the staleness/expiry
+    windows *before* anything is written, then becomes `LoggedMeal.loggedAt`
+    directly, so a backdated offline meal lands on the day it happened, not
+    the day it synced. `nutrition_snapshot` is what the client last showed
+    the user; a difference from the server's freshly-recomputed total beyond
+    `NUTRITION_DRIFT_EPSILON_KCAL` surfaces a one-time note in the response
+    (never persisted - §12.5's server-authority recompute is unaffected
+    either way, this only decides whether to tell the client about it)."""
 
-    draft = _load_open_draft_for_mutation(user_id, draft_id, version)
+    def _do() -> Dict[str, Any]:
+        if meal_timestamp is not None:
+            age = _now() - meal_timestamp
+            if age > timedelta(days=settings.MAX_QUEUE_AGE_DAYS):
+                raise OperationExpiredError()
+            if age > timedelta(days=settings.STALE_QUEUE_AGE_DAYS) and not stale_confirmed:
+                raise StaleOperationError()
 
-    # Server authority (§12.5): recompute fresh from the current catalog
-    # rather than trusting the draft's live-computed-but-still-client-visible
-    # numbers. Only RESOLVED/ESTIMATED_DISH items convert into LoggedMealItem
-    # rows - UNRESOLVED never does, same as before this chunk.
-    items_payload: List[Dict[str, Any]] = []
-    vectors: List[NutrientVector] = []
-    for item in draft.items:
-        if item.resolution == "RESOLVED" and item.food is not None:
-            resolved, vector = meals_services.resolve_item(
-                item.food, item.quantity, item.unit, item.state
-            )
-            items_payload.append(resolved)
-            vectors.append(vector)
-        elif item.resolution == "ESTIMATED_DISH":
-            # Recomputed against the *current* DishCategoryProfile, exactly
-            # like a RESOLVED item recomputes against the current Food row -
-            # never the draft's own stored range (§12.5). A since-removed
-            # profile drops the item silently, same posture as a
-            # since-deleted food in the RESOLVED branch above.
-            resolved_dish = meals_services.resolve_estimated_dish_item(
-                item.dishCategory, item.quantity, item.unit, item.grams, item.rawText
-            )
-            if resolved_dish is not None:
-                items_payload.append(resolved_dish[0])
-                vectors.append(resolved_dish[1])
+        draft = _load_open_draft_for_mutation(user_id, draft_id, version)
 
-    meal_data = dict(
-        name=draft.name,
-        slot=draft.slot,
-        source="CHAT_AI",
-        **_totals_payload(sum_nutrition(vectors)),
-    )
-    logged_meal = meals_repository.create_logged_meal(user_id, meal_data, items_payload)
-    repository.update_draft(draft_id, {"status": "CONFIRMED", "version": {"increment": 1}})
+        # Server authority (§12.5): recompute fresh from the current catalog
+        # rather than trusting the draft's live-computed-but-still-client-visible
+        # numbers. Only RESOLVED/ESTIMATED_DISH items convert into LoggedMealItem
+        # rows - UNRESOLVED never does, same as before this chunk.
+        items_payload: List[Dict[str, Any]] = []
+        vectors: List[NutrientVector] = []
+        for item in draft.items:
+            if item.resolution == "RESOLVED" and item.food is not None:
+                resolved, vector = meals_services.resolve_item(
+                    item.food, item.quantity, item.unit, item.state
+                )
+                items_payload.append(resolved)
+                vectors.append(vector)
+            elif item.resolution == "ESTIMATED_DISH":
+                # Recomputed against the *current* DishCategoryProfile, exactly
+                # like a RESOLVED item recomputes against the current Food row -
+                # never the draft's own stored range (§12.5). A since-removed
+                # profile drops the item silently, same posture as a
+                # since-deleted food in the RESOLVED branch above.
+                resolved_dish = meals_services.resolve_estimated_dish_item(
+                    item.dishCategory, item.quantity, item.unit, item.grams, item.rawText
+                )
+                if resolved_dish is not None:
+                    items_payload.append(resolved_dish[0])
+                    vectors.append(resolved_dish[1])
 
-    response = {
-        "loggedMeal": serialize_logged_meal(logged_meal),
-        "dailyTotals": serialize_daily_totals(_daily_totals(user_id)),
-    }
-    repository.save_idempotency_record(
+        totals = sum_nutrition(vectors)
+        meal_data = dict(
+            name=draft.name,
+            slot=draft.slot,
+            source="CHAT_AI",
+            **_totals_payload(totals),
+        )
+        if meal_timestamp is not None:
+            meal_data["loggedAt"] = meal_timestamp
+        logged_meal = meals_repository.create_logged_meal(user_id, meal_data, items_payload)
+        repository.update_draft(draft_id, {"status": "CONFIRMED", "version": {"increment": 1}})
+
+        recomputed_from_snapshot = False
+        if nutrition_snapshot is not None:
+            snapshot_kcal = nutrition_snapshot.get("caloriesKcal")
+            if (
+                snapshot_kcal is not None
+                and abs(totals.calories_kcal - snapshot_kcal) > settings.NUTRITION_DRIFT_EPSILON_KCAL
+            ):
+                recomputed_from_snapshot = True
+
+        logger.info(
+            "draft confirmed user=%s draft=%s meal=%s", user_id, draft_id, logged_meal.id
+        )
+        return {
+            "loggedMeal": serialize_logged_meal(logged_meal),
+            "dailyTotals": serialize_daily_totals(_daily_totals(user_id)),
+            "recomputedFromClientSnapshot": recomputed_from_snapshot,
+        }
+
+    return _idempotent(
         idempotency_key,
         user_id,
-        request_hash,
-        response,
+        {
+            "op": "CONFIRM_LOG",
+            "draftId": draft_id,
+            "version": version,
+            "mealTimestamp": meal_timestamp.isoformat() if meal_timestamp else None,
+        },
         201,
-        _now() + timedelta(hours=IDEMPOTENCY_TTL_HOURS),
+        _do,
     )
-    logger.info(
-        "draft confirmed user=%s draft=%s meal=%s", user_id, draft_id, logged_meal.id
-    )
-    return response
 
 
 # -- Chunk 2b: text pipeline (§7, §7.5, §12.6) -------------------------------
@@ -1611,67 +1745,64 @@ def _process_message(
 
 def send_message(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     """POST /messages (§10.1 - always 200, a conversational turn rather than
-    always a resource creation). Idempotent on `clientMessageId`, same
-    pattern as `confirm_draft` (§12.1) - reused, not reimplemented."""
+    always a resource creation). Idempotent on `clientMessageId`, via the
+    same `_idempotent` helper `confirm_draft` and the structured mutation
+    endpoints use - kept at its own, shorter TTL (not `REPLAY_WINDOW_HOURS`):
+    descriptive/AI chat input isn't a queueable `opType` at all (§12.12:
+    "offline logging is only available on paths that need no server")."""
     client_message_id = data["clientMessageId"]
     content = data["content"]
     on_open_draft = data.get("onOpenDraft")
 
-    request_hash = _request_hash({"content": content, "onOpenDraft": on_open_draft})
-    record = repository.get_idempotency_record(client_message_id)
-    if record is not None and record.expiresAt > _now():
-        if record.requestHash != request_hash:
-            raise IdempotencyKeyReuseError()
-        return dict(record.responseBody)
+    def _do() -> Dict[str, Any]:
+        normalized = chatparser.normalize_text(content)
+        normalized_hash = chatparser.hash_normalized(normalized)
 
-    normalized = chatparser.normalize_text(content)
-    normalized_hash = chatparser.hash_normalized(normalized)
+        outcome = _process_message(user_id, normalized, normalized_hash, on_open_draft)
 
-    outcome = _process_message(user_id, normalized, normalized_hash, on_open_draft)
+        session = repository.get_or_create_today_session(user_id)
+        # Cache keys are LOG_NEW-only (§7.4) - an edit-shaped message's text has
+        # nothing worth caching against, so both fields stay null for it.
+        cacheable = outcome.intent == "LOG_NEW"
+        user_message = repository.create_chat_message(
+            session.id,
+            user_id,
+            {
+                "role": "USER",
+                "clientMessageId": client_message_id,
+                "content": content,
+                "normalizedHash": normalized_hash if cacheable else None,
+                "tier": outcome.tier,
+                "intent": outcome.intent,
+                "draftId": outcome.draft_id,
+                "parseSnapshot": outcome.parse_snapshot if cacheable else None,
+            },
+        )
+        repository.create_chat_message(
+            session.id, user_id, {"role": "ASSISTANT", "content": outcome.assistant_text}
+        )
 
-    session = repository.get_or_create_today_session(user_id)
-    # Cache keys are LOG_NEW-only (§7.4) - an edit-shaped message's text has
-    # nothing worth caching against, so both fields stay null for it.
-    cacheable = outcome.intent == "LOG_NEW"
-    user_message = repository.create_chat_message(
-        session.id,
-        user_id,
-        {
-            "role": "USER",
-            "clientMessageId": client_message_id,
-            "content": content,
-            "normalizedHash": normalized_hash if cacheable else None,
+        return {
+            "messageId": user_message.id,
             "tier": outcome.tier,
             "intent": outcome.intent,
-            "draftId": outcome.draft_id,
-            "parseSnapshot": outcome.parse_snapshot if cacheable else None,
-        },
-    )
-    repository.create_chat_message(
-        session.id, user_id, {"role": "ASSISTANT", "content": outcome.assistant_text}
-    )
+            "assistantText": outcome.assistant_text,
+            "draft": outcome.draft,
+            "unconsumedText": outcome.unconsumed_text,
+            "needsClarification": outcome.needs_clarification,
+            "quotaExceeded": outcome.quota_exceeded,
+            "gamificationSuppressed": outcome.gamification_suppressed,
+            "wellbeingResources": outcome.wellbeing_resources,
+        }
 
-    response = {
-        "messageId": user_message.id,
-        "tier": outcome.tier,
-        "intent": outcome.intent,
-        "assistantText": outcome.assistant_text,
-        "draft": outcome.draft,
-        "unconsumedText": outcome.unconsumed_text,
-        "needsClarification": outcome.needs_clarification,
-        "quotaExceeded": outcome.quota_exceeded,
-        "gamificationSuppressed": outcome.gamification_suppressed,
-        "wellbeingResources": outcome.wellbeing_resources,
-    }
-    repository.save_idempotency_record(
+    return _idempotent(
         client_message_id,
         user_id,
-        request_hash,
-        response,
+        {"content": content, "onOpenDraft": on_open_draft},
         200,
-        _now() + timedelta(hours=IDEMPOTENCY_TTL_HOURS),
+        _do,
+        ttl_hours=IDEMPOTENCY_TTL_HOURS,
     )
-    return response
 
 
 # -- AI quota (Chunk 4c, §5.1.4, §12.8) --------------------------------------

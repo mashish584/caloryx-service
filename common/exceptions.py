@@ -95,6 +95,29 @@ class EstimatedDishNotEditableError(DomainError):
     message = "This item is an estimated dish and can't be adjusted directly."
 
 
+class OperationExpiredError(DomainError):
+    """A queued offline operation's `mealTimestamp` is older than
+    `settings.MAX_QUEUE_AGE_DAYS` (assistant app, PRD §12.12) - refused
+    outright rather than silently processed or dropped, so the client's own
+    queue can surface it for manual review (`NEEDS_REVIEW`)."""
+
+    code = "operation_expired"
+    status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+    message = "This operation is too old to sync and needs manual review."
+
+
+class StaleOperationError(DomainError):
+    """A queued offline operation's `mealTimestamp` is older than
+    `settings.STALE_QUEUE_AGE_DAYS` but within the hard expiry (PRD §12.12) -
+    the client is expected to prompt before sending one this old; the server
+    enforces it too via the `staleConfirmed` flag rather than trusting a
+    client that skips the prompt."""
+
+    code = "operation_stale"
+    status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+    message = "This meal was logged a while ago — confirm before syncing it."
+
+
 class OpenDraftExistsError(DomainError):
     """One open draft per user (assistant app, PRD §9, §12.2) - raised instead
     of silently starting a second one or clobbering the first. Callers attach

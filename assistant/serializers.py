@@ -51,6 +51,10 @@ class DraftCreateSerializer(serializers.Serializer):
     slot = serializers.ChoiceField(choices=[s.value for s in MealSlot], required=False)
     localHour = serializers.IntegerField(min_value=0, max_value=23, required=False)
     items = DraftItemPayloadSerializer(many=True)
+    # Optional (§12.12) - a queued-offline retry of this call sends the same
+    # `opId` so a network-retried CREATE_DRAFT can't create a second draft.
+    # Omitted, this behaves exactly as it always has - idempotency is opt-in.
+    opId = serializers.CharField(max_length=128, required=False)
 
     def validate_items(self, items):
         if not items:
@@ -69,6 +73,7 @@ class DraftUpdateSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=80, required=False)
     slot = serializers.ChoiceField(choices=[s.value for s in MealSlot], required=False)
     version = serializers.IntegerField(min_value=1)
+    opId = serializers.CharField(max_length=128, required=False)  # §12.12, optional
 
     def validate(self, attrs):
         if "name" not in attrs and "slot" not in attrs:
@@ -80,6 +85,7 @@ class DraftItemCreateSerializer(DraftItemPayloadSerializer):
     """POST /drafts/{id}/items."""
 
     version = serializers.IntegerField(min_value=1)
+    opId = serializers.CharField(max_length=128, required=False)  # §12.12, optional
 
 
 class DraftItemUpdateSerializer(serializers.Serializer):
@@ -91,6 +97,7 @@ class DraftItemUpdateSerializer(serializers.Serializer):
     unit = serializers.CharField(required=False)
     state = serializers.ChoiceField(choices=[s.value for s in FoodState], required=False)
     version = serializers.IntegerField(min_value=1)
+    opId = serializers.CharField(max_length=128, required=False)  # §12.12, optional
 
     def validate(self, attrs):
         if not any(k in attrs for k in ("quantity", "unit", "state")):
@@ -100,18 +107,45 @@ class DraftItemUpdateSerializer(serializers.Serializer):
 
 class VersionSerializer(serializers.Serializer):
     """Body for DELETE endpoints (discard draft, remove item) - just the
-    optimistic-lock version being acted against."""
+    optimistic-lock version being acted against. `opId` (§12.12, optional) is
+    only meaningful for `DELETE .../items/:id` (`REMOVE_ITEM` is a queueable
+    `opType`); `discard_draft` ignores it - discarding a draft isn't in
+    §12.12's own `opType` union."""
 
     version = serializers.IntegerField(min_value=1)
+    opId = serializers.CharField(max_length=128, required=False)
+
+
+class NutritionSnapshotSerializer(serializers.Serializer):
+    """What the client last showed the user for this draft (§12.12) - not a
+    strict full vector, whatever it still has. Compared against the server's
+    freshly-recomputed total on confirm to decide the one-time drift note;
+    never trusted as the actual nutrition value (§12.5)."""
+
+    caloriesKcal = serializers.FloatField(required=False)
+    proteinG = serializers.FloatField(required=False)
+    carbsG = serializers.FloatField(required=False)
+    fatG = serializers.FloatField(required=False)
+    fiberG = serializers.FloatField(required=False)
 
 
 class ConfirmSerializer(serializers.Serializer):
     """POST /drafts/{id}/confirm. `idempotencyKey` guards logging - separate
     from `POST /messages`'s message-level idempotency (§12.1: "messageId
-    guards parsing, the confirm key guards logging")."""
+    guards parsing, the confirm key guards logging"). The remaining fields
+    are §12.12's queued-replay inputs, all optional - omitted, this behaves
+    exactly as it always has."""
 
     idempotencyKey = serializers.CharField(max_length=128)
     version = serializers.IntegerField(min_value=1)
+    # When the user actually ate, not when this call reached the server -
+    # drives which day the resulting LoggedMeal lands on, and the
+    # staleness/expiry checks below.
+    mealTimestamp = serializers.DateTimeField(required=False)
+    # Required alongside a `mealTimestamp` older than `STALE_QUEUE_AGE_DAYS`
+    # - see `common.exceptions.StaleOperationError`.
+    staleConfirmed = serializers.BooleanField(required=False, default=False)
+    nutritionSnapshot = NutritionSnapshotSerializer(required=False)
 
 
 class SendMessageSerializer(serializers.Serializer):
@@ -209,6 +243,10 @@ class DailyTotalsSerializer(serializers.Serializer):
 class ConfirmResponseSerializer(serializers.Serializer):
     loggedMeal = LoggedMealSerializer()
     dailyTotals = DailyTotalsSerializer()
+    # §12.5/§12.12 - true only when a supplied `nutritionSnapshot` differed
+    # from the server's freshly-recomputed total beyond the epsilon; always
+    # False on a plain online confirm (no snapshot sent at all).
+    recomputedFromClientSnapshot = serializers.BooleanField()
 
 
 class NeedsClarificationSerializer(serializers.Serializer):

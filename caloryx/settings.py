@@ -230,6 +230,24 @@ WELLBEING_RESOURCES = [
     },
 ]
 
+# --- Offline queue & sync (§12.12, Chunk 7) --------------------------------
+# Hard expiry - a queued op older than this is refused and surfaced for
+# review (§12.12), never silently processed.
+MAX_QUEUE_AGE_DAYS = int(env("MAX_QUEUE_AGE_DAYS", "30"))
+# Soft staleness gate - older than this needs an explicit confirmation flag.
+STALE_QUEUE_AGE_DAYS = int(env("STALE_QUEUE_AGE_DAYS", "7"))
+# REPLAY_WINDOW = MAX_QUEUE_AGE + a 1-day retry tail (§9) - deliberately
+# *derived*, not independently configurable: a shorter idempotency TTL than
+# the queue's own hard-expiry window is exactly the bug that motivated this
+# (a queued op replayed near the 30-day limit finding no idempotency record
+# and creating a duplicate meal). Used by every replay-relevant idempotency
+# record (the structured mutations + confirm) - NOT `POST /messages`, which
+# keeps its own 24h window since descriptive/AI input isn't a queueable
+# `opType` at all (§12.12).
+REPLAY_WINDOW_HOURS = (MAX_QUEUE_AGE_DAYS + 1) * 24
+# §12.5's "beyond epsilon" threshold for the catalog-drift note on confirm.
+NUTRITION_DRIFT_EPSILON_KCAL = float(env("NUTRITION_DRIFT_EPSILON_KCAL", "5"))
+
 # --- Guest sessions -------------------------------------------------------
 # Guest mode is not a Clerk concept, so we mint our own short-lived tokens.
 GUEST_TOKEN_TTL_DAYS = int(env("GUEST_TOKEN_TTL_DAYS", "180"))
