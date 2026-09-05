@@ -6,6 +6,7 @@ comparison), this owns reads and writes. Mirrors meals/repository.py.
 """
 from __future__ import annotations
 
+import statistics
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -196,3 +197,45 @@ def find_cached_message(user_id: str, normalized_hash: str) -> Optional[Any]:
 
 def create_parse_event(user_id: str, data: Dict[str, Any]) -> Any:
     return get_client().parseevent.create(data=dict(data, userId=user_id))
+
+
+# -- quantity-resolution ladder (Chunk 4b, §5.1.1a) --------------------------
+
+_RECENT_OBSERVATIONS_CAP = 10
+
+
+def get_serving_preference(user_id: str, food_id: str, state: str) -> Optional[Any]:
+    return get_client().userservingpreference.find_unique(
+        where={"userId_foodId_state": {"userId": user_id, "foodId": food_id, "state": state}}
+    )
+
+
+def record_serving_observation(user_id: str, food_id: str, state: str, grams: float) -> Any:
+    """Every EXPLICIT resolved item's write-back into the user's serving
+    history (§5.1.1a: "every portion edit writes to a per-user serving
+    profile"). `recentGrams` is capped at the last 10 observations so
+    `medianGrams` is a literal median-of-recent-logs, computed here rather
+    than via a raw SQL aggregate - Postgres has no portable median, and the
+    array is small enough that Python is simpler."""
+    existing = get_serving_preference(user_id, food_id, state)
+    if existing is None:
+        return get_client().userservingpreference.create(
+            data={
+                "userId": user_id,
+                "foodId": food_id,
+                "state": state,
+                "recentGrams": [grams],
+                "medianGrams": grams,
+                "observations": 1,
+            }
+        )
+
+    recent = (list(existing.recentGrams) + [grams])[-_RECENT_OBSERVATIONS_CAP:]
+    return get_client().userservingpreference.update(
+        where={"id": existing.id},
+        data={
+            "recentGrams": recent,
+            "medianGrams": statistics.median(recent),
+            "observations": len(recent),
+        },
+    )

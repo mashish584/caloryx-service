@@ -11,7 +11,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
+from .enums import FoodCategory
+
 _GRAM_UNITS = {"g": 1.0, "kg": 1000.0}
+
+# Quantity-resolution ladder (PRD §5.1.1a). Step 2's multiplier applies on top
+# of whichever base serving (step 3's `Food.defaultServingGrams`, or step 4's
+# category fallback below) ends up firing - "small"/"large" scale a serving,
+# they are never a serving amount on their own. A qualifier the model didn't
+# recognize (or none stated) is treated as "medium" (1.0x, a no-op).
+SIZE_QUALIFIER_MULTIPLIERS = {"small": 0.7, "medium": 1.0, "large": 1.4}
+
+# Ladder step 4 - a flat default for a food with no `defaultServingGrams`
+# catalogued yet. Literal values per §5.1.1a; revisit only alongside a
+# curation pass, not per-code-change.
+CATEGORY_FALLBACK_GRAMS = {
+    FoodCategory.GRAIN: 150.0,
+    FoodCategory.PROTEIN: 100.0,
+    FoodCategory.VEGETABLE: 80.0,
+    FoodCategory.DRESSING: 20.0,
+    FoodCategory.OIL: 5.0,
+}
 
 
 class UnknownServingUnitError(Exception):

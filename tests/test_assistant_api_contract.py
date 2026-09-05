@@ -45,6 +45,8 @@ def make_food(**overrides):
         carbsGPer100g=28.2,
         fatGPer100g=0.3,
         fiberGPer100g=0.4,
+        defaultServingGrams=None,
+        category=None,
         servingUnits=[SimpleNamespace(unit="katori", grams=150.0, type="HOUSEHOLD")],
     )
     fields.update(overrides)
@@ -146,6 +148,8 @@ def test_creating_a_draft_returns_the_computed_totals(client, guest, monkeypatch
     monkeypatch.setattr(
         assistant_repository, "get_or_create_today_session", lambda user_id: SimpleNamespace(id="session-1")
     )
+    monkeypatch.setattr(assistant_repository, "get_serving_preference", lambda *a, **kw: None)
+    monkeypatch.setattr(assistant_repository, "record_serving_observation", lambda *a, **kw: None)
 
     def create_draft_with_expiry_check(user_id, session_id, draft_data, items_data):
         item = make_item(food, **{k: v for k, v in items_data[0].items() if k != "foodId"})
@@ -300,6 +304,8 @@ def test_sending_a_message_creates_a_draft_from_text(client, guest, monkeypatch)
         "create_chat_message",
         lambda session_id, user_id, data: SimpleNamespace(id="msg-1", **data),
     )
+    monkeypatch.setattr(assistant_repository, "get_serving_preference", lambda *a, **kw: None)
+    monkeypatch.setattr(assistant_repository, "record_serving_observation", lambda *a, **kw: None)
 
     def create_draft_with_expiry_check(user_id, session_id, draft_data, items_data):
         item = make_item(food, **{k: v for k, v in items_data[0].items() if k != "foodId"})

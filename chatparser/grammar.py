@@ -60,6 +60,12 @@ class ParsedItemPhrase:
     state: Optional[str]  # "RAW" | "COOKED" | None
     prep: Optional[str]
     food_text: str
+    # Provenance overrides (AI Meal Assistant PRD §5.1.1a, Chunk 4b) - every T1
+    # match is stated/direct, so these defaults reproduce today's behavior
+    # exactly. A quantity-resolution-ladder-produced phrase (assistant.services)
+    # sets both explicitly instead of leaving them to be inferred from `unit`.
+    quantity_source: str = "EXPLICIT"
+    mass_source: Optional[str] = None
 
 
 @dataclass(frozen=True)

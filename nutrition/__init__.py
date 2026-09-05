@@ -8,16 +8,25 @@ structural half of the PRD's header principle - "the nutrition database
 determines what a meal contains" - that this package exists to enforce.
 """
 from .calculator import NutrientVector, NutritionError, ZERO_VECTOR, apply_yield, item_nutrition, sum_nutrition
-from .enums import FoodSource, FoodState, LoggedMealSource, MealSlot, ServingUnitType
-from .units import ServingUnit, UnknownServingUnitError, resolve_grams
+from .enums import FoodCategory, FoodSource, FoodState, LoggedMealSource, MealSlot, ServingUnitType
+from .units import (
+    CATEGORY_FALLBACK_GRAMS,
+    SIZE_QUALIFIER_MULTIPLIERS,
+    ServingUnit,
+    UnknownServingUnitError,
+    resolve_grams,
+)
 
 __all__ = [
+    "CATEGORY_FALLBACK_GRAMS",
+    "FoodCategory",
     "FoodSource",
     "FoodState",
     "LoggedMealSource",
     "MealSlot",
     "NutrientVector",
     "NutritionError",
+    "SIZE_QUALIFIER_MULTIPLIERS",
     "ServingUnit",
     "ServingUnitType",
     "UnknownServingUnitError",

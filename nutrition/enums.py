@@ -36,3 +36,14 @@ class MealSlot(StrEnum):
 class LoggedMealSource(StrEnum):
     MANUAL = "MANUAL"
     CHAT_AI = "CHAT_AI"
+
+
+class FoodCategory(StrEnum):
+    """Quantity-resolution ladder step 4's fallback bucket (PRD §5.1.1a) -
+    grams per category live in `nutrition.units.CATEGORY_FALLBACK_GRAMS`."""
+
+    GRAIN = "GRAIN"
+    PROTEIN = "PROTEIN"
+    VEGETABLE = "VEGETABLE"
+    DRESSING = "DRESSING"
+    OIL = "OIL"

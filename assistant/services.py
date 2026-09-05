@@ -32,7 +32,13 @@ from llm.prompts import SYSTEM_PROMPT
 from meals import repository as meals_repository
 from meals import services as meals_services
 from meals.serializers import serialize_logged_meal
-from nutrition import ZERO_VECTOR, NutrientVector, sum_nutrition
+from nutrition import (
+    CATEGORY_FALLBACK_GRAMS,
+    SIZE_QUALIFIER_MULTIPLIERS,
+    ZERO_VECTOR,
+    NutrientVector,
+    sum_nutrition,
+)
 
 from . import repository
 from .serializers import (
@@ -141,6 +147,26 @@ def _load_open_draft_for_mutation(user_id: str, draft_id: str, version: int) -> 
     return draft
 
 
+# -- quantity-resolution ladder write-back (Chunk 4b, §5.1.1a) ---------------
+
+
+def _record_serving_observations(user_id: str, items_payload: List[Dict[str, Any]]) -> None:
+    """"Every portion edit writes to a per-user serving profile" (§5.1.1a).
+    Called from every choke point a `MealDraftItem` payload is actually
+    persisted through (create, add, and edit), so it fires regardless of
+    which surface produced the item. An `ASSUMED` item is the ladder's own
+    guess, not a real observation - recording it back would let a wrong
+    guess reinforce itself, so only `EXPLICIT` (stated) items count."""
+    for item_payload in items_payload:
+        if item_payload.get("resolution") != "RESOLVED":
+            continue
+        if item_payload.get("quantitySource") != "EXPLICIT":
+            continue
+        repository.record_serving_observation(
+            user_id, item_payload["foodId"], item_payload["state"], item_payload["grams"]
+        )
+
+
 # -- draft lifecycle ----------------------------------------------------------
 
 
@@ -171,6 +197,7 @@ def _create_draft_from_items(
     if created is None:
         existing = repository.get_open_draft(user_id)
         raise OpenDraftExistsError(details={"draft": serialize_draft(existing)})
+    _record_serving_observations(user_id, items_payload)
     return created
 
 
@@ -232,6 +259,7 @@ def _add_item_payload(user_id: str, draft_id: str, item_payload: Dict[str, Any])
     ADD_ITEM both do that themselves before reaching here, since they resolve
     the item differently (exact `foodId` vs. a fuzzy-matched food name)."""
     repository.create_draft_item(draft_id, item_payload)
+    _record_serving_observations(user_id, [item_payload])
     return _recompute_totals(user_id, draft_id, bump_version=True)
 
 
@@ -265,6 +293,7 @@ def update_draft_item(
     # against (§5.2.1) - fixed at creation, never moved by an edit.
     patch.pop("defaultGrams")
     repository.update_draft_item(item_id, patch)
+    _record_serving_observations(user_id, [patch])
 
     updated = _recompute_totals(user_id, draft_id, bump_version=True)
     logger.info("draft item updated user=%s draft=%s item=%s", user_id, draft_id, item_id)
@@ -396,7 +425,10 @@ def _resolve_composite_by_name(query: str) -> Optional[Any]:
 
 
 def _expand_composite(
-    composite: Any, quantity: float
+    composite: Any,
+    quantity: float,
+    quantity_source: str = "EXPLICIT",
+    mass_source: str = "DIRECT",
 ) -> List[Tuple[Dict[str, Any], NutrientVector]]:
     """A matched dish + a serving count -> one `RESOLVED` payload per
     component. Each component's mass is `quantity * composite.servingGrams *
@@ -423,8 +455,8 @@ def _expand_composite(
             "state": resolved["state"],
             "defaultGrams": resolved["grams"],
             "prep": component.prep,
-            "quantitySource": "EXPLICIT",
-            "massSource": "DIRECT",
+            "quantitySource": quantity_source,
+            "massSource": mass_source,
             # The *dish* was matched, not this component individually -
             # attributing a fuzzy score to it would misrepresent what
             # actually happened.
@@ -453,7 +485,12 @@ def _build_items_from_phrase(
             len(composite.components),
             composite.isCurated,
         )
-        return _expand_composite(composite, phrase.quantity)
+        return _expand_composite(
+            composite,
+            phrase.quantity,
+            quantity_source=phrase.quantity_source,
+            mass_source=phrase.mass_source or "DIRECT",
+        )
 
     food, score, band = _resolve_food_by_name(phrase.food_text)
     if food is None or band == "LOW":
@@ -476,8 +513,8 @@ def _build_items_from_phrase(
         "state": resolved["state"],
         "defaultGrams": resolved["grams"],
         "prep": phrase.prep,
-        "quantitySource": "EXPLICIT",
-        "massSource": _mass_source(resolved["unit"]),
+        "quantitySource": phrase.quantity_source,
+        "massSource": phrase.mass_source or _mass_source(resolved["unit"]),
         "matchScore": score,
         "matchBand": band,
     }
@@ -728,6 +765,86 @@ def _call_t2(user_id: str, content: str) -> Optional[Dict[str, Any]]:
     return envelope
 
 
+def _resolve_assumed_grams(
+    food: Any, state: Optional[str], size_qualifier: Optional[str], user_id: str
+) -> Optional[Tuple[float, str]]:
+    """Quantity-resolution ladder (§5.1.1a) for an already-matched food with
+    no stated amount - first match wins:
+    1. This user's own history for this food+state, once it has >=3 recent
+       observations (a size qualifier this message is ignored when history
+       fires - a personal, already-calibrated number beats a generic
+       small/large modifier).
+    2. The food's canonical serving (`defaultServingGrams`) or, absent that,
+       a flat category default (`CATEGORY_FALLBACK_GRAMS`) - whichever base
+       applies, scaled by the stated size qualifier (0.7x/1.0x/1.4x, a no-op
+       when none was stated).
+    Returns `None` when neither the user's history nor the catalog has
+    anything to assume - the caller reports the item unconsumed, the same
+    honest fallback used everywhere a food can't be resolved."""
+    pref = repository.get_serving_preference(user_id, food.id, state or "UNSPECIFIED")
+    if pref is not None and len(pref.recentGrams) >= 3:
+        return pref.medianGrams, "USER_HISTORY"
+
+    base = food.defaultServingGrams
+    mass_source = "CATALOG_SERVING"
+    if base is None:
+        base = CATEGORY_FALLBACK_GRAMS.get(food.category)
+        mass_source = "CATEGORY_FALLBACK"
+    if base is None:
+        return None
+
+    multiplier = SIZE_QUALIFIER_MULTIPLIERS.get(size_qualifier, 1.0)
+    return base * multiplier, mass_source
+
+
+def _resolve_llm_item_without_quantity(
+    llm_item: Dict[str, Any], user_id: str
+) -> List[Tuple[Dict[str, Any], NutrientVector]]:
+    """A T2 item with no stated quantity/unit -> the quantity-resolution
+    ladder, applied to whichever food/composite its name matches. A
+    composite defaults to one serving (scaled by any stated size qualifier)
+    since it already carries its own canonical `servingGrams` - it never
+    touches `UserServingPreference`/`Food.category`, both per-`Food`
+    concepts. Returns `[]` when nothing matches, or a matched food's ladder
+    has nothing to assume - the caller reports the item unconsumed, exactly
+    like any other unresolvable mention."""
+    food_text = llm_item["food"]
+    size_qualifier = llm_item.get("sizeQualifier")
+    multiplier = SIZE_QUALIFIER_MULTIPLIERS.get(size_qualifier, 1.0)
+
+    composite = _resolve_composite_by_name(food_text)
+    if composite is not None:
+        return _expand_composite(
+            composite, 1.0 * multiplier, quantity_source="ASSUMED", mass_source="CATALOG_SERVING"
+        )
+
+    food, score, band = _resolve_food_by_name(food_text)
+    if food is None or band == "LOW":
+        meals_repository.file_food_miss(food_text)
+        return []
+
+    state = llm_item.get("state")
+    normalized_state = state.upper() if state else None
+    assumed = _resolve_assumed_grams(food, normalized_state, size_qualifier, user_id)
+    if assumed is None:
+        # The food matched fine - it's the serving data that's missing, not
+        # the food itself, so this is not a miss-queue case.
+        return []
+    grams, mass_source = assumed
+
+    phrase = chatparser.ParsedItemPhrase(
+        raw_text=food_text,
+        quantity=grams,
+        unit="g",
+        state=normalized_state,
+        prep=llm_item.get("prep"),
+        food_text=food_text,
+        quantity_source="ASSUMED",
+        mass_source=mass_source,
+    )
+    return _build_items_from_phrase(phrase)
+
+
 def _llm_item_to_phrase(llm_item: Dict[str, Any]) -> Optional["chatparser.ParsedItemPhrase"]:
     """One validated envelope item -> the same `ParsedItemPhrase` T1's own
     regex grammar already produces, when the model reported a quantity *and*
@@ -737,9 +854,10 @@ def _llm_item_to_phrase(llm_item: Dict[str, Any]) -> Optional["chatparser.Parsed
     every convertible item flow through the unmodified
     `_build_items_from_phrase` (composite matching, confidence banding,
     miss-queue filing - all of it) with zero new resolution code. Returns
-    `None` when quantity/unit is missing or unrecognized - treated the same
-    as any other unresolvable item until Chunk 4b's quantity-resolution
-    ladder can do better."""
+    `None` when quantity/unit is missing or unrecognized - the caller
+    (`_process_t2_new_meal`) falls back to `_resolve_llm_item_without_quantity`
+    (the quantity-resolution ladder) instead of reporting it unconsumed
+    outright."""
     quantity = llm_item.get("quantity")
     unit_text = llm_item.get("unit")
     if quantity is None or not unit_text:
@@ -763,19 +881,27 @@ def _process_t2_new_meal(
     user_id: str, envelope: Dict[str, Any], t1_unconsumed: List[str]
 ) -> _Outcome:
     """A validated `LOG_NEW` envelope with >=1 item -> the same draft-creation
-    core the T1 path uses. An item with no usable quantity+unit reports its
-    food name as unconsumed text rather than being resolved (no
-    quantity-resolution ladder until Chunk 4b)."""
+    core the T1 path uses. An item with a stated quantity+unit resolves via
+    `_llm_item_to_phrase`; one without falls to the quantity-resolution
+    ladder (`_resolve_llm_item_without_quantity`, §5.1.1a) before finally
+    being reported unconsumed."""
     items_payload: List[Dict[str, Any]] = []
     vectors: List[NutrientVector] = []
     unconsumed: List[str] = list(t1_unconsumed)
 
     for llm_item in envelope["items"]:
         phrase = _llm_item_to_phrase(llm_item)
-        if phrase is None:
+        if phrase is not None:
+            for item_payload, vector in _build_items_from_phrase(phrase):
+                items_payload.append(item_payload)
+                vectors.append(vector)
+            continue
+
+        ladder_items = _resolve_llm_item_without_quantity(llm_item, user_id)
+        if not ladder_items:
             unconsumed.append(llm_item["food"])
             continue
-        for item_payload, vector in _build_items_from_phrase(phrase):
+        for item_payload, vector in ladder_items:
             items_payload.append(item_payload)
             vectors.append(vector)
 

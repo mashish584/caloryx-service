@@ -4,6 +4,9 @@ from __future__ import annotations
 import pytest
 
 from nutrition import (
+    CATEGORY_FALLBACK_GRAMS,
+    SIZE_QUALIFIER_MULTIPLIERS,
+    FoodCategory,
     FoodState,
     NutrientVector,
     NutritionError,
@@ -133,3 +136,19 @@ def test_resolve_grams_rejects_an_undeclared_unit():
     undeclared unit must fail rather than silently assume grams."""
     with pytest.raises(UnknownServingUnitError):
         resolve_grams(1.0, "cup", [])
+
+
+# -- quantity-resolution ladder lookup tables (§5.1.1a, Chunk 4b) -------------
+
+
+def test_size_qualifier_multipliers_cover_small_medium_large():
+    assert SIZE_QUALIFIER_MULTIPLIERS == {"small": 0.7, "medium": 1.0, "large": 1.4}
+
+
+def test_category_fallback_grams_covers_every_food_category():
+    assert set(CATEGORY_FALLBACK_GRAMS) == set(FoodCategory)
+    assert CATEGORY_FALLBACK_GRAMS[FoodCategory.GRAIN] == 150.0
+    assert CATEGORY_FALLBACK_GRAMS[FoodCategory.PROTEIN] == 100.0
+    assert CATEGORY_FALLBACK_GRAMS[FoodCategory.VEGETABLE] == 80.0
+    assert CATEGORY_FALLBACK_GRAMS[FoodCategory.DRESSING] == 20.0
+    assert CATEGORY_FALLBACK_GRAMS[FoodCategory.OIL] == 5.0

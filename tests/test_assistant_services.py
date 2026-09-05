@@ -43,6 +43,8 @@ def make_food(**overrides):
         carbsGPer100g=28.2,
         fatGPer100g=0.3,
         fiberGPer100g=0.4,
+        defaultServingGrams=None,
+        category=None,
         servingUnits=[serving_unit("katori", 150.0)],
     )
     fields.update(overrides)
@@ -159,6 +161,8 @@ def seam(monkeypatch):
         create_logged_meal_calls=0,
         messages=[],
         parse_events=[],
+        serving_preferences={},
+        record_serving_observation_calls=[],
     )
 
     # -- assistant.repository ------------------------------------------------
@@ -313,6 +317,35 @@ def seam(monkeypatch):
         return event
 
     monkeypatch.setattr(repository, "create_parse_event", create_parse_event)
+
+    # -- assistant.repository: quantity-resolution ladder (Chunk 4b) ---------
+
+    def get_serving_preference(user_id, food_id, pref_state):
+        return state.serving_preferences.get((user_id, food_id, pref_state))
+
+    monkeypatch.setattr(repository, "get_serving_preference", get_serving_preference)
+
+    def record_serving_observation(user_id, food_id, pref_state, grams):
+        import statistics as statistics_module
+
+        state.record_serving_observation_calls.append((user_id, food_id, pref_state, grams))
+        key = (user_id, food_id, pref_state)
+        existing = state.serving_preferences.get(key)
+        recent = (list(existing.recentGrams) if existing else []) + [grams]
+        recent = recent[-10:]
+        pref = SimpleNamespace(
+            id="pref-{}".format(len(state.serving_preferences) + 1) if existing is None else existing.id,
+            userId=user_id,
+            foodId=food_id,
+            state=pref_state,
+            recentGrams=recent,
+            medianGrams=statistics_module.median(recent),
+            observations=len(recent),
+        )
+        state.serving_preferences[key] = pref
+        return pref
+
+    monkeypatch.setattr(repository, "record_serving_observation", record_serving_observation)
 
     # -- meals.repository (confirm -> LoggedMeal handoff) --------------------
 
@@ -1153,3 +1186,161 @@ def test_derive_meal_name_picks_the_highest_calorie_resolved_item(seam):
 def test_derive_meal_name_falls_back_when_nothing_resolved():
     name = services._derive_meal_name([], [], None, "SNACK")
     assert name == "Snack meal"
+
+
+# -- quantity-resolution ladder (Chunk 4b, §5.1.1a) --------------------------
+
+
+def test_resolve_assumed_grams_prefers_user_history_over_a_stated_size_qualifier(seam):
+    food = make_food(id="food-rice", category="GRAIN")
+    seam.serving_preferences[("user-1", "food-rice", "COOKED")] = SimpleNamespace(
+        recentGrams=[100.0, 120.0, 110.0], medianGrams=110.0, observations=3
+    )
+
+    result = services._resolve_assumed_grams(food, "COOKED", "large", "user-1")
+
+    assert result == (110.0, "USER_HISTORY")
+
+
+def test_resolve_assumed_grams_ignores_history_below_three_observations(seam):
+    food = make_food(id="food-rice", category="GRAIN", defaultServingGrams=None)
+    seam.serving_preferences[("user-1", "food-rice", "COOKED")] = SimpleNamespace(
+        recentGrams=[100.0, 120.0], medianGrams=110.0, observations=2
+    )
+
+    grams, mass_source = services._resolve_assumed_grams(food, "COOKED", None, "user-1")
+
+    assert grams == pytest.approx(150.0)  # GRAIN category fallback, no history override
+    assert mass_source == "CATEGORY_FALLBACK"
+
+
+def test_resolve_assumed_grams_uses_canonical_serving_times_size_qualifier(seam):
+    food = make_food(id="food-roti", defaultServingGrams=40.0, category="GRAIN")
+
+    grams, mass_source = services._resolve_assumed_grams(food, None, "small", "user-1")
+
+    assert grams == pytest.approx(28.0)  # 40g * 0.7
+    assert mass_source == "CATALOG_SERVING"
+
+
+def test_resolve_assumed_grams_uses_category_fallback_times_size_qualifier(seam):
+    food = make_food(id="food-oil", defaultServingGrams=None, category="OIL")
+
+    grams, mass_source = services._resolve_assumed_grams(food, None, "large", "user-1")
+
+    assert grams == pytest.approx(7.0)  # 5g * 1.4
+    assert mass_source == "CATEGORY_FALLBACK"
+
+
+def test_resolve_assumed_grams_returns_none_when_nothing_to_assume(seam):
+    food = make_food(id="food-mystery", defaultServingGrams=None, category=None)
+
+    assert services._resolve_assumed_grams(food, None, None, "user-1") is None
+
+
+def test_send_message_t2_item_without_quantity_resolves_via_the_ladder(seam, monkeypatch):
+    chicken = make_food(
+        id="food-chicken",
+        name="Grilled Chicken Breast",
+        defaultState="COOKED",
+        rawToCookedYield=1.0,
+        servingUnits=[],
+        category="PROTEIN",
+    )
+    seam.foods["food-chicken"] = chicken
+    envelope = llm_envelope(items=[llm_item("grilled chicken breast", confidence=0.6)])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert response["tier"] == "LLM_SMALL"
+    assert response["intent"] == "LOG_NEW"
+    items = response["draft"]["items"]
+    assert len(items) == 1
+    item = items[0]
+    assert item["resolution"] == "RESOLVED"
+    assert item["quantitySource"] == "ASSUMED"
+    assert item["massSource"] == "CATEGORY_FALLBACK"
+    assert item["grams"] == pytest.approx(100.0)
+    # An ASSUMED item is the ladder's own guess, not a real observation.
+    assert seam.record_serving_observation_calls == []
+
+
+def test_send_message_t2_item_without_quantity_applies_a_size_qualifier(seam, monkeypatch):
+    oil = make_food(
+        id="food-oil",
+        name="Olive Oil",
+        defaultState="UNSPECIFIED",
+        rawToCookedYield=None,
+        servingUnits=[],
+        category="OIL",
+    )
+    seam.foods["food-oil"] = oil
+    envelope = llm_envelope(items=[llm_item("olive oil", size_qualifier="large", confidence=0.6)])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "a large drizzle of olive oil on my salad")
+
+    item = response["draft"]["items"][0]
+    assert item["grams"] == pytest.approx(7.0)  # 5g OIL fallback * 1.4
+    assert item["massSource"] == "CATEGORY_FALLBACK"
+
+
+def test_send_message_t2_quantity_less_composite_defaults_to_one_serving(seam, monkeypatch):
+    rice = make_food()
+    chicken = make_food(id="food-chicken", name="Grilled Chicken Breast")
+    seam.foods.update({"food-rice": rice, "food-chicken": chicken})
+    seam.composites["composite-1"] = make_composite(
+        name="Chicken Biryani",
+        aliases=["biryani"],
+        servingGrams=350.0,
+        components=[make_component(rice, 0.65), make_component(chicken, 0.30)],
+    )
+    envelope = llm_envelope(items=[llm_item("biryani", confidence=0.6)])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "I had some biryani for lunch today with friends")
+
+    items = response["draft"]["items"]
+    assert len(items) == 2
+    assert all(i["resolution"] == "RESOLVED" for i in items)
+    assert all(i["quantitySource"] == "ASSUMED" for i in items)
+    total_grams = sum(i["grams"] for i in items)
+    assert total_grams == pytest.approx(350.0 * 0.95)  # 1 serving, ratios sum to 0.95
+
+
+def test_send_message_t2_quantity_less_item_with_no_ladder_data_stays_unconsumed(seam, monkeypatch):
+    mystery = make_food(
+        id="food-mystery", name="Mystery Paste", defaultServingGrams=None, category=None, servingUnits=[]
+    )
+    seam.foods["food-mystery"] = mystery
+    envelope = llm_envelope(items=[llm_item("mystery paste", confidence=0.4)])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "some mystery paste on the side today please")
+
+    assert response["draft"] is None
+    assert response["tier"] == "LLM_SMALL"
+    assert response["intent"] == "OTHER"
+    assert "mystery paste" in response["unconsumedText"]
+
+
+def test_explicit_structured_create_records_a_serving_observation(seam):
+    create_lunch_draft(seam, quantity=200.0)  # 200g rice, food-rice, state COOKED
+
+    assert seam.record_serving_observation_calls == [("user-1", "food-rice", "COOKED", 200.0)]
+
+
+def test_explicit_t1_text_log_records_a_serving_observation(seam):
+    send(seam, "200g rice")
+
+    assert seam.record_serving_observation_calls == [("user-1", "food-rice", "COOKED", 200.0)]
+
+
+def test_explicit_edit_item_correction_records_a_serving_observation(seam):
+    create_lunch_draft(seam)  # 200g rice
+    seam.record_serving_observation_calls.clear()  # drop the create's own observation
+
+    send(seam, "rice was actually 100g", client_message_id="m2")
+
+    assert seam.record_serving_observation_calls == [("user-1", "food-rice", "COOKED", 100.0)]

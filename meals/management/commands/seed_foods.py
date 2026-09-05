@@ -24,6 +24,7 @@ FOODS = [
         "carbsGPer100g": 28.2,
         "fatGPer100g": 0.3,
         "fiberGPer100g": 0.4,
+        "category": "GRAIN",  # ladder step 4 covers this; no defaultServingGrams needed
         "servingUnits": [
             {"unit": "katori", "grams": 150.0, "type": "HOUSEHOLD"},
             {"unit": "cup", "grams": 158.0, "type": "HOUSEHOLD"},
@@ -39,6 +40,7 @@ FOODS = [
         "carbsGPer100g": 0.0,
         "fatGPer100g": 3.6,
         "fiberGPer100g": 0.0,
+        "category": "PROTEIN",
         "servingUnits": [],
     },
     {
@@ -51,6 +53,10 @@ FOODS = [
         "carbsGPer100g": 56.0,
         "fatGPer100g": 4.6,
         "fiberGPer100g": 8.0,
+        # A roti's own countable unit (40g) is a better canonical serving than
+        # the flat grain-category default - ladder step 3, not step 4.
+        "defaultServingGrams": 40.0,
+        "category": "GRAIN",
         "servingUnits": [{"unit": "piece", "grams": 40.0, "type": "COUNTABLE"}],
     },
     {
@@ -63,6 +69,7 @@ FOODS = [
         "carbsGPer100g": 20.0,
         "fatGPer100g": 0.4,
         "fiberGPer100g": 5.0,
+        "category": "PROTEIN",
         "servingUnits": [{"unit": "katori", "grams": 150.0, "type": "HOUSEHOLD"}],
     },
     {
@@ -75,6 +82,8 @@ FOODS = [
         "carbsGPer100g": 1.1,
         "fatGPer100g": 11.0,
         "fiberGPer100g": 0.0,
+        "defaultServingGrams": 50.0,  # one egg - its own countable unit
+        "category": "PROTEIN",
         "servingUnits": [{"unit": "piece", "grams": 50.0, "type": "COUNTABLE"}],
     },
     {
@@ -87,6 +96,9 @@ FOODS = [
         "carbsGPer100g": 22.8,
         "fatGPer100g": 0.3,
         "fiberGPer100g": 2.6,
+        # Fruit has no bucket in §5.1.1a's category-fallback table - only its
+        # own canonical serving (step 3) is set; `category` stays unset.
+        "defaultServingGrams": 118.0,
         "servingUnits": [{"unit": "piece", "grams": 118.0, "type": "COUNTABLE"}],
     },
     {
@@ -99,6 +111,7 @@ FOODS = [
         "carbsGPer100g": 0.0,
         "fatGPer100g": 100.0,
         "fiberGPer100g": 0.0,
+        "category": "OIL",
         "servingUnits": [
             {"unit": "tbsp", "grams": 13.5, "type": "HOUSEHOLD"},
             {"unit": "tsp", "grams": 4.5, "type": "HOUSEHOLD"},
@@ -114,6 +127,7 @@ FOODS = [
         "carbsGPer100g": 3.6,
         "fatGPer100g": 0.4,
         "fiberGPer100g": 2.2,
+        "category": "VEGETABLE",
         "servingUnits": [{"unit": "cup", "grams": 30.0, "type": "HOUSEHOLD"}],
     },
 ]

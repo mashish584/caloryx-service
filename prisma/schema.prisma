@@ -80,6 +80,7 @@ model User {
   mealDrafts   MealDraft[]
   chatMessages ChatMessage[]
   parseEvents  ParseEvent[]
+  servingPreferences UserServingPreference[]
 
   @@index([isGuest, createdAt])
 }
@@ -256,15 +257,39 @@ model Food {
   sodiumMgPer100g      Float?
   cholesterolMgPer100g Float?
 
+  // Quantity-resolution ladder, steps 3-4 (AI Meal Assistant PRD §5.1.1a). Both
+  // nullable - missing is a real state ("no serving data for this food yet"),
+  // not zero, so the ladder falls through to the next step rather than
+  // assuming a bogus amount. `defaultServingGrams` is the food's own
+  // canonical/USDA/package serving (step 3); `category` drives the flat
+  // category fallback (step 4, `nutrition.units.CATEGORY_FALLBACK_GRAMS`)
+  // when even that isn't catalogued.
+  defaultServingGrams Float?
+  category            FoodCategory?
+
   servingUnits             FoodServingUnit[]
   loggedMealItems          LoggedMealItem[]
   mealDraftItems           MealDraftItem[]
   compositeFoodComponents  CompositeFoodComponent[]
+  servingPreferences       UserServingPreference[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([name])
+}
+
+/// Ladder step 4's fallback bucket (§5.1.1a) - a coarse default for a food with
+/// no `defaultServingGrams` yet. Grams per category live in
+/// `nutrition.units.CATEGORY_FALLBACK_GRAMS`, not here - this enum is only the
+/// classification; the numbers are pure/dependency-free like the rest of
+/// `nutrition`.
+enum FoodCategory {
+  GRAIN
+  PROTEIN
+  VEGETABLE
+  DRESSING
+  OIL
 }
 
 /// Household/countable measures, defined per food (§8) - a cup of rice and a
@@ -725,8 +750,8 @@ model ParseEvent {
   inputHash      String
   tier           ParseTier
   intent         ChatIntent
-  // False for every row in Chunk 4a - there is no quota to count against yet
-  // (Chunk 4b). Not a bug: a schema-accurate placeholder, same pattern as
+  // False for every row through Chunk 4b - there is no quota to count against
+  // yet (Chunk 4c). Not a bug: a schema-accurate placeholder, same pattern as
   // Chunk 2a's `ParseTier.MANUAL`.
   countedToQuota Boolean    @default(false)
   model          String?
@@ -735,8 +760,8 @@ model ParseEvent {
   costMicros     Int?
   latencyMs      Int
   confidence     Float
-  // Not updated by anything in Chunk 4a - populating these needs tracking a
-  // pre-confirm edit and a completed confirm, which is Chunk 4b or a later
+  // Not updated by anything through Chunk 4b - populating these needs
+  // tracking a pre-confirm edit and a completed confirm, which is a later
   // observability pass. Documented gap, not a silent one.
   wasCorrected   Boolean    @default(false)
   wasLogged      Boolean    @default(false)
@@ -744,4 +769,33 @@ model ParseEvent {
 
   @@index([inputHash])
   @@index([userId, createdAt])
+}
+
+/// Per-user portion learning - the quantity-resolution ladder's step 1 and
+/// the feature's self-improvement loop (§5.1.1a): after a few weeks, a bare
+/// food mention resolves to *this user's* usual portion instead of a generic
+/// default. `recentGrams` is the actual observation history (oldest first,
+/// capped at 10 on write) so `medianGrams`/`observations` are a literal
+/// median-of-recent-logs, not an approximation with no underlying data.
+model UserServingPreference {
+  id           String    @id @default(cuid())
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId       String
+  food         Food      @relation(fields: [foodId], references: [id], onDelete: Cascade)
+  foodId       String
+  // Raw vs. cooked rice are different portions - keyed in, same reasoning as
+  // everywhere else `FoodState` appears on a draft item.
+  state        FoodState @default(UNSPECIFIED)
+  recentGrams  Float[]   @default([])
+  medianGrams  Float     @default(0)
+  observations Int       @default(0)
+  updatedAt    DateTime  @updatedAt
+
+  // Deliberately narrower than the PRD's `(userId, foodId, state, unit)` key -
+  // see the Chunk 4b plan for why `unit` is dropped (the ladder only ever
+  // fires when no unit was stated, so there's nothing to match it against)
+  // and why the PRD's coarser `(userId, foodId)`-only fallback below 3
+  // observations is not implemented (it reintroduces the raw/cooked
+  // conflation §16.6 flagged as a bug).
+  @@unique([userId, foodId, state])
 }
