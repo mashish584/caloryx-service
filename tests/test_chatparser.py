@@ -6,7 +6,10 @@ import pytest
 
 from chatparser import (
     band_for_score,
+    classify_t1_intent,
+    extract_nutrition_qa_food,
     hash_normalized,
+    is_diary_query_a_trend_question,
     is_non_food_greeting,
     normalize_text,
     parse_edit_command,
@@ -47,6 +50,85 @@ def test_greetings_are_caught(text):
 @pytest.mark.parametrize("text", ["200g rice", "chicken was actually 150g", "remove the dressing"])
 def test_food_shaped_text_is_not_caught(text):
     assert is_non_food_greeting(normalize_text(text)) is False
+
+
+# -- classify_t1_intent (Chunk 6a, §5.5) --------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("hi", "SOCIAL"),
+        ("thanks", "SOCIAL"),
+        ("how do i change my calorie goal", "APP_HELP"),
+        ("how does the streak work", "APP_HELP"),
+        ("how many calories do i have left", "DIARY_QUERY"),
+        ("what did i eat today", "DIARY_QUERY"),
+        ("how much protein is in an egg", "NUTRITION_QA"),
+        ("how many calories in chicken breast", "NUTRITION_QA"),
+        ("should i try keto", "ADVICE_SEEKING"),
+        ("is 1200 kcal enough for me", "ADVICE_SEEKING"),
+        ("do i have diabetes risk from this", "ADVICE_SEEKING"),
+        ("yes", "UNCLEAR"),
+        ("the usual", "UNCLEAR"),
+    ],
+)
+def test_classify_t1_intent_matches_the_expected_intent(text, expected):
+    assert classify_t1_intent(normalize_text(text)) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "200g rice",
+        "chicken was actually 150g",
+        "grilled chicken salad with a tahini dressing",
+        "asdfgh",  # gibberish is deliberately not detected - falls through
+    ],
+)
+def test_classify_t1_intent_returns_none_for_unrecognized_text(text):
+    assert classify_t1_intent(normalize_text(text)) is None
+
+
+def test_classify_t1_intent_never_misclassifies_a_real_food_mention():
+    # Real food words must never accidentally trip APP_HELP/UNCLEAR - the
+    # word-boundary matching (not substring) is what prevents "app" matching
+    # inside "happy" or "carb" inside "carbonated".
+    assert classify_t1_intent(normalize_text("is soda carbonated")) is None
+    assert classify_t1_intent(normalize_text("how do i make a happy meal")) is None
+
+
+def test_nutrition_qa_judgment_framing_is_not_nutrition_qa():
+    assert classify_t1_intent(normalize_text("is quinoa healthy")) is None
+    assert classify_t1_intent(normalize_text("what should i eat for dinner")) == "ADVICE_SEEKING"
+
+
+def test_nutrition_qa_trigger_without_extractable_food_is_still_nutrition_qa():
+    # "how many calories in" with nothing sensible after it still trips the
+    # loose trigger - extraction (answered separately) is allowed to fail.
+    intent = classify_t1_intent(normalize_text("how many calories are in this"))
+    assert intent == "NUTRITION_QA"
+
+
+def test_extract_nutrition_qa_food_pulls_out_the_food_name():
+    assert extract_nutrition_qa_food(normalize_text("how much protein is in an egg")) == "egg"
+    assert (
+        extract_nutrition_qa_food(normalize_text("how much protein is in chicken breast"))
+        == "chicken breast"
+    )
+
+
+def test_extract_nutrition_qa_food_returns_none_when_it_cant_parse_a_food():
+    assert extract_nutrition_qa_food(normalize_text("how many calories should i eat")) is None
+
+
+def test_diary_query_distinguishes_trend_questions_from_todays_data():
+    today = normalize_text("how many calories do i have left")
+    trend = normalize_text("how many calories did i eat this week")
+    assert classify_t1_intent(today) == "DIARY_QUERY"
+    assert is_diary_query_a_trend_question(today) is False
+    assert classify_t1_intent(trend) == "DIARY_QUERY"
+    assert is_diary_query_a_trend_question(trend) is True
 
 
 # -- T1 new-item grammar ---------------------------------------------------

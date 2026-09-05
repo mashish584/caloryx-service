@@ -23,6 +23,7 @@ from common.exceptions import (
 from engine.rounding import round_int
 from llm import LLMCallError, LLMResponse
 from meals import repository as meals_repository
+from onboarding import repository as onboarding_repository
 from nutrition import NutrientVector, item_nutrition
 
 REAL_PAST = datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -202,7 +203,10 @@ def seam(monkeypatch):
         global_cache_hit_calls=[],
         draft_operations=[],
         dish_category_profiles={},
+        profiles={},
     )
+
+    monkeypatch.setattr(onboarding_repository, "get_profile", lambda user_id, **kw: state.profiles.get(user_id))
 
     # -- assistant.repository ------------------------------------------------
 
@@ -796,7 +800,9 @@ def test_send_message_short_circuits_on_a_greeting_and_persists_both_messages(se
     response = send(seam, "hey there")
 
     assert response["tier"] == "PRECLASSIFIER"
-    assert response["intent"] == "OTHER"
+    # Chunk 6a: SOCIAL is now distinguished from OTHER (previously every
+    # T-1 short-circuit, greeting included, was tagged OTHER).
+    assert response["intent"] == "SOCIAL"
     assert response["draft"] is None
     assert len(seam.messages) == 2
     user_msg, assistant_msg = seam.messages
@@ -1236,14 +1242,19 @@ def test_send_message_t2_envelope_validation_failure_falls_back_gracefully(seam,
     assert seam.parse_events[0].model == "gpt-4o-mini"  # the call itself succeeded
 
 
-def test_send_message_t2_non_log_new_intent_falls_back_gracefully(seam, monkeypatch):
+def test_send_message_t2_other_intent_gets_the_scripted_reply(seam, monkeypatch):
+    """Chunk 6a: a T2-classified OTHER (or any of the other 6 non-logging
+    intents) now gets its real scripted handler, tagged with the tier that
+    actually produced the classification - previously (pre-6a) this fell
+    back to the generic PARSER/_NO_FOOD_REPLY fallback since nothing handled
+    a non-LOG_NEW envelope intent at all."""
     envelope = llm_envelope(intent="OTHER", items=[])
     stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
 
     response = send(seam, "grilled chicken salad with a tahini dressing")
 
     assert response["draft"] is None
-    assert response["tier"] == "PARSER"
+    assert response["tier"] == "LLM_SMALL"
     assert response["intent"] == "OTHER"
 
 
@@ -1918,3 +1929,128 @@ def test_confirm_draft_drops_an_estimated_dish_item_when_its_profile_is_gone(sea
     response = services.confirm_draft("user-1", created.id, "idem-1", created.version)
 
     assert response["loggedMeal"]["items"] == []
+
+
+# -- non-logging intents (Chunk 6a, §5.5) ------------------------------------
+
+
+def make_logged_meal_row(**overrides):
+    fields = dict(
+        caloriesKcal=500.0, proteinG=20.0, carbsG=50.0, fatG=10.0, fiberG=5.0,
+        loggedAt=datetime.now(timezone.utc),
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def make_plan(**overrides):
+    fields = dict(caloriesKcal=2000, proteinG=150, carbsG=200, fatG=60, fiberG=30)
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_send_message_app_help_intent(seam):
+    response = send(seam, "how do i change my calorie goal")
+
+    assert response["tier"] == "PRECLASSIFIER"
+    assert response["intent"] == "APP_HELP"
+    assert response["draft"] is None
+
+
+def test_send_message_advice_seeking_intent(seam):
+    response = send(seam, "should i try keto")
+
+    assert response["tier"] == "PRECLASSIFIER"
+    assert response["intent"] == "ADVICE_SEEKING"
+    assert response["draft"] is None
+
+
+def test_send_message_unclear_intent(seam):
+    response = send(seam, "yes")
+
+    assert response["tier"] == "PRECLASSIFIER"
+    assert response["intent"] == "UNCLEAR"
+
+
+def test_diary_query_with_no_meals_logged_today(seam):
+    response = send(seam, "how many calories do i have left")
+
+    assert response["intent"] == "DIARY_QUERY"
+    assert "haven't logged" in response["assistantText"].lower()
+
+
+def test_diary_query_reports_totals_without_a_plan(seam):
+    seam.logged_meals.append(make_logged_meal_row())
+
+    response = send(seam, "how many calories do i have left")
+
+    assert response["intent"] == "DIARY_QUERY"
+    assert "500" in response["assistantText"]
+
+
+def test_diary_query_reports_remaining_against_a_plan_target(seam):
+    seam.logged_meals.append(make_logged_meal_row())
+    seam.profiles["user-1"] = SimpleNamespace(plan=make_plan())
+
+    response = send(seam, "how many calories do i have left")
+
+    assert "500" in response["assistantText"]
+    assert "1500" in response["assistantText"]  # 2000 - 500
+
+
+def test_diary_query_trend_question_deep_links_to_insights(seam):
+    seam.logged_meals.append(make_logged_meal_row())
+
+    response = send(seam, "how many calories did i eat this week")
+
+    assert response["intent"] == "DIARY_QUERY"
+    assert "insights" in response["assistantText"].lower()
+
+
+def test_nutrition_qa_answers_a_high_confidence_match(seam):
+    response = send(seam, "how much protein is in cooked white rice")
+
+    assert response["intent"] == "NUTRITION_QA"
+    assert "Cooked White Rice" in response["assistantText"]
+    assert "per 100g" in response["assistantText"]
+
+
+def test_nutrition_qa_deflects_on_no_catalog_match(seam):
+    response = send(seam, "how much protein is in xyzzyplonk")
+
+    assert response["intent"] == "NUTRITION_QA"
+    assert "couldn't find" in response["assistantText"].lower()
+
+
+def test_send_message_t2_classifies_diary_query_when_t1_misses(seam, monkeypatch):
+    seam.logged_meals.append(make_logged_meal_row(caloriesKcal=300.0))
+    envelope = llm_envelope(intent="DIARY_QUERY", items=[])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "hows my day looking food wise")
+
+    assert response["tier"] == "LLM_SMALL"
+    assert response["intent"] == "DIARY_QUERY"
+    assert "300" in response["assistantText"]
+
+
+def test_send_message_t2_classifies_nutrition_qa_using_envelope_items(seam, monkeypatch):
+    envelope = llm_envelope(
+        intent="NUTRITION_QA", items=[llm_item("cooked white rice", confidence=0.8)]
+    )
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "tell me about the protein content of rice please")
+
+    assert response["tier"] == "LLM_SMALL"
+    assert response["intent"] == "NUTRITION_QA"
+    assert "Cooked White Rice" in response["assistantText"]
+
+
+def test_send_message_t2_non_logging_intent_does_not_refund_quota(seam, monkeypatch):
+    envelope = llm_envelope(intent="OTHER", items=[])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+
+    send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert seam.quota_counters["user-1"].count == 1

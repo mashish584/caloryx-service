@@ -28,11 +28,13 @@ from common.exceptions import (
     UnresolvableQuantityError,
 )
 from chatparser.units import UNIT_WORDS
+from engine.rounding import round_int
 from llm import LLMCallError, LLMConfigurationError, call_large_model, call_small_model
 from llm.prompts import SYSTEM_PROMPT
 from meals import repository as meals_repository
 from meals import services as meals_services
 from meals.serializers import serialize_logged_meal
+from onboarding import repository as onboarding_repository
 from nutrition import (
     CATEGORY_FALLBACK_GRAMS,
     SIZE_QUALIFIER_MULTIPLIERS,
@@ -74,6 +76,23 @@ _NO_FOOD_REPLY = "I couldn't work out what food that was — try naming the dish
 # dish whose item has no stated quantity+unit, or an unrecognized one (only
 # g/kg are meaningful for a dish with no serving-unit table of its own).
 _DISH_DEFAULT_SERVING_GRAMS = 300.0
+
+# -- non-logging intents (Chunk 6a, §5.5) - short, scripted, ends by pointing
+# back to logging or the right surface, per §5.5's own design principle.
+_APP_HELP_REPLY = (
+    "I'm just for logging meals — you can change goals, units, and reminders from "
+    "Settings, or check the Help Center for anything else."
+)
+_DIARY_QUERY_TREND_REPLY = "For trends over time, check Insights — I only answer for today here."
+_DIARY_QUERY_NO_MEALS_REPLY = "You haven't logged anything today yet — what did you eat?"
+_NUTRITION_QA_NO_FOOD_REPLY = "Tell me a specific food and I'll look up its numbers."
+_NUTRITION_QA_NOT_FOUND_REPLY = "I couldn't find that in the catalog — try searching for it in Meals."
+_ADVICE_SEEKING_REPLY = (
+    "I can't give dietary or medical advice — that's best discussed with a registered "
+    "dietitian or your doctor. I can help you log what you eat though!"
+)
+_UNCLEAR_REPLY = "Not sure I follow — what did you eat?"
+_OTHER_REPLY = "I stick to logging meals — what did you eat?"
 
 
 def _now() -> datetime:
@@ -1271,6 +1290,95 @@ def _replay_snapshot(
     )
 
 
+def _answer_diary_query(user_id: str, normalized: str) -> str:
+    """§5.5's DIARY_QUERY - a local database read, never a model call.
+    Cross-day/trend questions deep-link to Insights instead of answering
+    inline (§5.5: "cross-day trends or analysis -> deep link to Insights,
+    don't answer inline") - no date-range analysis is built here."""
+    if chatparser.is_diary_query_a_trend_question(normalized):
+        return _DIARY_QUERY_TREND_REPLY
+
+    totals = _daily_totals(user_id)
+    if totals.calories_kcal == 0:
+        return _DIARY_QUERY_NO_MEALS_REPLY
+
+    profile = onboarding_repository.get_profile(user_id)
+    if profile is None or profile.plan is None:
+        # Onboarding incomplete - a real, common state, not an error. Report
+        # what we know rather than a target that doesn't exist yet.
+        return "So far today: {} kcal.".format(round_int(totals.calories_kcal))
+
+    remaining = profile.plan.caloriesKcal - totals.calories_kcal
+    return "So far today: {} kcal — {} kcal left toward your {} kcal goal.".format(
+        round_int(totals.calories_kcal), round_int(remaining), profile.plan.caloriesKcal
+    )
+
+
+def _answer_nutrition_qa(food_text: Optional[str]) -> str:
+    """§5.5's NUTRITION_QA - catalog-bound, never a judgment (§5.5's own
+    dividing line: report what a food contains, never whether it's good for
+    this person). `food_text` comes from the T-1 path's own extraction
+    regex, or (T2 path) whatever food the model itself populated in
+    `items[0]` - `None` when neither found one, answered with a deflect
+    rather than a guess."""
+    if not food_text:
+        return _NUTRITION_QA_NO_FOOD_REPLY
+
+    food, _score, band = _resolve_food_by_name(food_text)
+    if food is None or band == "LOW":
+        return _NUTRITION_QA_NOT_FOUND_REPLY
+
+    return "{} (per 100g): {} kcal, {}g protein, {}g carbs, {}g fat.".format(
+        food.name,
+        round_int(food.caloriesKcalPer100g),
+        round_int(food.proteinGPer100g),
+        round_int(food.carbsGPer100g),
+        round_int(food.fatGPer100g),
+    )
+
+
+def _handle_non_logging_intent(
+    user_id: str,
+    intent: str,
+    normalized: str,
+    tier: str,
+    envelope: Optional[Dict[str, Any]] = None,
+) -> _Outcome:
+    """Every §5.5 intent except the 5 logging ones and `WELLBEING_FLAG`
+    (Chunk 6b) - none of these mutate a draft or touch quota (§5.1.4),
+    whether T-1 caught it directly (`envelope=None`) or a T2/T3 envelope was
+    classified this way after T-1 missed the phrasing."""
+    if intent == "DIARY_QUERY":
+        text = _answer_diary_query(user_id, normalized)
+    elif intent == "NUTRITION_QA":
+        food_text = chatparser.extract_nutrition_qa_food(normalized)
+        if not food_text and envelope is not None and envelope["items"]:
+            food_text = envelope["items"][0]["food"]
+        text = _answer_nutrition_qa(food_text)
+    elif intent == "APP_HELP":
+        text = _APP_HELP_REPLY
+    elif intent == "ADVICE_SEEKING":
+        text = _ADVICE_SEEKING_REPLY
+    elif intent == "SOCIAL":
+        text = _GREETING_REPLY
+    elif intent == "UNCLEAR":
+        text = _UNCLEAR_REPLY
+    else:  # OTHER
+        text = _OTHER_REPLY
+    return _Outcome(tier=tier, intent=intent, assistant_text=text)
+
+
+_NON_LOGGING_INTENTS = (
+    "DIARY_QUERY",
+    "APP_HELP",
+    "NUTRITION_QA",
+    "ADVICE_SEEKING",
+    "SOCIAL",
+    "UNCLEAR",
+    "OTHER",
+)
+
+
 def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _Outcome:
     cached = repository.find_cached_message(user_id, normalized_hash)
     if cached is not None:
@@ -1334,6 +1442,13 @@ def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _O
             if outcome.intent == "LOG_NEW" and outcome.parse_snapshot is not None:
                 repository.save_global_cache(normalized_hash, outcome.parse_snapshot)
             return outcome
+        if envelope is not None and envelope["intent"] in _NON_LOGGING_INTENTS:
+            # T-1's keyword classifier missed this phrasing, but T2/T3 caught
+            # it anyway - same handler, just tagged with the tier that
+            # actually produced it. No quota refund (see the Chunk 6a plan).
+            return _handle_non_logging_intent(
+                user_id, envelope["intent"], normalized, tier=tier_used, envelope=envelope
+            )
         return _Outcome(tier="PARSER", intent="OTHER", assistant_text=_NO_FOOD_REPLY, unconsumed_text=unconsumed)
 
     items_payload = []
@@ -1378,8 +1493,13 @@ def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _O
 def _process_message(
     user_id: str, normalized: str, normalized_hash: str, on_open_draft: Optional[str]
 ) -> _Outcome:
-    if chatparser.is_non_food_greeting(normalized):
-        return _Outcome(tier="PRECLASSIFIER", intent="OTHER", assistant_text=_GREETING_REPLY)
+    # Every non-logging intent (§5.5) makes sense regardless of draft state
+    # and never reaches the quota gate - checked first, before today's
+    # open-draft/edit dispatch, the same place the old greeting-only check
+    # used to run.
+    t1_intent = chatparser.classify_t1_intent(normalized)
+    if t1_intent is not None:
+        return _handle_non_logging_intent(user_id, t1_intent, normalized, tier="PRECLASSIFIER")
 
     open_draft = repository.get_open_draft(user_id)
     if open_draft is not None:

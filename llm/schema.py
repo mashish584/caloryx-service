@@ -7,11 +7,14 @@ fact. Strict mode requires every property to be listed in `required` (there is
 no true "optional key" - a field the model may omit is expressed as a
 nullable type instead) and `additionalProperties: false` on every object.
 
-Only the 6 `ChatIntent` members Chunk 2b defined are offered - the other 7
-don't exist anywhere else in this system yet either (Chunk 6).
+`intent`'s enum is the full `chatparser.ChatIntent` taxonomy minus
+`WELLBEING_FLAG` - held back until Chunk 6b actually implements its required
+behavior (§5.6), so the model is never offered a classification nothing
+handles yet.
 """
 from __future__ import annotations
 
+from chatparser import ChatIntent
 from nutrition import DishCategory
 
 _INTENT_ITEM_SCHEMA = {
@@ -41,7 +44,7 @@ INTENT_ENVELOPE_SCHEMA = {
     "properties": {
         "intent": {
             "type": "string",
-            "enum": ["LOG_NEW", "EDIT_ITEM", "ADD_ITEM", "REMOVE_ITEM", "SET_SLOT", "OTHER"],
+            "enum": [i.value for i in ChatIntent],
         },
         # Free text referring to an existing draft item - null for LOG_NEW.
         # Unused by anything in Chunk 4a (only LOG_NEW is acted on), kept in

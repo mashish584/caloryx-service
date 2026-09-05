@@ -682,12 +682,22 @@ enum ChatRole {
 /// NUTRITION_QA, ADVICE_SEEKING, WELLBEING_FLAG, SOCIAL, UNCLEAR) arrive with
 /// the full 13-intent taxonomy in Chunk 6. Until then, anything the T-1 gate
 /// doesn't recognise as food-parsing-shaped is tagged OTHER.
+/// The PRD's full 13-intent taxonomy (§5.5), minus WELLBEING_FLAG - held back
+/// deliberately until Chunk 6b actually implements its required behavior
+/// (§5.6), so the model is never offered a classification nothing handles
+/// yet.
 enum ChatIntent {
   LOG_NEW
   EDIT_ITEM
   ADD_ITEM
   REMOVE_ITEM
   SET_SLOT
+  DIARY_QUERY
+  APP_HELP
+  NUTRITION_QA
+  ADVICE_SEEKING
+  SOCIAL
+  UNCLEAR
   OTHER
 }
 

@@ -18,7 +18,17 @@ from .enums import (
 )
 from .grammar import ParsedEdit, ParsedItemPhrase, parse_edit_command, parse_new_item_phrases
 from .normalize import hash_normalized, normalize_text
-from .preclassifier import is_non_food_greeting
+from .preclassifier import (
+    classify_t1_intent,
+    extract_nutrition_qa_food,
+    is_advice_seeking,
+    is_app_help,
+    is_diary_query,
+    is_diary_query_a_trend_question,
+    is_non_food_greeting,
+    is_nutrition_qa,
+    is_unclear,
+)
 
 __all__ = [
     "ChatIntent",
@@ -34,8 +44,16 @@ __all__ = [
     "ParsedItemPhrase",
     "QuantitySource",
     "band_for_score",
+    "classify_t1_intent",
+    "extract_nutrition_qa_food",
     "hash_normalized",
+    "is_advice_seeking",
+    "is_app_help",
+    "is_diary_query",
+    "is_diary_query_a_trend_question",
     "is_non_food_greeting",
+    "is_nutrition_qa",
+    "is_unclear",
     "normalize_text",
     "parse_edit_command",
     "parse_new_item_phrases",

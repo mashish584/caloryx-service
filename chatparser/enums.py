@@ -59,13 +59,20 @@ class ChatRole(StrEnum):
 
 
 class ChatIntent(StrEnum):
-    """The 6 members Chunk 2b can produce. Chunk 6 adds the other 7 PRD
-    intents (DIARY_QUERY, APP_HELP, NUTRITION_QA, ADVICE_SEEKING,
-    WELLBEING_FLAG, SOCIAL, UNCLEAR) with the full 13-intent taxonomy."""
+    """The PRD's full 13-intent taxonomy (§5.5), minus WELLBEING_FLAG - held
+    back deliberately until Chunk 6b implements its required behavior
+    (§5.6), so nothing can classify a message that way before anything
+    handles it."""
 
     LOG_NEW = "LOG_NEW"
     EDIT_ITEM = "EDIT_ITEM"
     ADD_ITEM = "ADD_ITEM"
     REMOVE_ITEM = "REMOVE_ITEM"
     SET_SLOT = "SET_SLOT"
+    DIARY_QUERY = "DIARY_QUERY"
+    APP_HELP = "APP_HELP"
+    NUTRITION_QA = "NUTRITION_QA"
+    ADVICE_SEEKING = "ADVICE_SEEKING"
+    SOCIAL = "SOCIAL"
+    UNCLEAR = "UNCLEAR"
     OTHER = "OTHER"
