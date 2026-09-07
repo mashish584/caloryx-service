@@ -51,8 +51,15 @@ authx/          Identity: Clerk verification, guest tokens, claiming
 onboarding/     Profile / plan / complete endpoints + persistence
 common/         Prisma client lifecycle, error envelope, checks, health probes
 prisma/         schema.prisma (§7)
+documents/      High- and low-level flow diagrams (Mermaid)
 tests/          611 tests, none of which need a database
 ```
+
+[`documents/`](documents/) carries the flow diagrams: a
+[high-level view](documents/high-level-flow.md) of the components, the
+onboarding journey and the data model, and a
+[low-level view](documents/low-level-flow.md) of token routing, each endpoint
+call by call, and the engine pipeline.
 
 ---
 
