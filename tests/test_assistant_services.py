@@ -1747,6 +1747,29 @@ def test_send_message_does_not_escalate_to_t3_on_a_t2_call_failure(seam, monkeyp
     assert response["intent"] == "OTHER"
 
 
+@pytest.mark.parametrize("intent", ["DIARY_QUERY", "APP_HELP", "SOCIAL", "UNCLEAR", "OTHER"])
+def test_send_message_does_not_escalate_to_t3_for_a_non_logging_intent_with_empty_items(
+    seam, monkeypatch, intent
+):
+    """Regression: `_envelope_confidence` returns 0.0 for an empty items[] -
+    correct for LOG_NEW ("found nothing"), but every non-logging intent
+    (Chunk 6a) also legitimately reports empty items. Before this fix, that
+    0.0 always fell below `T3_ESCALATION_CONFIDENCE_THRESHOLD`, so every
+    non-logging message that reached T2 silently paid for a redundant T3
+    call too - found while verifying Chunk 8e, when a real OPENAI_API_KEY in
+    this environment's .env turned a latent bug into an actual, unmocked
+    network call in several unrelated tests (also fixed - see
+    tests/settings.py's OPENAI_API_KEY override)."""
+    envelope = llm_envelope(intent=intent, items=[])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
+    large_calls = stub_call_large_model(monkeypatch, result=stub_llm_response(envelope))
+
+    response = send(seam, "some message T-1's keyword classifier misses")
+
+    assert large_calls == []
+    assert response["tier"] == "LLM_SMALL"
+
+
 # -- conversational edits via AI + DraftOperation audit log (Chunk 5a) -------
 
 

@@ -26,5 +26,12 @@ CLERK_AUDIENCE = None
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
+# Same reasoning as DATABASE_URL above: a real key in the developer's own
+# .env must never leak into the suite. Every test that reaches `_call_llm`
+# monkeypatches `call_small_model`/`call_large_model` directly - a test that
+# forgets to should degrade via `LLMConfigurationError`, not silently make a
+# real, paid network call using whatever's in a local .env.
+OPENAI_API_KEY = ""
+
 MINIMUM_AGE_YEARS = 18
 MAXIMUM_AGE_YEARS = 100

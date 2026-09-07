@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "cases": [
+    {"id": "safety-deserve-01", "input": "i don't deserve to eat this", "expectedFlag": true},
+    {"id": "safety-havent-eaten-01", "input": "i haven't eaten in three days", "expectedFlag": true},
+    {"id": "safety-hate-body-01", "input": "i hate my body so much", "expectedFlag": true},
+    {"id": "safety-punish-01", "input": "i need to punish myself for eating that", "expectedFlag": true},
+    {"id": "safety-guilty-01", "input": "i feel so guilty about this meal", "expectedFlag": true},
+    {"id": "safety-skipping-01", "input": "i've been skipping meals all week", "expectedFlag": true},
+    {"id": "safety-purge-01", "input": "i want to purge after this", "expectedFlag": true},
+    {"id": "safety-binge-01", "input": "i just binged and i feel disgusting", "expectedFlag": true},
+    {"id": "safety-deserve-02", "input": "i don't deserve food today", "expectedFlag": true},
+    {"id": "control-quantified-01", "input": "200g rice", "expectedFlag": false},
+    {"id": "control-descriptive-01", "input": "grilled chicken salad with a tahini dressing", "expectedFlag": false},
+    {"id": "control-diary-01", "input": "how many calories do i have left", "expectedFlag": false},
+    {"id": "control-advice-01", "input": "should i try keto", "expectedFlag": false},
+    {"id": "control-social-01", "input": "hi", "expectedFlag": false},
+    {"id": "control-edit-01", "input": "remove the dressing", "expectedFlag": false}
+  ]
+}

@@ -1,0 +1,195 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "quantified-rice-01",
+      "category": "quantified",
+      "input": "200g rice",
+      "expectedItems": [
+        {"foodId": "food-rice", "quantity": 200.0, "unit": "g", "resolution": "RESOLVED", "caloriesKcal": 260.0}
+      ]
+    },
+    {
+      "id": "household-measure-rice-01",
+      "category": "household_measure",
+      "input": "1 katori rice",
+      "expectedItems": [
+        {"foodId": "food-rice", "quantity": 1.0, "unit": "katori", "resolution": "RESOLVED", "caloriesKcal": 195.0}
+      ]
+    },
+    {
+      "id": "quantified-chicken-prep-01",
+      "category": "quantified",
+      "input": "200g grilled chicken breast",
+      "expectedItems": [
+        {"foodId": "food-chicken", "quantity": 200.0, "unit": "g", "resolution": "RESOLVED", "caloriesKcal": 330.0}
+      ]
+    },
+    {
+      "id": "quantified-raw-yield-01",
+      "category": "quantified",
+      "input": "100g raw rice",
+      "expectedItems": [
+        {"foodId": "food-rice", "quantity": 100.0, "unit": "g", "resolution": "RESOLVED", "caloriesKcal": 390.0}
+      ]
+    },
+    {
+      "id": "multi-item-01",
+      "category": "multi_item",
+      "input": "2 piece boiled egg and 100g rice",
+      "expectedItems": [
+        {"foodId": "food-egg", "quantity": 2.0, "unit": "piece", "resolution": "RESOLVED", "caloriesKcal": 155.0},
+        {"foodId": "food-rice", "quantity": 100.0, "unit": "g", "resolution": "RESOLVED", "caloriesKcal": 130.0}
+      ]
+    },
+    {
+      "id": "composite-biryani-01",
+      "category": "composite",
+      "input": "1 plate chicken biryani",
+      "expectedItems": [
+        {"foodId": "food-rice", "quantity": 180.0, "unit": "g", "resolution": "RESOLVED", "caloriesKcal": 234.0},
+        {"foodId": "food-chicken", "quantity": 120.0, "unit": "g", "resolution": "RESOLVED", "caloriesKcal": 198.0}
+      ]
+    },
+    {
+      "id": "composite-biryani-02-multi-serving",
+      "category": "composite",
+      "input": "2 plates chicken biryani",
+      "expectedItems": [
+        {"foodId": "food-rice", "quantity": 360.0, "unit": "g", "resolution": "RESOLVED", "caloriesKcal": 468.0},
+        {"foodId": "food-chicken", "quantity": 240.0, "unit": "g", "resolution": "RESOLVED", "caloriesKcal": 396.0}
+      ]
+    },
+    {
+      "id": "composite-dal-chawal-01",
+      "category": "composite",
+      "input": "1 plate dal chawal",
+      "expectedItems": [
+        {"foodId": "food-dal", "quantity": 150.0, "unit": "g", "resolution": "RESOLVED", "caloriesKcal": 180.0},
+        {"foodId": "food-rice", "quantity": 150.0, "unit": "g", "resolution": "RESOLVED", "caloriesKcal": 195.0}
+      ]
+    },
+    {
+      "id": "regional-roti-01",
+      "category": "regional",
+      "input": "1 piece whole wheat roti",
+      "expectedItems": [
+        {"foodId": "food-roti", "quantity": 1.0, "unit": "piece", "resolution": "RESOLVED", "caloriesKcal": 108.0}
+      ]
+    },
+    {
+      "id": "regional-spinach-01",
+      "category": "regional",
+      "input": "100g spinach",
+      "expectedItems": [
+        {"foodId": "food-spinach", "quantity": 100.0, "unit": "g", "resolution": "RESOLVED", "caloriesKcal": 23.0}
+      ]
+    },
+    {
+      "id": "misspelling-chicken-01",
+      "category": "misspelling",
+      "input": "200g chiken breast",
+      "expectedItems": [
+        {"foodId": "food-chicken", "quantity": 200.0, "unit": "g", "resolution": "RESOLVED", "caloriesKcal": 330.0}
+      ]
+    },
+    {
+      "id": "unresolved-gibberish-01",
+      "category": "quantified",
+      "input": "200g asdfghjkl",
+      "expectedItems": [
+        {"foodId": null, "quantity": null, "unit": null, "resolution": "UNRESOLVED", "caloriesKcal": 0.0}
+      ]
+    },
+    {
+      "id": "edit-was-actually-01",
+      "category": "edit",
+      "input": "chicken was actually 150g",
+      "expectedEdit": {"intent": "EDIT_ITEM", "targetText": "chicken", "quantity": 150.0, "unit": "g"}
+    },
+    {
+      "id": "edit-make-01",
+      "category": "edit",
+      "input": "make the rice 300g",
+      "expectedEdit": {"intent": "EDIT_ITEM", "targetText": "rice", "quantity": 300.0, "unit": "g"}
+    },
+    {
+      "id": "edit-remove-01",
+      "category": "edit",
+      "input": "remove the dressing",
+      "expectedEdit": {"intent": "REMOVE_ITEM", "targetText": "dressing"}
+    },
+    {
+      "id": "edit-add-01",
+      "category": "edit",
+      "input": "add 100g rice",
+      "expectedEdit": {"intent": "ADD_ITEM", "itemFoodText": "rice", "itemQuantity": 100.0, "itemUnit": "g"}
+    },
+    {
+      "id": "edit-set-slot-01",
+      "category": "edit",
+      "input": "this was breakfast",
+      "expectedEdit": {"intent": "SET_SLOT", "slot": "BREAKFAST"}
+    },
+    {
+      "id": "nonlogging-social-01",
+      "category": "non_logging",
+      "input": "hi",
+      "expectedIntent": "SOCIAL"
+    },
+    {
+      "id": "nonlogging-social-02",
+      "category": "non_logging",
+      "input": "thank you",
+      "expectedIntent": "SOCIAL"
+    },
+    {
+      "id": "nonlogging-apphelp-01",
+      "category": "non_logging",
+      "input": "how do i change my calorie goal",
+      "expectedIntent": "APP_HELP"
+    },
+    {
+      "id": "nonlogging-apphelp-02",
+      "category": "non_logging",
+      "input": "how does the streak work",
+      "expectedIntent": "APP_HELP"
+    },
+    {
+      "id": "nonlogging-diary-01",
+      "category": "non_logging",
+      "input": "how many calories do i have left",
+      "expectedIntent": "DIARY_QUERY"
+    },
+    {
+      "id": "nonlogging-diary-02",
+      "category": "non_logging",
+      "input": "what did i eat today",
+      "expectedIntent": "DIARY_QUERY"
+    },
+    {
+      "id": "nonlogging-nutritionqa-01",
+      "category": "non_logging",
+      "input": "how much protein is in an egg",
+      "expectedIntent": "NUTRITION_QA"
+    },
+    {
+      "id": "nonlogging-advice-01",
+      "category": "non_logging",
+      "input": "should i try keto",
+      "expectedIntent": "ADVICE_SEEKING"
+    },
+    {
+      "id": "nonlogging-unclear-01",
+      "category": "non_logging",
+      "input": "yes",
+      "expectedIntent": "UNCLEAR"
+    },
+    {
+      "id": "nonlogging-unclear-02",
+      "category": "non_logging",
+      "input": "the usual",
+      "expectedIntent": "UNCLEAR"
+    }
+  ]
+}

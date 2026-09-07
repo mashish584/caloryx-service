@@ -1654,9 +1654,18 @@ def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _O
         )
         tier_used = "LLM_SMALL"
         t2_wellbeing = envelope is not None and envelope["intent"] == "WELLBEING_FLAG"
-        if envelope is not None and (
-            t2_wellbeing or _envelope_confidence(envelope) < settings.T3_ESCALATION_CONFIDENCE_THRESHOLD
-        ):
+        # Confidence-based escalation only means something for LOG_NEW, where
+        # an empty items[] genuinely signals "found nothing" - every
+        # non-logging intent (Chunk 6a) correctly reports an empty items[]
+        # too, which would otherwise make _envelope_confidence's 0.0 default
+        # spuriously trigger a T3 call on every single non-logging message
+        # that reaches T2 (§5.1.4: quota/cost discipline applies here too).
+        t2_low_confidence = (
+            envelope is not None
+            and envelope["intent"] == "LOG_NEW"
+            and _envelope_confidence(envelope) < settings.T3_ESCALATION_CONFIDENCE_THRESHOLD
+        )
+        if envelope is not None and (t2_wellbeing or t2_low_confidence):
             # T3 is a second opinion on a low-confidence T2 *success*, never
             # a rescue for a T2 *failure* (§7.1) - a failure already degrades
             # gracefully without compounding cost on what might be a
