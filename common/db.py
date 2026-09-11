@@ -78,21 +78,58 @@ def _import_prisma():
     return Prisma
 
 
+def _is_usable(client: "Prisma") -> bool:
+    """True only if the client has an engine that can still serve queries.
+
+    `Prisma.is_connected()` just checks that an engine object is attached, and
+    prisma leaves a dead one attached in two cases: a failed `connect()` (the
+    engine kills its process and closes its HTTP session, then re-raises) and
+    its own `atexit` stop. Trusting it turns the shared client into a zombie
+    that fails every query with `HTTPClientClosedError` until restart. Prisma
+    exposes no public liveness check, hence the private attributes.
+    """
+    if not client.is_connected():
+        return False
+    engine = getattr(client, "_internal_engine", None)
+    process = getattr(engine, "process", None)
+    if process is None or process.poll() is not None:
+        return False
+    session = getattr(engine, "session", None)
+    return not getattr(session, "closed", False)
+
+
+def _discard_engine() -> None:
+    """Detach and stop whatever engine the client holds so `connect()` starts clean."""
+    try:
+        _client.disconnect()
+    except Exception:  # noqa: BLE001 - the engine is already dead; nothing to salvage
+        logger.debug("error discarding dead prisma engine", exc_info=True)
+
+
 def get_client() -> "Prisma":
     """Return the shared, connected client, connecting on first use."""
     global _client
 
     client = _client
-    if client is not None and client.is_connected():
+    if client is not None and _is_usable(client):
         return client
 
     with _lock:
         if _client is None:
             prisma_cls = _import_prisma()
             _client = prisma_cls(auto_register=True)
-        if not _client.is_connected():
+        if not _is_usable(_client):
+            if _client.is_connected():
+                logger.warning("prisma engine is no longer usable; reconnecting")
+                _discard_engine()
             timeout = timedelta(seconds=settings.PRISMA_CONNECT_TIMEOUT_SECONDS)
-            _client.connect(timeout=timeout)
+            try:
+                _client.connect(timeout=timeout)
+            except Exception:
+                # Leave the client disconnected so the next request retries
+                # instead of inheriting the half-built engine.
+                _discard_engine()
+                raise
             logger.info("prisma client connected")
     return _client
 
