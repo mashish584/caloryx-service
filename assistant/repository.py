@@ -177,13 +177,18 @@ def save_idempotency_record(
 
 
 def create_chat_message(session_id: str, user_id: str, data: Dict[str, Any]) -> Any:
+    data = dict(data)
+    draft_id = data.pop("draftId", None)
     payload = dict(
         data,
         session={"connect": {"id": session_id}},
         user={"connect": {"id": user_id}},
     )
-    if "parseSnapshot" in payload and payload["parseSnapshot"] is not None:
-        payload["parseSnapshot"] = Json(payload["parseSnapshot"])
+    if draft_id is not None:
+        payload["draft"] = {"connect": {"id": draft_id}}
+    parse_snapshot = payload.pop("parseSnapshot", None)
+    if parse_snapshot is not None:
+        payload["parseSnapshot"] = Json(parse_snapshot)
     return get_client().chatmessage.create(data=payload)
 
 
