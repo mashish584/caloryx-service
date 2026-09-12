@@ -13,14 +13,19 @@ one from a different model", so an interrupted run just carries on, and
 changing `EMBEDDING_MODEL` re-embeds only what is now stale rather than
 truncating the column. Re-running a finished backfill is a no-op.
 
-**Open Food Facts is excluded by default.** It is the largest source by far
-(a full import is hundreds of thousands of branded rows) and the least
-valuable to embed - `_SOURCE_PRIORITY` already ranks it last precisely so
-plain text lands on generic data. Pass `--source open_food_facts` to include
-it, knowingly.
+**Open Food Facts is excluded by default**, but not for the reason you might
+assume. Measured against the live catalog (2026-09-12): 2,070,267 OFF rows vs
+14,615 generic (USDA + INDB). The *token* cost of embedding all of OFF is
+around $0.60 - not the obstacle. The obstacles are wall time (~8,000 provider
+round trips) and storage: 2.07M x 1536 float4 is ~12.7 GB of vector data
+before the HNSW index adds its own graph on top. Plus it is the least valuable
+source to embed - `_SOURCE_PRIORITY` already ranks it last precisely so plain
+text lands on generic data. Pass `--source open_food_facts` to include it,
+knowingly, and check the database's storage headroom first.
 
-Costs real money. `--dry-run` reports the row count and an estimate without
-calling the provider or writing anything.
+The default run is cheap: ~14.6k rows is roughly 175k tokens, well under a
+cent at text-embedding-3-small's list price. `--dry-run` reports the row count
+and an estimate without calling the provider or writing anything.
 """
 from __future__ import annotations
 

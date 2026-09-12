@@ -13,10 +13,12 @@ conditions change · ⚪ blocked on infra/data this environment doesn't have.
 
 ## Cross-cutting
 
-- 🔴 **Nothing has ever *written* to a real Postgres database or made a real OpenAI API call.**
-  One exception, added in Chunk 9a: read-only probes (`pg_available_extensions`, `pg_extension`,
-  `version()`) were run against the configured Prisma Postgres to confirm pgvector availability.
-  No `prisma db push` has been run from here, and no write of any kind. Every chunk's plan named specific
+- 🟡 **Superseded 2026-09-12.** This used to read "nothing has ever run against a real Postgres
+  database or a real OpenAI API call". That is no longer true: the schema has been pushed to the
+  live Prisma Postgres, 14,615 real embedding calls have been made, and the vector columns are
+  populated. Everything *else* it warned about still stands — no chunk's behaviour has been
+  exercised end-to-end against production traffic, and every "verified" claim in the plan history
+  outside Chunk 9 still means "verified against mocks". Every chunk's plan named specific
   behaviors as "worth confirming by hand" once real infra exists — none of those manual checks
   have actually been performed. This is the single largest standing risk across the whole
   feature; treat every "verified" claim in the plan history as "verified against mocks," not
@@ -98,14 +100,51 @@ conditions change · ⚪ blocked on infra/data this environment doesn't have.
 
 ## Semantic resolution (Chunk 9a built the infrastructure; 9b reads it)
 
-- ⚪ **No embeddings exist yet.** Chunk 9a ships the columns, the provider wrapper and
-  `manage.py backfill_food_embeddings`, but the backfill has never been run — it costs real money
-  and needs a key this environment doesn't have. `SEMANTIC_RESOLUTION_ENABLED` is off, and Chunk
-  9b's resolution changes are meaningless until the catalog is actually embedded.
-- 🟡 **Open Food Facts is excluded from the backfill by default.** It is the largest source by
-  far and the least valuable to embed (`_SOURCE_PRIORITY` already ranks it last so plain text
-  lands on generic data). `--source open_food_facts` includes it. If branded-dish matching ever
-  becomes a goal (PRD §19 lists it as out of scope), this decision is the thing to revisit.
+- 🔴 **MEASURED 2026-09-12: Chunk 9b changes nothing on the real catalog.** With the catalog
+  embedded (14,615 generic foods, HNSW index confirmed in use) and the flag on, **0 of ~25
+  hand-picked probe queries resolved differently** than with the flag off. The cause is not the
+  similarity floor — it is that `_resolve_food_by_name` short-circuits on a lexical HIGH before
+  any vector query runs, and on this catalog trigram returns HIGH for nearly everything. The
+  semantic arm is structurally unable to fire. Lowering `SEMANTIC_MATCH_FLOOR` does not change
+  this; the floor is never reached.
+- 🔴 **Root cause, and it is a pre-existing lexical bug, not a Chunk 9 one:
+  `chatparser.score_food_match` ignores unmatched query words.** It is a partial ratio — it scores
+  the best-aligned *window*, so query words the candidate lacks cost nothing. Measured:
+  `"cottage cheese curry"` → `"Cottage Cheese"` scores **1.000 HIGH**; `"yoghurt rice"` →
+  `"Yoghurt"` **1.000 HIGH**; `"lady finger sabzi"` → `"Lady Fingers"` (the *biscuit*, 400
+  kcal/100g, against okra's ~50) **0.917 HIGH**, auto-resolved silently per §12.6. The ANN arm
+  found the correct okra entry at 0.653 and was never consulted. A query-coverage penalty in
+  `score_food_match` is the actual fix, and it would also create the LOW/MEDIUM band the semantic
+  arm needs to be useful at all. It moves every band in the system, so it needs its own chunk and
+  its own eval pass — see §12.6.
+- 🟡 **Measured similarity ranges (text-embedding-3-small, 1536d, this catalog)**, for whoever
+  calibrates the floors: exact-name hits 0.82–0.85 (`"dal"`→`"Dal"` 0.848, `"paneer tikka"`→
+  `"Paneer shaslik/tikka"` 0.822); correct-but-differently-worded 0.65–0.73
+  (`"kadhi pakoda"`→`"Besan kadhi with pakodies"` 0.693, `"clarified butter"`→`"Butter, Clarified
+  butter (ghee)"` 0.730); *incorrect* neighbours occupy the same 0.65–0.73 band
+  (`"misal pav"`→`"Pav bhaji"` 0.693); nonsense 0.29–0.32. Correct and incorrect matches are **not
+  separable by a single cosine threshold** on this catalog — which is the real argument against
+  lowering the floor, independent of the short-circuit above.
+- 🔴 **There are zero `CompositeFood` rows**, so the composite semantic path has never run against
+  real data. `search_composites_by_embedding` returns nothing on every call.
+- ✅ **Resolved 2026-09-12:** the schema is pushed, pgvector is installed, both HNSW indexes
+  exist, and all 14,615 generic foods are embedded with `text-embedding-3-small`. The backfill
+  cost well under a cent and took ~12 minutes. `SEMANTIC_RESOLUTION_ENABLED` remains off — see the
+  measured finding above for why turning it on would currently change nothing.
+- 🟡 **Open Food Facts is excluded from the backfill by default.** Live catalog counts
+  (2026-09-12): **2,070,267** OFF rows against **14,615** generic (13,601 USDA + 1,014 INDB), and
+  zero `CALORYX_CURATED`. The earlier framing of this as a cost decision was wrong — embedding all
+  of OFF is roughly $0.60 in tokens. The real constraints are wall time (~8,000 provider round
+  trips at the default batch size) and **storage: ~12.7 GB of vector data** before HNSW adds its
+  own graph, which needs checking against the managed database's headroom. It is also the least
+  valuable source to embed (`_SOURCE_PRIORITY` already ranks it last so plain text lands on
+  generic data). `--source open_food_facts` includes it. If branded-dish matching becomes a goal
+  (PRD §19 lists it as out of scope), this is the decision to revisit.
+- 🔴 **There are zero `CompositeFood` rows in the live database** (confirmed 2026-09-12), so
+  Chunk 9b's semantic composite matching — and Chunk 3's exact alias matching before it — has
+  nothing to match against in practice. `manage.py seed_composite_foods` has never been run
+  against this database. Not a code defect; the §7.6 dish-decomposition path is simply inert
+  until the catalog has dishes in it.
 - 🟡 **The HNSW indexes are not declared in `schema.prisma`.** Prisma's `@@index(type:)` supports
   Hash/Gist/Gin/SpGist/Brin only — there is no Hnsw — so unlike `Food_name_trgm_idx` they are
   created by `manage.py ensure_vector_index` in raw SQL, which means a later `prisma db push` can
