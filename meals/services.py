@@ -145,6 +145,10 @@ def search_foods(query: str) -> Dict[str, Any]:
         # Extends the miss-queue flywheel (§9, I8) to the manual/direct-entry
         # path, not just chat - a search that comes up empty is exactly as
         # much a curation signal as an unresolved chat item.
+        # TODO(food-miss-llm): same LLM-lookup-then-seed idea as the chat
+        # miss path (assistant.services._build_items_from_phrase) - find the
+        # macros via LLM, seed the Food catalog, return it here. Blocked on
+        # the same PRD §7.4/I4 revision.
         repository.file_food_miss(query.strip())
     return {"foods": [serialize_food(f) for f in foods]}
 

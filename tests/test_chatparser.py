@@ -12,8 +12,10 @@ from chatparser import (
     hash_normalized,
     is_diary_query_a_trend_question,
     is_non_food_greeting,
+    match_tie_breaks,
     normalize_text,
     parse_edit_command,
+    parse_food_mentions,
     parse_new_item_phrases,
     redact_pii,
     score_food_match,
@@ -228,9 +230,10 @@ def test_an_unparseable_segment_is_reported_not_dropped():
 
 
 def test_a_bare_countable_mention_with_no_separate_unit_is_unconsumed():
-    """"2 rotis" has no explicit unit distinct from the food name - Chunk 2b
-    requires an explicit unit (no default-serving inference, that's Chunk 4),
-    so this must NOT silently resolve to some guessed unit."""
+    """"2 rotis" has no explicit unit distinct from the food name, so the
+    quantified grammar must NOT silently resolve it to some guessed unit -
+    it belongs to `parse_food_mentions`, which is explicit about assuming
+    the mass (see the second-pass tests below)."""
     phrases, unconsumed = parse_new_item_phrases(normalize_text("2 rotis"))
     assert phrases == []
     assert unconsumed == ["2 rotis"]
@@ -246,6 +249,134 @@ def test_quantity_and_unit_with_no_food_left_does_not_match():
     phrases, unconsumed = parse_new_item_phrases(normalize_text("200g cooked"))
     assert phrases == []
     assert unconsumed == ["200g cooked"]
+
+
+# -- T1 new-item grammar: food-first phrasing ------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        # The exact shape that used to fall through to an AI-fallback reply.
+        ("noodles 1 bowl", (1.0, "bowl", None, None, "noodles")),
+        ("rice 200g", (200.0, "g", None, None, "rice")),
+        ("rice 200 g", (200.0, "g", None, None, "rice")),
+        ("chicken biryani 600g", (600.0, "g", None, None, "chicken biryani")),
+        ("dal 1 katori", (1.0, "katori", None, None, "dal")),
+        ("green tea a cup", (1.0, "cup", None, None, "green tea")),
+    ],
+)
+def test_parses_a_quantity_stated_after_the_food(text, expected):
+    phrases, unconsumed = parse_new_item_phrases(normalize_text(text))
+    assert unconsumed == []
+    assert len(phrases) == 1
+    phrase = phrases[0]
+    assert (phrase.quantity, phrase.unit, phrase.state, phrase.prep, phrase.food_text) == expected
+
+
+def test_postfix_phrasing_still_reads_state_and_prep():
+    phrases, _ = parse_new_item_phrases(normalize_text("boiled egg 2 pieces"))
+    phrase = phrases[0]
+    assert (phrase.quantity, phrase.unit) == (2.0, "piece")
+    assert (phrase.state, phrase.prep, phrase.food_text) == ("COOKED", "boiled", "egg")
+
+
+def test_postfix_phrasing_does_not_mangle_a_multi_word_food_name():
+    """`unit` is anchored to the end and holds no space, so the only split the
+    engine can find is the last two tokens - "masala" can never be read as a
+    quantity."""
+    phrases, _ = parse_new_item_phrases(normalize_text("chicken tikka masala one bowl"))
+    assert [p.food_text for p in phrases] == ["chicken tikka masala"]
+    assert phrases[0].quantity == 1.0
+
+
+def test_both_quantity_orders_can_appear_in_one_message():
+    phrases, unconsumed = parse_new_item_phrases(normalize_text("200g rice and noodles 1 bowl"))
+    assert unconsumed == []
+    assert [(p.food_text, p.quantity, p.unit) for p in phrases] == [
+        ("rice", 200.0, "g"),
+        ("noodles", 1.0, "bowl"),
+    ]
+
+
+def test_postfix_phrasing_still_requires_a_known_unit_word():
+    phrases, unconsumed = parse_new_item_phrases(normalize_text("rice 1 smidge"))
+    assert phrases == []
+    assert unconsumed == ["rice 1 smidge"]
+
+
+def test_a_trailing_number_with_no_unit_is_not_a_postfix_match():
+    phrases, unconsumed = parse_new_item_phrases(normalize_text("rice bowl 1"))
+    assert phrases == []
+    assert unconsumed == ["rice bowl 1"]
+
+
+# -- T1 second pass: parse_food_mentions -----------------------------------
+
+
+def _mentions(text, **kw):
+    """The second pass as the pipeline runs it: over whatever the quantified
+    grammar left behind."""
+    _phrases, unconsumed = parse_new_item_phrases(normalize_text(text))
+    return parse_food_mentions(unconsumed, **kw)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("2 rotis", (2.0, None, None, "rotis")),
+        ("3 eggs", (3.0, None, None, "eggs")),
+        ("two boiled eggs", (2.0, "COOKED", "boiled", "eggs")),
+        ("an apple", (1.0, None, None, "apple")),
+        ("24 almonds", (24.0, None, None, "almonds")),
+    ],
+)
+def test_count_only_mentions_are_read_by_default(text, expected):
+    mentions, unconsumed = _mentions(text)
+    assert unconsumed == []
+    assert len(mentions) == 1
+    mention = mentions[0]
+    assert (mention.count, mention.state, mention.prep, mention.food_text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "500 ml milk",  # an unrecognised *unit*, not a count of 500
+        "200 smidges rice",
+        "a really long bit of prose here",  # prose, not a food name
+    ],
+)
+def test_an_implausible_count_or_an_over_long_food_name_stays_unconsumed(text):
+    mentions, unconsumed = _mentions(text)
+    assert mentions == []
+    assert unconsumed == [normalize_text(text)]
+
+
+def test_a_bare_food_name_is_not_read_unless_the_caller_opts_in():
+    assert _mentions("noodles") == ([], ["noodles"])
+
+    mentions, unconsumed = _mentions("noodles", allow_bare_food=True)
+    assert unconsumed == []
+    assert (mentions[0].count, mentions[0].food_text) == (None, "noodles")
+
+
+def test_a_bare_food_name_still_reads_state_and_prep():
+    mentions, _ = _mentions("boiled egg", allow_bare_food=True)
+    assert (mentions[0].count, mentions[0].state, mentions[0].prep, mentions[0].food_text) == (
+        None,
+        "COOKED",
+        "boiled",
+        "egg",
+    )
+
+
+def test_with_both_grammars_off_every_segment_comes_straight_back():
+    """The pre-second-pass contract, still reachable by configuration."""
+    for text in ("2 rotis", "noodles", "something weird"):
+        mentions, unconsumed = _mentions(text, allow_count_only=False, allow_bare_food=False)
+        assert mentions == []
+        assert unconsumed == [text]
 
 
 # -- T1 edit grammar (§7.5) ------------------------------------------------
@@ -308,6 +439,43 @@ def test_a_close_variant_scores_medium_or_high():
 def test_unrelated_strings_score_low():
     score = score_food_match("banana", "Grilled Chicken Breast")
     assert band_for_score(score) == "LOW"
+
+
+def test_reordered_whole_words_score_high():
+    # Partial ratio alone gives 0.5 (LOW) - USDA-style names invert word order.
+    assert band_for_score(score_food_match("greek yogurt", "Yogurt, Greek, plain, nonfat")) == "HIGH"
+    assert band_for_score(score_food_match("bananas", "Banana, raw")) == "HIGH"
+    # ...but an exact substring still outscores a reordered match.
+    assert score_food_match("white rice", "White rice flour") > score_food_match("white rice", "Rice, white")
+
+
+def test_word_coverage_needs_every_query_word():
+    assert band_for_score(score_food_match("greek lamb", "Yogurt, Greek, plain")) != "HIGH"
+
+
+@pytest.mark.parametrize(
+    "query,name,expected",
+    [
+        ("egg", "Egg, whole, raw, fresh", (2, True, 0, False)),
+        ("egg", "Bread, egg", (0, True, 1, False)),
+        ("banana", "Bananas, raw", (2, True, 0, False)),
+        ("banana", "Pepper, banana, raw", (0, True, 1, False)),
+        ("rice", "Cooked White Rice", (2, True, 0, False)),
+        ("rice", "Rice crackers", (0, True, 1, False)),
+        ("rice", "Licorice", (0, False, 1, False)),
+        ("rice", "Rice, fried, NFS", (2, True, 1, True)),  # fried rice is its own food
+        ("rice", "Rice, cooked, NFS", (2, True, 0, True)),
+        ("brown rice", "Rice, brown, cooked", (1, True, 0, False)),
+        ("brown rice", "Snacks, brown rice chips", (0, True, 2, False)),
+        ("white rice", "Rice, brown, cooked", (2, False, 1, False)),
+        ("egg", "Egg, yolk, dried", (2, True, 2, False)),
+        # FNDDS qualifiers don't count as extra words, but never strip a head.
+        ("chicken", "Chicken, NS as to part and cooking method, skin not eaten", (2, True, 0, True)),
+        ("chicken", "Chicken skin", (0, True, 0, False)),
+    ],
+)
+def test_match_tie_breaks(query, name, expected):
+    assert match_tie_breaks(query, name) == expected
 
 
 # -- has_wellbeing_signal (§5.6, Chunk 6b) ------------------------------------

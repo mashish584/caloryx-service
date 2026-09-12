@@ -279,6 +279,10 @@ class MessageResponseSerializer(serializers.Serializer):
     # class docstring); the client fetches GET /quota separately for the
     # used/limit/resetsAt numbers to render the upgrade sheet.
     quotaExceeded = serializers.BooleanField()
+    # True only when this message needed a T2/T3 AI fallback call and the
+    # matching AI_*_FALLBACK_ENABLED/AI_T3_ESCALATION_ENABLED flag was off
+    # (caloryx.settings) - a deliberate config choice, not a provider outage.
+    aiFallbackDisabled = serializers.BooleanField()
     # §5.6, Chunk 6b - true once a WELLBEING_FLAG response has fired for this
     # session; no gamification feature reads this yet (forward-declared).
     gamificationSuppressed = serializers.BooleanField()

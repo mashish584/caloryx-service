@@ -12,6 +12,7 @@ class FoodSource(StrEnum):
     USDA = "USDA"
     OPEN_FOOD_FACTS = "OPEN_FOOD_FACTS"
     CALORYX_CURATED = "CALORYX_CURATED"
+    INDB = "INDB"
 
 
 class FoodState(StrEnum):

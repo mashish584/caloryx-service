@@ -13,7 +13,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from django.conf import settings
 
@@ -199,17 +199,30 @@ def _load_open_draft_for_mutation(user_id: str, draft_id: str, version: int) -> 
 # -- quantity-resolution ladder write-back (Chunk 4b, §5.1.1a) ---------------
 
 
+# The two `massSource` values that come from the amount the user actually
+# stated - a mass, or a household unit whose count they gave. Every other
+# value is a rung of the quantity-resolution ladder, i.e. our own inference.
+_STATED_MASS_SOURCES = frozenset({"DIRECT", "HOUSEHOLD_TABLE"})
+
+
 def _record_serving_observations(user_id: str, items_payload: List[Dict[str, Any]]) -> None:
     """"Every portion edit writes to a per-user serving profile" (§5.1.1a).
     Called from every choke point a `MealDraftItem` payload is actually
     persisted through (create, add, and edit), so it fires regardless of
-    which surface produced the item. An `ASSUMED` item is the ladder's own
-    guess, not a real observation - recording it back would let a wrong
-    guess reinforce itself, so only `EXPLICIT` (stated) items count."""
+    which surface produced the item. An item whose grams the ladder guessed
+    is not a real observation - recording it back would let a wrong guess
+    reinforce itself - so this needs a stated amount on *both* of §5.1.1a's
+    provenance axes: `EXPLICIT` (an amount was given) *and* a `massSource`
+    that came from the amount itself rather than from the ladder. "2 rotis"
+    is the case that separates them: the count is the user's, the 40g-per-roti
+    is the catalog's, and only a real mass ("80g roti", "1 katori dal") says
+    anything about this user's portions."""
     for item_payload in items_payload:
         if item_payload.get("resolution") != "RESOLVED":
             continue
         if item_payload.get("quantitySource") != "EXPLICIT":
+            continue
+        if item_payload.get("massSource") not in _STATED_MASS_SOURCES:
             continue
         repository.record_serving_observation(
             user_id, item_payload["foodId"], item_payload["state"], item_payload["grams"]
@@ -622,15 +635,48 @@ def confirm_draft(
 # -- Chunk 2b: text pipeline (§7, §7.5, §12.6) -------------------------------
 
 
+_RESOLVE_CANDIDATES = 100
+
+# Tie-break among equally-scored candidates: generic data before branded,
+# hand-curated first. Plain text ("hummus") should land on a generic food,
+# not whichever of dozens of branded hummus rows happens to sort first.
+_SOURCE_PRIORITY = {"CALORYX_CURATED": 3, "INDB": 2, "USDA": 1, "OPEN_FOOD_FACTS": 0}
+_BAND_RANK = {"HIGH": 2, "MEDIUM": 1, "LOW": 0}
+
+
 def _resolve_food_by_name(query: str) -> Tuple[Optional[Any], float, str]:
     """Best-matching catalog food for free text, with its score and band
-    (§12.6). Candidates come from every food in the catalog, scored in Python
-    via `difflib` (the Chunk 2a decision on trigram vs. pure-Python)."""
-    candidates = meals_repository.search_foods("", limit=500)
+    (§12.6). Postgres trigram search narrows the whole catalog to a candidate
+    window; `chatparser.score_food_match` (unchanged, so the bands keep their
+    calibration) picks within it.
+
+    Many candidates share a band - "egg" is an exact substring of "Bread,
+    egg" and "Egg, whole, raw" alike - so within the best band the pick is
+    by `chatparser.match_tie_breaks` (the query is the name's head, every
+    query word present, fewest extra words), with raw score, source priority
+    and the shorter name as the final deterministic tie-breaks."""
+    candidates = meals_repository.search_foods(query, limit=_RESOLVE_CANDIDATES)
     if not candidates:
         return None, 0.0, "LOW"
+
+    def rank(pair: Tuple[Any, float]) -> Tuple[int, int, bool, float, int, int, bool, int]:
+        food, score = pair
+        head_tier, has_all_words, extra_words, is_unspecified = chatparser.match_tie_breaks(
+            query, food.name
+        )
+        return (
+            _BAND_RANK[chatparser.band_for_score(score)],
+            head_tier,
+            has_all_words,
+            score,
+            _SOURCE_PRIORITY.get(food.source, 0),
+            -extra_words,
+            is_unspecified,
+            -len(food.name),
+        )
+
     scored = [(food, chatparser.score_food_match(query, food.name)) for food in candidates]
-    best_food, best_score = max(scored, key=lambda pair: pair[1])
+    best_food, best_score = max(scored, key=rank)
     return best_food, best_score, chatparser.band_for_score(best_score)
 
 
@@ -724,6 +770,13 @@ def _build_items_from_phrase(
 
     food, score, band = _resolve_food_by_name(phrase.food_text)
     if food is None or band == "LOW":
+        # TODO(food-miss-llm): showing "not found" is poor UX. Consider an LLM
+        # lookup for the missing food's macros per 100g, then seed it into the
+        # local Food catalog (new FoodSource value, e.g. LLM_ESTIMATED) so it
+        # resolves deterministically next time. Needs a PRD revision first:
+        # §7.4 "never hallucinate a food" / I4 "AI never returns numbers"
+        # currently forbid model-authored nutrition, so the entry must be
+        # flagged as estimated in the UI.
         meals_repository.file_food_miss(phrase.food_text)
         return [(_unresolved_item(phrase), ZERO_VECTOR)]
 
@@ -820,6 +873,7 @@ class _Outcome:
     needs_clarification: Optional[Dict[str, Any]] = None
     parse_snapshot: Optional[Dict[str, Any]] = None
     quota_exceeded: bool = False
+    ai_fallback_disabled: bool = False
     gamification_suppressed: bool = False
     wellbeing_resources: Optional[List[Dict[str, str]]] = None
 
@@ -994,13 +1048,23 @@ def _apply_ai_edit(user_id: str, draft: Any, envelope: Dict[str, Any]) -> Option
 
 
 def _apply_add_phrases(
-    user_id: str, draft: Any, phrases: List["chatparser.ParsedItemPhrase"], unconsumed: List[str]
+    user_id: str,
+    draft: Any,
+    phrases: List["chatparser.ParsedItemPhrase"],
+    unconsumed: List[str],
+    ladder_items: Sequence[Tuple[Dict[str, Any], NutrientVector]] = (),
 ) -> _Outcome:
+    """`ladder_items` are already-built payloads from the second pass
+    (`_resolve_food_mentions`) - unlike a `ParsedItemPhrase`, a mention can't
+    be re-resolved here, because finishing it needed the ladder's catalog and
+    history reads that already happened upstream."""
     _load_open_draft_for_mutation(user_id, draft.id, draft.version)
     updated_row = None
     for phrase in phrases:
         for item_payload, _ in _build_items_from_phrase(phrase):
             updated_row = _add_item_payload(user_id, draft.id, item_payload)
+    for item_payload, _ in ladder_items:
+        updated_row = _add_item_payload(user_id, draft.id, item_payload)
     return _Outcome(
         tier="PARSER",
         intent="ADD_ITEM",
@@ -1185,7 +1249,15 @@ def _resolve_assumed_grams(
     Returns `None` when neither the user's history nor the catalog has
     anything to assume - the caller reports the item unconsumed, the same
     honest fallback used everywhere a food can't be resolved."""
-    pref = repository.get_serving_preference(user_id, food.id, state or "UNSPECIFIED")
+    # An unstated state resolves to the food's own default *state*, not to the
+    # literal "UNSPECIFIED" - that's what `_record_serving_observations`
+    # writes under, via `meals.services.resolve_item`'s own
+    # `state or food.defaultState`. Keying the read differently from the write
+    # meant step 1 could never fire for a food whose default isn't
+    # UNSPECIFIED (rice, roti, chicken - most of the catalog) unless the
+    # message happened to spell the state out.
+    pref_state = state or food.defaultState or "UNSPECIFIED"
+    pref = repository.get_serving_preference(user_id, food.id, pref_state)
     if pref is not None and len(pref.recentGrams) >= 3:
         return pref.medianGrams, "USER_HISTORY"
 
@@ -1201,25 +1273,40 @@ def _resolve_assumed_grams(
     return base * multiplier, mass_source
 
 
-def _resolve_llm_item_without_quantity(
-    llm_item: Dict[str, Any], user_id: str
+def _resolve_unquantified(
+    food_text: str,
+    *,
+    user_id: str,
+    raw_text: Optional[str] = None,
+    count: float = 1.0,
+    quantity_source: str = "ASSUMED",
+    size_qualifier: Optional[str] = None,
+    state: Optional[str] = None,
+    prep: Optional[str] = None,
 ) -> List[Tuple[Dict[str, Any], NutrientVector]]:
-    """A T2 item with no stated quantity/unit -> the quantity-resolution
-    ladder, applied to whichever food/composite its name matches. A
-    composite defaults to one serving (scaled by any stated size qualifier)
-    since it already carries its own canonical `servingGrams` - it never
-    touches `UserServingPreference`/`Food.category`, both per-`Food`
-    concepts. Returns `[]` when nothing matches, or a matched food's ladder
-    has nothing to assume - the caller reports the item unconsumed, exactly
-    like any other unresolvable mention."""
-    food_text = llm_item["food"]
-    size_qualifier = llm_item.get("sizeQualifier")
+    """A food named with no stated *mass* -> the quantity-resolution ladder,
+    applied to whichever food/composite the name matches. `count` is how many
+    of that serving ("2 rotis" -> 2.0), defaulting to one. A composite is
+    scaled straight off its own canonical `servingGrams` and never touches
+    `UserServingPreference`/`Food.category`, both per-`Food` concepts.
+
+    `quantity_source` is the caller's to state, because it answers a question
+    only the caller knows the answer to - §5.1.1a's first axis is "was an
+    amount stated?", and "2 rotis" states one while a bare "noodles" does
+    not. `massSource` always records the ladder rung the grams came from, so
+    an `EXPLICIT` count still carries an approximate conversion (the PRD's own
+    "1 katori of dal" case: no `est.` chip, because the count is certain, but
+    the gram figure is still tracked as approximate).
+
+    Returns `[]` when nothing matches, or a matched food's ladder has nothing
+    to assume - the caller reports the item unconsumed, exactly like any other
+    unresolvable mention."""
     multiplier = SIZE_QUALIFIER_MULTIPLIERS.get(size_qualifier, 1.0)
 
     composite = _resolve_composite_by_name(food_text)
     if composite is not None:
         return _expand_composite(
-            composite, 1.0 * multiplier, quantity_source="ASSUMED", mass_source="CATALOG_SERVING"
+            composite, count * multiplier, quantity_source=quantity_source, mass_source="CATALOG_SERVING"
         )
 
     food, score, band = _resolve_food_by_name(food_text)
@@ -1227,7 +1314,6 @@ def _resolve_llm_item_without_quantity(
         meals_repository.file_food_miss(food_text)
         return []
 
-    state = llm_item.get("state")
     normalized_state = state.upper() if state else None
     assumed = _resolve_assumed_grams(food, normalized_state, size_qualifier, user_id)
     if assumed is None:
@@ -1237,16 +1323,82 @@ def _resolve_llm_item_without_quantity(
     grams, mass_source = assumed
 
     phrase = chatparser.ParsedItemPhrase(
-        raw_text=food_text,
-        quantity=grams,
+        raw_text=raw_text or food_text,
+        quantity=grams * count,
         unit="g",
         state=normalized_state,
-        prep=llm_item.get("prep"),
+        prep=prep,
         food_text=food_text,
-        quantity_source="ASSUMED",
+        quantity_source=quantity_source,
         mass_source=mass_source,
     )
     return _build_items_from_phrase(phrase)
+
+
+def _resolve_llm_item_without_quantity(
+    llm_item: Dict[str, Any], user_id: str
+) -> List[Tuple[Dict[str, Any], NutrientVector]]:
+    """A T2 envelope item with no stated quantity/unit -> the ladder above."""
+    return _resolve_unquantified(
+        llm_item["food"],
+        user_id=user_id,
+        size_qualifier=llm_item.get("sizeQualifier"),
+        state=llm_item.get("state"),
+        prep=llm_item.get("prep"),
+    )
+
+
+def _resolve_food_mention(
+    mention: "chatparser.ParsedFoodMention", user_id: str
+) -> List[Tuple[Dict[str, Any], NutrientVector]]:
+    """A T1 second-pass mention (`chatparser.parse_food_mentions`) -> the same
+    ladder the T2 path uses. This is the whole point of the second pass: a
+    "2 rotis" or a bare "noodles" reaches §5.1.1a's ladder - user history,
+    then catalog serving, then category fallback - without a model call, since
+    none of those rungs involve a model in the first place. T1's grammar just
+    had no way to express "a food, with no mass" until now.
+
+    A stated count is `EXPLICIT` per §5.1.1a ("2 rotis" is one of the PRD's
+    own examples) - so no `est.` chip, since the count is certain - while a
+    bare mention assumed the amount outright and is `ASSUMED`. Either way
+    `massSource` is a ladder rung, which is what keeps the gram figure
+    honestly marked as a conversion and out of the user's serving profile."""
+    return _resolve_unquantified(
+        mention.food_text,
+        user_id=user_id,
+        raw_text=mention.raw_text,
+        count=mention.count if mention.count is not None else 1.0,
+        quantity_source="EXPLICIT" if mention.count is not None else "ASSUMED",
+        state=mention.state,
+        prep=mention.prep,
+    )
+
+
+def _parse_food_mentions(unconsumed: List[str]) -> Tuple[List["chatparser.ParsedFoodMention"], List[str]]:
+    """`chatparser.parse_food_mentions` with this deployment's switches - the
+    parser stays pure/settings-free, so the flags get read here."""
+    return chatparser.parse_food_mentions(
+        unconsumed,
+        allow_count_only=settings.PARSER_COUNT_ONLY_QUANTITY_ENABLED,
+        allow_bare_food=settings.PARSER_BARE_FOOD_MENTION_ENABLED,
+    )
+
+
+def _resolve_food_mentions(
+    mentions: List["chatparser.ParsedFoodMention"], unconsumed: List[str], user_id: str
+) -> Tuple[List[Tuple[Dict[str, Any], NutrientVector]], List[str]]:
+    """Runs the ladder over every mention. One the ladder can't finish rejoins
+    `unconsumed` under its original text (§12.13), so an unreadable segment
+    still comes back verbatim rather than becoming an empty draft row."""
+    resolved: List[Tuple[Dict[str, Any], NutrientVector]] = []
+    still_unconsumed = list(unconsumed)
+    for mention in mentions:
+        built = _resolve_food_mention(mention, user_id)
+        if built:
+            resolved.extend(built)
+        else:
+            still_unconsumed.append(mention.raw_text)
+    return resolved, still_unconsumed
 
 
 def _llm_item_to_phrase(llm_item: Dict[str, Any]) -> Optional["chatparser.ParsedItemPhrase"]:
@@ -1450,6 +1602,9 @@ def _process_t2_new_meal(
 
 
 _QUOTA_EXCEEDED_REPLY = 'Quantified meals still work — try "200g rice, 100g chicken".'
+_AI_FALLBACK_DISABLED_REPLY = (
+    'I can\'t do AI-based lookups right now — try a quantified format like "200g rice, 100g chicken".'
+)
 
 
 def _replay_snapshot(
@@ -1617,13 +1772,21 @@ def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _O
         # Cached items no longer resolve against the catalog - fall through to T1.
 
     phrases, unconsumed = chatparser.parse_new_item_phrases(normalized)
-    if not phrases:
-        # T1's grammar found nothing at all - from here, in order: L2 global
-        # cache (a shared phrasing another user already paid to resolve),
-        # then the quota gate, then T2, then T3 on a low-confidence T2
-        # result (§7.1's exception layer; a partial T1 match stays
-        # unescalated at every one of these steps - see the Chunk 4a plan's
-        # router-scope note).
+    # Second pass over what the quantified grammar couldn't read: a stated
+    # count or a bare food name, finished through §5.1.1a's ladder. Runs
+    # before the escalation decision below on purpose - a message the ladder
+    # can resolve must never reach a model, since every rung of the ladder is
+    # a local catalog/history lookup.
+    mentions, unconsumed = _parse_food_mentions(unconsumed)
+    ladder_items, unconsumed = _resolve_food_mentions(mentions, unconsumed, user_id)
+
+    if not phrases and not ladder_items:
+        # T1 found nothing at all, second pass included - from here, in
+        # order: L2 global cache (a shared phrasing another user already paid
+        # to resolve), then the quota gate, then T2, then T3 on a
+        # low-confidence T2 result (§7.1's exception layer; a partial T1
+        # match stays unescalated at every one of these steps - see the
+        # Chunk 4a plan's router-scope note).
         global_cache = repository.get_global_cache(normalized_hash)
         if global_cache is not None:
             outcome = _replay_snapshot(
@@ -1636,6 +1799,16 @@ def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _O
                 repository.bump_global_cache_hit(normalized_hash)
                 return outcome
             # Cached items no longer resolve against the catalog - fall through.
+
+        if not settings.AI_NEW_MEAL_FALLBACK_ENABLED:
+            logger.info("assistant_ai_new_meal_fallback_disabled user=%s", user_id)
+            return _Outcome(
+                tier="PARSER",
+                intent="OTHER",
+                assistant_text=_AI_FALLBACK_DISABLED_REPLY,
+                unconsumed_text=unconsumed,
+                ai_fallback_disabled=True,
+            )
 
         window = timedelta(hours=settings.AI_QUOTA_WINDOW_HOURS)
         _counter, consumed = repository.try_consume_quota(user_id, settings.AI_QUOTA_LIMIT, window)
@@ -1672,12 +1845,16 @@ def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _O
             # provider-wide outage. A T2 WELLBEING_FLAG is the one exception
             # to "T3 overrides T2" below - always double-checked (§5.6), but
             # never downgraded by what T3 says or whether it even succeeds
-            # (false negatives matter more than cost).
-            t3_envelope = _call_llm(
-                user_id, normalized, tier="LLM_LARGE", call_fn=call_large_model, counted_to_quota=False
-            )
-            if t3_envelope is not None:
-                envelope, tier_used = t3_envelope, "LLM_LARGE"
+            # (false negatives matter more than cost). If AI_T3_ESCALATION_ENABLED
+            # is off, T2's own result is trusted as final instead - a
+            # WELLBEING_FLAG is still honored unverified (same "false
+            # negatives matter more than cost" reasoning above).
+            if settings.AI_T3_ESCALATION_ENABLED:
+                t3_envelope = _call_llm(
+                    user_id, normalized, tier="LLM_LARGE", call_fn=call_large_model, counted_to_quota=False
+                )
+                if t3_envelope is not None:
+                    envelope, tier_used = t3_envelope, "LLM_LARGE"
             if t2_wellbeing:
                 return _handle_wellbeing_flag(user_id, tier_used)
 
@@ -1719,11 +1896,17 @@ def _process_new_meal(user_id: str, normalized: str, normalized_hash: str) -> _O
         for item_payload, vector in _build_items_from_phrase(phrase):
             items_payload.append(item_payload)
             vectors.append(vector)
+    for item_payload, vector in ladder_items:
+        items_payload.append(item_payload)
+        vectors.append(vector)
 
     resolved_count = sum(1 for ip in items_payload if ip["resolution"] == "RESOLVED")
     confidence = resolved_count / len(items_payload)
     slot = _infer_slot(None)
-    name = _derive_meal_name(items_payload, vectors, phrases[0].food_text, slot)
+    # `mentions` is non-empty whenever `ladder_items` is, so one of the two is
+    # always there to name the meal after.
+    name_fallback = phrases[0].food_text if phrases else mentions[0].food_text
+    name = _derive_meal_name(items_payload, vectors, name_fallback, slot)
 
     created = _create_draft_from_items(user_id, name, slot, "PARSER", confidence, items_payload, vectors)
 
@@ -1775,10 +1958,14 @@ def _process_message(
             return _apply_edit(user_id, open_draft, edit)
 
         phrases, unconsumed = chatparser.parse_new_item_phrases(normalized)
-        if phrases:
+        mentions, unconsumed = _parse_food_mentions(unconsumed)
+        ladder_items, unconsumed = _resolve_food_mentions(mentions, unconsumed, user_id)
+        if phrases or ladder_items:
             # A new-meal-shaped message while a draft is already open (§5.1.1).
             if on_open_draft == "ADD":
-                return _apply_add_phrases(user_id, open_draft, phrases, unconsumed)
+                return _apply_add_phrases(
+                    user_id, open_draft, phrases, unconsumed, ladder_items=ladder_items
+                )
             if on_open_draft == "NEW":
                 repository.update_draft(open_draft.id, {"status": "DISCARDED", "version": {"increment": 1}})
                 # Falls through below to the fresh-draft path.
@@ -1792,15 +1979,19 @@ def _process_message(
                     needs_clarification={"reason": "open_draft", "candidates": ["ADD", "NEW"]},
                 )
         else:
-            # T1's edit grammar and T1's new-item grammar both missed - one
+            # T1's edit grammar and both of T1's new-item passes missed - one
             # T2 call for a second opinion (Chunk 5a, §7.5). Edits are
             # quota-exempt even through T2 (§5.1.4) and draft-relative, so
             # never L2-cacheable (§7.4) - no quota gate, no cache lookup, no
             # T3 escalation (see the Chunk 5a plan for why `_envelope_confidence`
             # isn't a meaningful signal for intents that validly have an
             # empty `items[]`, e.g. SET_SLOT/REMOVE_ITEM).
-            envelope = _call_llm(
-                user_id, normalized, tier="LLM_SMALL", call_fn=call_small_model, counted_to_quota=False
+            envelope = (
+                _call_llm(
+                    user_id, normalized, tier="LLM_SMALL", call_fn=call_small_model, counted_to_quota=False
+                )
+                if settings.AI_EDIT_FALLBACK_ENABLED
+                else None
             )
             outcome = _apply_ai_edit(user_id, open_draft, envelope) if envelope is not None else None
             if outcome is not None:
@@ -1812,6 +2003,7 @@ def _process_message(
                 draft=serialize_draft(open_draft),
                 draft_id=open_draft.id,
                 unconsumed_text=unconsumed,
+                ai_fallback_disabled=not settings.AI_EDIT_FALLBACK_ENABLED,
             )
 
     return _process_new_meal(user_id, normalized, normalized_hash)
@@ -1869,6 +2061,7 @@ def send_message(user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
             "unconsumedText": outcome.unconsumed_text,
             "needsClarification": outcome.needs_clarification,
             "quotaExceeded": outcome.quota_exceeded,
+            "aiFallbackDisabled": outcome.ai_fallback_disabled,
             "gamificationSuppressed": outcome.gamification_suppressed,
             "wellbeingResources": outcome.wellbeing_resources,
         }

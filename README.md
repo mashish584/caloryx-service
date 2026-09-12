@@ -122,6 +122,71 @@ python manage.py backfill_date_of_birth
 
 Both `age` and `preferredUnits` are then droppable in a single contract-phase push.
 
+### Seed the database
+
+A fresh push leaves every table empty. Nothing is required to boot — config and
+singleton reads all fall back to compiled defaults — but an `EngineConfig` row,
+the `DishCategoryProfile` bands, and the food catalog should go back in before
+the service behaves correctly. `scripts/caloryx_helper.sh` is an interactive
+menu covering all of it:
+
+```bash
+scripts/caloryx_helper.sh
+```
+
+```
+1) Reset DB & seed initial engine config + food profiles
+2) Ingest food catalog data
+3) Drop food catalog data
+```
+
+**1) Reset** runs `prisma db push --force-reset` (drops and recreates every
+table) and then seeds the active `EngineConfig` row and the five
+`DishCategoryProfile` bands — the food catalog is left for option 2. Without an
+active config, plans silently use the compiled defaults and `Plan.engineConfigId`
+stays null, so a stored plan can no longer be explained after a retune (§10).
+Without the dish profiles, a catalog MISS resolves to nothing rather than a
+bounded estimate and the item is dropped as unconsumed — the failure mode is
+silence, not an error (§7.6.1). The bands themselves are illustrative
+placeholders, to be replaced with empirically derived p25/p75 values once real
+data is in `Food`.
+
+#### The food catalog
+
+**2) Ingest** prompts for which food data to load — `All`, or one of `USDA
+FNDDS`, `USDA SR Legacy`, `USDA Foundation`, `INDB`, `Open Food Facts` — and
+runs `manage.py ingest_foods` over the bulk datasets in `$FOOD_DATA_DIR`
+(default `~/Downloads`), §8. It does not download them: they are large,
+versioned by release date, and INDB needs a manual xlsx→CSV export. Download
+links are in the script header. Anything missing is reported and skipped, so a
+partial set still seeds. USDA folders are found by name prefix (newest release
+wins) and unzipped if needed, so paths never need editing.
+
+Until at least the USDA sets are in, food search returns nothing and parsed
+items file `FoodMissQueue` rows — expected, not broken.
+
+Useful knobs:
+
+| Env | Effect |
+| --- | --- |
+| `DRY_RUN=1` | Parse and validate every dataset, write nothing |
+| `OFF_MIN_SCANS=5` | ~137k Open Food Facts products people actually scan, instead of all ~2.07M |
+| `FORCE_INGEST=1` | Re-run the Open Food Facts pass even though rows already exist |
+| `FOOD_DATA_DIR` | Where the datasets live |
+
+Re-running is safe: the ingest skips rows that already exist, keyed on
+`(source, sourceRef)`. A completed Open Food Facts pass is skipped outright —
+re-reading ~10GB to insert nothing costs tens of minutes.
+
+**3) Drop** prompts for which ingested source to remove — `All`, `USDA`,
+`INDB`, or `Open Food Facts` — and deletes those `Food` rows, for a clean
+re-import. It never touches `CALORYX_CURATED` rows.
+
+`seed_foods` and `seed_composite_foods` exist for local development only; their
+curated rows outrank ingested data in the search ordering and their `--reset`
+clears the whole `Food` table, so don't run them against a database destined
+for a real ingest.
+
 Verify configuration, then run:
 
 ```bash

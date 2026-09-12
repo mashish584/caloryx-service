@@ -5,7 +5,13 @@ Deliberately dependency-free: no Django, no Prisma, no I/O - mirrors
 `assistant.services` is what turns that structured intent into draft
 mutations and persistence.
 """
-from .confidence import HIGH_THRESHOLD, MEDIUM_THRESHOLD, band_for_score, score_food_match
+from .confidence import (
+    HIGH_THRESHOLD,
+    MEDIUM_THRESHOLD,
+    band_for_score,
+    match_tie_breaks,
+    score_food_match,
+)
 from .enums import (
     ChatIntent,
     ChatRole,
@@ -16,7 +22,14 @@ from .enums import (
     ParseTier,
     QuantitySource,
 )
-from .grammar import ParsedEdit, ParsedItemPhrase, parse_edit_command, parse_new_item_phrases
+from .grammar import (
+    ParsedEdit,
+    ParsedFoodMention,
+    ParsedItemPhrase,
+    parse_edit_command,
+    parse_food_mentions,
+    parse_new_item_phrases,
+)
 from .normalize import hash_normalized, normalize_text
 from .redaction import redact_pii
 from .preclassifier import (
@@ -43,6 +56,7 @@ __all__ = [
     "MatchBand",
     "ParseTier",
     "ParsedEdit",
+    "ParsedFoodMention",
     "ParsedItemPhrase",
     "QuantitySource",
     "band_for_score",
@@ -57,8 +71,10 @@ __all__ = [
     "is_non_food_greeting",
     "is_nutrition_qa",
     "is_unclear",
+    "match_tie_breaks",
     "normalize_text",
     "parse_edit_command",
+    "parse_food_mentions",
     "parse_new_item_phrases",
     "redact_pii",
     "score_food_match",

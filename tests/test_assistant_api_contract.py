@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from django.test import Client
+from django.test import Client, override_settings
 from django.urls import reverse
 
 from assistant import repository as assistant_repository
@@ -38,6 +38,7 @@ def make_food(**overrides):
         id="food-rice",
         name="Cooked White Rice",
         source="CALORYX_CURATED",
+        brand=None,
         defaultState="COOKED",
         rawToCookedYield=3.0,
         caloriesKcalPer100g=130.0,
@@ -451,10 +452,17 @@ def test_get_quota_reflects_an_active_window(client, guest, monkeypatch):
     assert body["resetsAt"] == (window_start + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_sending_a_message_surfaces_quota_exceeded_without_calling_the_model(
     client, guest, monkeypatch
 ):
     monkeypatch.setattr(meals_repository, "get_catalog_version", lambda: 1)
+    # T1's quantity-less second pass reads the catalog for "a tahini dressing"
+    # before anything escalates; an empty catalog leaves it unresolved, which
+    # is what puts this message on the T2 path this test is about.
+    monkeypatch.setattr(meals_repository, "search_foods", lambda query, **kw: [])
+    monkeypatch.setattr(meals_repository, "get_composite_foods", lambda: [])
+    monkeypatch.setattr(meals_repository, "file_food_miss", lambda raw_text, locale="": None)
     monkeypatch.setattr(assistant_repository, "get_open_draft", lambda user_id: None)
     monkeypatch.setattr(assistant_repository, "get_idempotency_record", lambda key: None)
     monkeypatch.setattr(assistant_repository, "save_idempotency_record", lambda *a, **kw: None)
@@ -484,3 +492,47 @@ def test_sending_a_message_surfaces_quota_exceeded_without_calling_the_model(
     assert body["quotaExceeded"] is True
     assert body["draft"] is None
     assert "still work" in body["assistantText"]
+
+
+def test_sending_a_message_surfaces_ai_fallback_disabled_without_calling_the_model(
+    client, guest, monkeypatch
+):
+    monkeypatch.setattr(meals_repository, "get_catalog_version", lambda: 1)
+    # T1's quantity-less second pass reads the catalog for "a tahini dressing"
+    # before anything escalates; an empty catalog leaves it unresolved, which
+    # is what puts this message on the T2 path this test is about.
+    monkeypatch.setattr(meals_repository, "search_foods", lambda query, **kw: [])
+    monkeypatch.setattr(meals_repository, "get_composite_foods", lambda: [])
+    monkeypatch.setattr(meals_repository, "file_food_miss", lambda raw_text, locale="": None)
+    monkeypatch.setattr(assistant_repository, "get_open_draft", lambda user_id: None)
+    monkeypatch.setattr(assistant_repository, "get_idempotency_record", lambda key: None)
+    monkeypatch.setattr(assistant_repository, "save_idempotency_record", lambda *a, **kw: None)
+    monkeypatch.setattr(assistant_repository, "find_cached_message", lambda user_id, h: None)
+    monkeypatch.setattr(assistant_repository, "get_global_cache", lambda h: None)
+
+    def try_consume_quota(user_id, limit, window):
+        raise AssertionError("quota should never be checked when AI fallback is disabled")
+
+    monkeypatch.setattr(assistant_repository, "try_consume_quota", try_consume_quota)
+    monkeypatch.setattr(
+        assistant_repository, "get_or_create_today_session", lambda user_id: SimpleNamespace(id="session-1")
+    )
+    monkeypatch.setattr(
+        assistant_repository,
+        "create_chat_message",
+        lambda session_id, user_id, data: SimpleNamespace(id="msg-1", **data),
+    )
+
+    with override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=False):
+        response = client.post(
+            "/api/v1/assistant/messages",
+            data={"clientMessageId": "m1", "content": "grilled chicken salad with a tahini dressing"},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=guest,
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["aiFallbackDisabled"] is True
+    assert body["quotaExceeded"] is False
+    assert body["draft"] is None

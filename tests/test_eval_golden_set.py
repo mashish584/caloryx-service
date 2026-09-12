@@ -72,6 +72,7 @@ def _food(id, name, kcal, protein, carbs, fat, fiber, default_state="COOKED", yi
     return SimpleNamespace(
         id=id,
         name=name,
+        source="CALORYX_CURATED",
         defaultState=default_state,
         rawToCookedYield=yield_,
         caloriesKcalPer100g=kcal,

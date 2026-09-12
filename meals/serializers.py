@@ -31,6 +31,7 @@ class FoodSerializer(serializers.Serializer):
     id = serializers.CharField()
     name = serializers.CharField()
     source = serializers.ChoiceField(choices=[s.value for s in FoodSource])
+    brand = serializers.CharField(allow_null=True)
     defaultState = serializers.ChoiceField(choices=[s.value for s in FoodState])
     caloriesKcalPer100g = serializers.FloatField()
     proteinGPer100g = serializers.FloatField()
@@ -134,6 +135,7 @@ def serialize_food(food: Any) -> Dict[str, Any]:
         "id": food.id,
         "name": food.name,
         "source": food.source,
+        "brand": food.brand,
         "defaultState": food.defaultState,
         "caloriesKcalPer100g": food.caloriesKcalPer100g,
         "proteinGPer100g": food.proteinGPer100g,

@@ -203,6 +203,49 @@ AI_QUOTA_WINDOW_HOURS = int(env("AI_QUOTA_WINDOW_HOURS", "24"))
 # to calibrate against yet - same reasoning as the T1->T2 router in Chunk 4a).
 T3_ESCALATION_CONFIDENCE_THRESHOLD = float(env("T3_ESCALATION_CONFIDENCE_THRESHOLD", "0.5"))
 
+# Per-call-site AI fallback kill switches - manual, independent of the cost
+# circuit breaker above (which trips automatically on provider failures).
+# Off by default: until one is flipped on, the matching message just gets a
+# graceful "AI unavailable" reply (assistant.services) instead of reaching a
+# model, same as WELLBEING_CHECK_ALL_MESSAGES's off-by-default posture below.
+#
+# AI_NEW_MEAL_FALLBACK_ENABLED gates the T2 call in _process_new_meal when
+# T1 finds nothing at all - neither the quantified grammar nor the
+# quantity-less second pass below. Food-first phrasing ("chicken biryani
+# 600g") used to be the headline example here; T1's postfix grammar reads it
+# directly now, so what's left for T2 is genuinely unstructured prose.
+AI_NEW_MEAL_FALLBACK_ENABLED = env_bool("AI_NEW_MEAL_FALLBACK_ENABLED", False)
+# AI_T3_ESCALATION_ENABLED gates the second-opinion T3 call for a
+# low-confidence T2 LOG_NEW result or a T2 WELLBEING_FLAG double-check. Only
+# relevant when AI_NEW_MEAL_FALLBACK_ENABLED is also on. Off just means T2's
+# own result is trusted as final rather than escalated.
+AI_T3_ESCALATION_ENABLED = env_bool("AI_T3_ESCALATION_ENABLED", False)
+# AI_EDIT_FALLBACK_ENABLED gates the T2 call in _process_message that
+# interprets a message as an edit when an open draft exists and both the
+# edit grammar and the new-item grammar miss.
+AI_EDIT_FALLBACK_ENABLED = env_bool("AI_EDIT_FALLBACK_ENABLED", False)
+
+# --- T1 quantity-less second pass (§5.1.1a, chatparser.parse_food_mentions) -
+# Both switch on parsing that names a food T1's quantified grammar couldn't
+# measure, then finishes it through the quantity-resolution ladder - a local
+# catalog/history read, never a model call. Every item either produces is
+# `ASSUMED`, so the UI already has a way to show the amount as a guess.
+#
+# PARSER_COUNT_ONLY_QUANTITY_ENABLED reads a stated count with no unit of its
+# own ("2 rotis", "three boiled eggs"). On by default: the count is the
+# user's own, only the per-serving mass is assumed, and the alternative is
+# paying a model to read a two-token phrase.
+PARSER_COUNT_ONLY_QUANTITY_ENABLED = env_bool("PARSER_COUNT_ONLY_QUANTITY_ENABLED", True)
+# PARSER_BARE_FOOD_MENTION_ENABLED reads a bare food name with no amount at
+# all ("noodles"), assuming a single serving. Off by default: it's the
+# weakest signal in the pipeline - it fires on segments *nothing* else could
+# read, so a stray non-food phrase that happens to fuzzy-match the catalog
+# becomes a logged item instead of an honest "I didn't catch that" (§12.13).
+# The LOW-match-band guard and chatparser's own word cap are what make it
+# safe enough to flip on; turn it on once the miss queue shows the catalog is
+# dense enough for the match band to mean something.
+PARSER_BARE_FOOD_MENTION_ENABLED = env_bool("PARSER_BARE_FOOD_MENTION_ENABLED", False)
+
 # --- Wellbeing safeguards (§5.6, Chunk 6b) ---------------------------------
 # PLACEHOLDER SCAFFOLDING pending clinical/trust-and-safety review (§5.6's own
 # framing: "written here as a requirement, not a finished policy") - do not
@@ -258,7 +301,7 @@ NUTRITION_DRIFT_EPSILON_KCAL = float(env("NUTRITION_DRIFT_EPSILON_KCAL", "5"))
 # `CatalogVersion` singleton instead (see meals.repository.get_catalog_version
 # and `manage.py bump_catalog_version`).
 NORMALIZATION_VERSION = int(env("NORMALIZATION_VERSION", "1"))
-PARSER_VERSION = int(env("PARSER_VERSION", "1"))
+PARSER_VERSION = int(env("PARSER_VERSION", "2"))
 NUTRITION_ENGINE_VERSION = int(env("NUTRITION_ENGINE_VERSION", "1"))
 
 # --- Privacy & retention (§12.14, Chunk 8c) --------------------------------

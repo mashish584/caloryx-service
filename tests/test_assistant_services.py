@@ -41,6 +41,7 @@ def make_food(**overrides):
         id="food-rice",
         name="Cooked White Rice",
         source="CALORYX_CURATED",
+        brand=None,
         defaultState="COOKED",
         rawToCookedYield=3.0,
         caloriesKcalPer100g=130.0,
@@ -1205,6 +1206,7 @@ def stub_call_large_model(monkeypatch, result=None, exc=None):
     return calls
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_call_llm_sends_redacted_content_but_hashes_the_original(seam, monkeypatch):
     """§12.14 (Chunk 8c): the model never sees raw PII, but the ParseEvent's
     `inputHash` - and everything else keyed on the message - is unaffected."""
@@ -1222,6 +1224,7 @@ def test_call_llm_sends_redacted_content_but_hashes_the_original(seam, monkeypat
     assert seam.parse_events[0].inputHash == hash_normalized(normalize_text(content))
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_escalates_to_t2_when_t1_finds_nothing(seam, monkeypatch):
     chicken = make_food(
         id="food-chicken",
@@ -1259,6 +1262,22 @@ def test_send_message_escalates_to_t2_when_t1_finds_nothing(seam, monkeypatch):
     assert event.confidence == pytest.approx(0.9)
 
 
+def test_send_message_ai_new_meal_fallback_disabled_responds_gracefully(seam, monkeypatch):
+    calls = stub_call_small_model(monkeypatch, result=stub_llm_response(llm_envelope()))
+
+    with override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=False):
+        response = send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert calls == []  # T1 found zero phrases, but the flag blocked the T2 call
+    assert response["tier"] == "PARSER"
+    assert response["intent"] == "OTHER"
+    assert response["draft"] is None
+    assert response["aiFallbackDisabled"] is True
+    assert response["quotaExceeded"] is False
+    assert "user-1" not in seam.quota_counters  # no quota spent on a call that never happened
+
+
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t2_item_without_quantity_is_reported_as_unconsumed(seam, monkeypatch):
     envelope = llm_envelope(items=[llm_item("grilled chicken salad", confidence=0.5)])
     stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
@@ -1271,6 +1290,7 @@ def test_send_message_t2_item_without_quantity_is_reported_as_unconsumed(seam, m
     assert "grilled chicken salad" in response["unconsumedText"]
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t2_call_failure_falls_back_gracefully(seam, monkeypatch):
     stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
 
@@ -1284,6 +1304,7 @@ def test_send_message_t2_call_failure_falls_back_gracefully(seam, monkeypatch):
     assert seam.parse_events[0].intent == "OTHER"
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t2_envelope_validation_failure_falls_back_gracefully(seam, monkeypatch):
     bad_envelope = llm_envelope(items=[llm_item("chicken", state="sizzling", confidence=0.5)])
     stub_call_small_model(monkeypatch, result=stub_llm_response(bad_envelope))
@@ -1298,6 +1319,7 @@ def test_send_message_t2_envelope_validation_failure_falls_back_gracefully(seam,
     assert seam.parse_events[0].model == "gpt-4o-mini"  # the call itself succeeded
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t2_other_intent_gets_the_scripted_reply(seam, monkeypatch):
     """Chunk 6a: a T2-classified OTHER (or any of the other 6 non-logging
     intents) now gets its real scripted handler, tagged with the tier that
@@ -1314,6 +1336,7 @@ def test_send_message_t2_other_intent_gets_the_scripted_reply(seam, monkeypatch)
     assert response["intent"] == "OTHER"
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t2_uses_envelope_slot_and_meal_name_when_present(seam, monkeypatch):
     chicken = make_food(id="food-chicken", name="Grilled Chicken Breast", defaultState="COOKED", rawToCookedYield=1.0, servingUnits=[])
     seam.foods["food-chicken"] = chicken
@@ -1338,6 +1361,7 @@ def test_send_message_t1_partial_match_does_not_call_t2(seam, monkeypatch):
     assert calls == []
 
 
+@override_settings(AI_EDIT_FALLBACK_ENABLED=True)
 def test_send_message_open_draft_unrecognized_message_calls_t2_for_a_second_opinion(seam, monkeypatch):
     """Superseded by Chunk 5a: an open-draft message matching neither T1
     grammar now gets one T2 call (§7.5) before falling back - previously
@@ -1391,6 +1415,19 @@ def test_resolve_assumed_grams_prefers_user_history_over_a_stated_size_qualifier
     assert result == (110.0, "USER_HISTORY")
 
 
+def test_resolve_assumed_grams_finds_history_recorded_under_the_foods_default_state(seam):
+    """`_record_serving_observations` writes under the *resolved* state (the
+    food's own default when the message didn't state one), so an unstated
+    lookup has to read the same key - otherwise step 1 of the ladder could
+    never fire for a food whose default isn't UNSPECIFIED."""
+    food = make_food(id="food-rice", defaultState="COOKED", category="GRAIN")
+    seam.serving_preferences[("user-1", "food-rice", "COOKED")] = SimpleNamespace(
+        recentGrams=[100.0, 120.0, 110.0], medianGrams=110.0, observations=3
+    )
+
+    assert services._resolve_assumed_grams(food, None, None, "user-1") == (110.0, "USER_HISTORY")
+
+
 def test_resolve_assumed_grams_ignores_history_below_three_observations(seam):
     food = make_food(id="food-rice", category="GRAIN", defaultServingGrams=None)
     seam.serving_preferences[("user-1", "food-rice", "COOKED")] = SimpleNamespace(
@@ -1427,6 +1464,7 @@ def test_resolve_assumed_grams_returns_none_when_nothing_to_assume(seam):
     assert services._resolve_assumed_grams(food, None, None, "user-1") is None
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t2_item_without_quantity_resolves_via_the_ladder(seam, monkeypatch):
     chicken = make_food(
         id="food-chicken",
@@ -1455,6 +1493,7 @@ def test_send_message_t2_item_without_quantity_resolves_via_the_ladder(seam, mon
     assert seam.record_serving_observation_calls == []
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t2_item_without_quantity_applies_a_size_qualifier(seam, monkeypatch):
     oil = make_food(
         id="food-oil",
@@ -1475,6 +1514,7 @@ def test_send_message_t2_item_without_quantity_applies_a_size_qualifier(seam, mo
     assert item["massSource"] == "CATEGORY_FALLBACK"
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t2_quantity_less_composite_defaults_to_one_serving(seam, monkeypatch):
     rice = make_food()
     chicken = make_food(id="food-chicken", name="Grilled Chicken Breast")
@@ -1498,6 +1538,7 @@ def test_send_message_t2_quantity_less_composite_defaults_to_one_serving(seam, m
     assert total_grams == pytest.approx(350.0 * 0.95)  # 1 serving, ratios sum to 0.95
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t2_quantity_less_item_with_no_ladder_data_stays_unconsumed(seam, monkeypatch):
     mystery = make_food(
         id="food-mystery", name="Mystery Paste", defaultServingGrams=None, category=None, servingUnits=[]
@@ -1512,6 +1553,255 @@ def test_send_message_t2_quantity_less_item_with_no_ladder_data_stays_unconsumed
     assert response["tier"] == "LLM_SMALL"
     assert response["intent"] == "OTHER"
     assert "mystery paste" in response["unconsumedText"]
+
+
+# -- T1 food-first phrasing & the quantity-less second pass ------------------
+#
+# The whole point of both: a message this simple must never reach a model.
+# Every test here leaves the AI fallback flags at their defaults *or* turns
+# them on and asserts the model was still not called.
+
+
+def test_send_message_logs_food_first_phrasing_without_a_model_call(seam, monkeypatch):
+    """The screenshot case: "noodles 1 bowl" used to find zero T1 phrases and
+    fall through to the AI-fallback reply, despite "bowl" already being a
+    canonical unit word."""
+    noodles = make_food(
+        id="food-noodles",
+        name="Noodles",
+        defaultState="COOKED",
+        rawToCookedYield=None,
+        servingUnits=[serving_unit("bowl", 180.0)],
+    )
+    seam.foods.clear()
+    seam.foods["food-noodles"] = noodles
+    calls = stub_call_small_model(monkeypatch, result=None)
+
+    response = send(seam, "Noodles 1 bowl")
+
+    assert calls == []  # no model involved at any point
+    assert response["tier"] == "PARSER"
+    assert response["intent"] == "LOG_NEW"
+    item = response["draft"]["items"][0]
+    assert item["resolution"] == "RESOLVED"
+    assert (item["quantity"], item["unit"], item["grams"]) == (1.0, "bowl", 180.0)
+    assert item["quantitySource"] == "EXPLICIT"
+    assert item["massSource"] == "HOUSEHOLD_TABLE"
+
+
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True, AI_T3_ESCALATION_ENABLED=True)
+def test_send_message_food_first_phrasing_skips_the_model_even_with_fallback_on(seam, monkeypatch):
+    """The cost claim, asserted: turning the AI fallback on must not put a
+    deterministically-readable message back on the model path."""
+    calls = stub_call_small_model(monkeypatch, result=None)
+
+    response = send(seam, "rice 200g")
+
+    assert calls == []
+    assert response["tier"] == "PARSER"
+    assert response["draft"]["items"][0]["grams"] == pytest.approx(200.0)
+    # Quota is only ever consumed on the model path.
+    assert seam.quota_counters == {}
+
+
+def test_send_message_resolves_a_count_only_mention_through_the_ladder(seam, monkeypatch):
+    roti = make_food(
+        id="food-roti",
+        name="Roti",
+        defaultState="COOKED",
+        rawToCookedYield=None,
+        servingUnits=[],
+        defaultServingGrams=40.0,
+        category="GRAIN",
+    )
+    seam.foods.clear()
+    seam.foods["food-roti"] = roti
+    calls = stub_call_small_model(monkeypatch, result=None)
+
+    response = send(seam, "2 rotis")
+
+    assert calls == []
+    assert response["tier"] == "PARSER"
+    assert response["intent"] == "LOG_NEW"
+    item = response["draft"]["items"][0]
+    assert item["resolution"] == "RESOLVED"
+    assert item["grams"] == pytest.approx(80.0)  # 2 x the 40g catalog serving
+    assert item["rawText"] == "2 rotis"
+    # §5.1.1a's two axes, and "2 rotis" is the PRD's own example of why they
+    # are separate: the count is certain (EXPLICIT - so no `est.` chip), the
+    # 40g-per-roti conversion is the catalog's (CATALOG_SERVING).
+    assert item["quantitySource"] == "EXPLICIT"
+    assert item["massSource"] == "CATALOG_SERVING"
+    # ...and because the *mass* was never stated, it must not be fed back as
+    # an observation of this user's roti portion.
+    assert seam.record_serving_observation_calls == []
+
+
+def test_send_message_count_only_mention_prefers_the_users_own_history(seam, monkeypatch):
+    roti = make_food(
+        id="food-roti",
+        name="Roti",
+        defaultState="COOKED",
+        rawToCookedYield=None,
+        servingUnits=[],
+        defaultServingGrams=40.0,
+        category="GRAIN",
+    )
+    seam.foods.clear()
+    seam.foods["food-roti"] = roti
+    seam.serving_preferences[("user-1", "food-roti", "COOKED")] = SimpleNamespace(
+        recentGrams=[55.0, 60.0, 50.0], medianGrams=55.0, observations=3
+    )
+
+    response = send(seam, "3 rotis")
+
+    item = response["draft"]["items"][0]
+    assert item["grams"] == pytest.approx(165.0)  # 3 x the user's own 55g median
+    assert item["massSource"] == "USER_HISTORY"
+
+
+def test_send_message_count_only_mention_alongside_a_quantified_one(seam, monkeypatch):
+    rice = make_food()
+    roti = make_food(
+        id="food-roti",
+        name="Roti",
+        defaultState="COOKED",
+        rawToCookedYield=None,
+        servingUnits=[],
+        defaultServingGrams=40.0,
+        category="GRAIN",
+    )
+    seam.foods.clear()
+    seam.foods.update({"food-rice": rice, "food-roti": roti})
+
+    def search_foods(query, **kw):
+        return [roti] if "roti" in query else [rice]
+
+    monkeypatch.setattr(meals_repository, "search_foods", search_foods)
+    calls = stub_call_small_model(monkeypatch, result=None)
+
+    response = send(seam, "200g rice and 2 rotis")
+
+    assert calls == []
+    items = response["draft"]["items"]
+    assert [i["grams"] for i in items] == [pytest.approx(200.0), pytest.approx(80.0)]
+    # Both amounts were stated; only the second needed a ladder conversion.
+    assert [i["quantitySource"] for i in items] == ["EXPLICIT", "EXPLICIT"]
+    assert [i["massSource"] for i in items] == ["DIRECT", "CATALOG_SERVING"]
+    # Only the directly-stated mass counts as an observation of a portion.
+    assert seam.record_serving_observation_calls == [("user-1", "food-rice", "COOKED", 200.0)]
+    assert response["unconsumedText"] == []
+
+
+def test_send_message_ignores_a_bare_food_mention_by_default(seam, monkeypatch):
+    """`PARSER_BARE_FOOD_MENTION_ENABLED` off: a bare name is the weakest
+    signal in the pipeline, so it stays an honest miss rather than a guess."""
+    noodles = make_food(id="food-noodles", name="Noodles", servingUnits=[], defaultServingGrams=180.0)
+    seam.foods.clear()
+    seam.foods["food-noodles"] = noodles
+
+    response = send(seam, "noodles")
+
+    assert response["draft"] is None
+    assert response["aiFallbackDisabled"] is True
+    assert response["unconsumedText"] == ["noodles"]
+
+
+@override_settings(PARSER_BARE_FOOD_MENTION_ENABLED=True)
+def test_send_message_resolves_a_bare_food_mention_when_enabled(seam, monkeypatch):
+    noodles = make_food(
+        id="food-noodles",
+        name="Noodles",
+        defaultState="COOKED",
+        rawToCookedYield=None,
+        servingUnits=[],
+        defaultServingGrams=180.0,
+        category="GRAIN",
+    )
+    seam.foods.clear()
+    seam.foods["food-noodles"] = noodles
+    calls = stub_call_small_model(monkeypatch, result=None)
+
+    response = send(seam, "noodles")
+
+    assert calls == []
+    assert response["tier"] == "PARSER"
+    item = response["draft"]["items"][0]
+    assert item["grams"] == pytest.approx(180.0)  # one assumed serving
+    # Nothing was stated at all, so this one *is* ASSUMED - it earns the
+    # `est.` chip that "2 rotis" correctly does not.
+    assert item["quantitySource"] == "ASSUMED"
+    assert item["massSource"] == "CATALOG_SERVING"
+    assert seam.record_serving_observation_calls == []
+
+
+def test_send_message_count_only_mention_the_ladder_cannot_finish_stays_unconsumed(seam, monkeypatch):
+    """A matched food with no serving data anywhere on the ladder - reported
+    back verbatim (§12.13), never logged as a guessed amount."""
+    mystery = make_food(
+        id="food-mystery",
+        name="Mystery Paste",
+        servingUnits=[],
+        defaultServingGrams=None,
+        category=None,
+    )
+    seam.foods.clear()
+    seam.foods["food-mystery"] = mystery
+
+    response = send(seam, "2 mystery pastes")
+
+    assert response["draft"] is None
+    assert response["unconsumedText"] == ["2 mystery pastes"]
+
+
+def test_send_message_count_only_mention_expands_a_composite_dish(seam, monkeypatch):
+    rice = make_food()
+    chicken = make_food(id="food-chicken", name="Grilled Chicken Breast")
+    seam.foods.update({"food-rice": rice, "food-chicken": chicken})
+    seam.composites["composite-1"] = make_composite(
+        name="Chicken Biryani",
+        aliases=["biryani"],
+        servingGrams=350.0,
+        components=[make_component(rice, 0.65), make_component(chicken, 0.30)],
+    )
+    calls = stub_call_small_model(monkeypatch, result=None)
+
+    response = send(seam, "2 biryani")
+
+    assert calls == []
+    items = response["draft"]["items"]
+    assert len(items) == 2
+    assert sum(i["grams"] for i in items) == pytest.approx(2 * 350.0 * 0.95)
+    assert all(i["quantitySource"] == "EXPLICIT" for i in items)
+    assert all(i["massSource"] == "CATALOG_SERVING" for i in items)
+
+
+def test_send_message_adds_a_count_only_mention_to_an_open_draft(seam, monkeypatch):
+    roti = make_food(
+        id="food-roti",
+        name="Roti",
+        defaultState="COOKED",
+        rawToCookedYield=None,
+        servingUnits=[],
+        defaultServingGrams=40.0,
+        category="GRAIN",
+    )
+    seam.foods["food-roti"] = roti
+    send(seam, "200g rice")
+
+    def search_foods(query, **kw):
+        return [roti] if "roti" in query else [make_food()]
+
+    monkeypatch.setattr(meals_repository, "search_foods", search_foods)
+    calls = stub_call_small_model(monkeypatch, result=None)
+
+    response = send(seam, "2 rotis", client_message_id="m2", onOpenDraft="ADD")
+
+    assert calls == []
+    assert response["intent"] == "ADD_ITEM"
+    items = response["draft"]["items"]
+    assert len(items) == 2
+    assert items[-1]["grams"] == pytest.approx(80.0)
 
 
 def test_explicit_structured_create_records_a_serving_observation(seam):
@@ -1551,7 +1841,7 @@ def _chicken_food(**overrides):
     return make_food(**fields)
 
 
-@override_settings(AI_QUOTA_LIMIT=2)
+@override_settings(AI_QUOTA_LIMIT=2, AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_quota_allows_up_to_the_limit_then_blocks(seam, monkeypatch):
     seam.foods["food-chicken"] = _chicken_food()
     envelope = llm_envelope(
@@ -1574,6 +1864,7 @@ def test_send_message_quota_allows_up_to_the_limit_then_blocks(seam, monkeypatch
     assert len(calls) == 2  # the third message never reached the model
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t0_cache_hit_does_not_consume_quota(seam, monkeypatch):
     seam.foods["food-chicken"] = _chicken_food()
     envelope = llm_envelope(
@@ -1610,6 +1901,7 @@ def test_versioned_cache_key_changes_with_the_parser_version(seam):
     assert key_v1 != key_v2
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t0_cache_hit_is_invalidated_by_a_catalog_version_bump(seam, monkeypatch):
     seam.foods["food-chicken"] = _chicken_food()
     envelope = llm_envelope(
@@ -1628,6 +1920,7 @@ def test_send_message_t0_cache_hit_is_invalidated_by_a_catalog_version_bump(seam
     assert response["tier"] != "CACHE"
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_l2_cache_hit_for_a_different_user_skips_the_llm_call(seam, monkeypatch):
     seam.foods["food-chicken"] = _chicken_food()
     envelope = llm_envelope(
@@ -1653,6 +1946,7 @@ def test_send_message_l2_cache_hit_for_a_different_user_skips_the_llm_call(seam,
     assert seam.global_cache_hit_calls
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_global_cache_entry_falls_through_when_the_cached_food_no_longer_resolves(seam, monkeypatch):
     seam.foods["food-chicken"] = _chicken_food()
     content = "grilled chicken salad with a tahini dressing"
@@ -1677,6 +1971,7 @@ def test_global_cache_entry_falls_through_when_the_cached_food_no_longer_resolve
     assert response["tier"] == "LLM_SMALL"
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_l2_cache_entry_is_unreachable_after_a_catalog_version_bump(seam, monkeypatch):
     seam.foods["food-chicken"] = _chicken_food()
     envelope = llm_envelope(
@@ -1697,6 +1992,7 @@ def test_l2_cache_entry_is_unreachable_after_a_catalog_version_bump(seam, monkey
     assert response["tier"] != "CACHE"
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True, AI_T3_ESCALATION_ENABLED=True)
 def test_send_message_escalates_to_t3_on_low_confidence_t2_result(seam, monkeypatch):
     seam.foods["food-chicken"] = _chicken_food()
     low_confidence = llm_envelope(
@@ -1722,6 +2018,25 @@ def test_send_message_escalates_to_t3_on_low_confidence_t2_result(seam, monkeypa
     assert events_by_tier["LLM_LARGE"] is False
 
 
+def test_send_message_ai_t3_escalation_disabled_keeps_low_confidence_t2_result(seam, monkeypatch):
+    seam.foods["food-chicken"] = _chicken_food()
+    low_confidence = llm_envelope(
+        items=[llm_item("grilled chicken breast", quantity=150, unit="g", confidence=0.3)]
+    )
+    small_calls = stub_call_small_model(monkeypatch, result=stub_llm_response(low_confidence))
+    large_calls = stub_call_large_model(monkeypatch, result=stub_llm_response(llm_envelope()))
+
+    with override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True, AI_T3_ESCALATION_ENABLED=False):
+        response = send(seam, "grilled chicken salad with a tahini dressing")
+
+    assert len(small_calls) == 1
+    assert large_calls == []  # never escalated - T2's own result is trusted as final
+    assert response["tier"] == "LLM_SMALL"
+    assert response["intent"] == "LOG_NEW"
+    assert response["aiFallbackDisabled"] is False  # AI was used, just not escalated
+
+
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_does_not_escalate_to_t3_on_high_confidence_t2_result(seam, monkeypatch):
     seam.foods["food-chicken"] = _chicken_food()
     envelope = llm_envelope(
@@ -1736,6 +2051,7 @@ def test_send_message_does_not_escalate_to_t3_on_high_confidence_t2_result(seam,
     assert response["tier"] == "LLM_SMALL"
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_does_not_escalate_to_t3_on_a_t2_call_failure(seam, monkeypatch):
     stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
     large_calls = stub_call_large_model(monkeypatch, result=stub_llm_response(llm_envelope()))
@@ -1747,6 +2063,7 @@ def test_send_message_does_not_escalate_to_t3_on_a_t2_call_failure(seam, monkeyp
     assert response["intent"] == "OTHER"
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 @pytest.mark.parametrize("intent", ["DIARY_QUERY", "APP_HELP", "SOCIAL", "UNCLEAR", "OTHER"])
 def test_send_message_does_not_escalate_to_t3_for_a_non_logging_intent_with_empty_items(
     seam, monkeypatch, intent
@@ -1773,6 +2090,7 @@ def test_send_message_does_not_escalate_to_t3_for_a_non_logging_intent_with_empt
 # -- conversational edits via AI + DraftOperation audit log (Chunk 5a) -------
 
 
+@override_settings(AI_EDIT_FALLBACK_ENABLED=True)
 def test_send_message_ai_edit_set_slot_updates_the_open_draft(seam, monkeypatch):
     create_lunch_draft(seam)
     envelope = llm_envelope(intent="SET_SLOT", slot="BREAKFAST")
@@ -1784,6 +2102,7 @@ def test_send_message_ai_edit_set_slot_updates_the_open_draft(seam, monkeypatch)
     assert response["draft"]["slot"] == "BREAKFAST"
 
 
+@override_settings(AI_EDIT_FALLBACK_ENABLED=True)
 def test_send_message_ai_edit_add_item_appends_to_the_open_draft(seam, monkeypatch):
     create_lunch_draft(seam)  # 200g rice
     seam.foods["food-chicken"] = _chicken_food()
@@ -1801,6 +2120,7 @@ def test_send_message_ai_edit_add_item_appends_to_the_open_draft(seam, monkeypat
     assert any(i["foodName"] == "Grilled Chicken Breast" for i in items)
 
 
+@override_settings(AI_EDIT_FALLBACK_ENABLED=True)
 def test_send_message_ai_edit_edit_item_updates_the_target(seam, monkeypatch):
     create_lunch_draft(seam)  # 200g rice
     envelope = llm_envelope(
@@ -1816,6 +2136,7 @@ def test_send_message_ai_edit_edit_item_updates_the_target(seam, monkeypatch):
     assert response["draft"]["items"][0]["quantity"] == 100.0
 
 
+@override_settings(AI_EDIT_FALLBACK_ENABLED=True)
 def test_send_message_ai_edit_remove_item_deletes_the_target(seam, monkeypatch):
     create_lunch_draft(seam)  # 200g rice
     envelope = llm_envelope(intent="REMOVE_ITEM", target_ref="the rice")
@@ -1827,6 +2148,7 @@ def test_send_message_ai_edit_remove_item_deletes_the_target(seam, monkeypatch):
     assert response["draft"]["items"] == []
 
 
+@override_settings(AI_EDIT_FALLBACK_ENABLED=True)
 def test_send_message_ai_edit_ambiguous_target_asks_for_clarification(seam, monkeypatch):
     create_lunch_draft(seam)  # only "Cooked White Rice" on the draft
     envelope = llm_envelope(intent="REMOVE_ITEM", target_ref="xyzzyplonk")
@@ -1838,6 +2160,7 @@ def test_send_message_ai_edit_ambiguous_target_asks_for_clarification(seam, monk
     assert response["draft"]["items"][0]["grams"] == 200.0  # unchanged
 
 
+@override_settings(AI_EDIT_FALLBACK_ENABLED=True)
 def test_ai_edit_falls_back_gracefully_on_call_failure(seam, monkeypatch):
     create_lunch_draft(seam)
     stub_call_small_model(monkeypatch, exc=LLMCallError("boom"))
@@ -1848,6 +2171,7 @@ def test_ai_edit_falls_back_gracefully_on_call_failure(seam, monkeypatch):
     assert response["intent"] == "OTHER"
 
 
+@override_settings(AI_EDIT_FALLBACK_ENABLED=True)
 def test_ai_edit_falls_back_gracefully_when_envelope_is_not_actionable(seam, monkeypatch):
     create_lunch_draft(seam)
     envelope = llm_envelope(intent="LOG_NEW", items=[])  # not actionable on an open draft
@@ -1858,6 +2182,22 @@ def test_ai_edit_falls_back_gracefully_when_envelope_is_not_actionable(seam, mon
     assert response["intent"] == "OTHER"
 
 
+def test_ai_edit_fallback_disabled_responds_gracefully(seam, monkeypatch):
+    create_lunch_draft(seam)
+    calls = stub_call_small_model(
+        monkeypatch, result=stub_llm_response(llm_envelope(intent="SET_SLOT", slot="BREAKFAST"))
+    )
+
+    with override_settings(AI_EDIT_FALLBACK_ENABLED=False):
+        response = send(seam, "this was actually breakfast, my bad", client_message_id="m2")
+
+    assert calls == []
+    assert response["tier"] == "PARSER"
+    assert response["intent"] == "OTHER"
+    assert response["aiFallbackDisabled"] is True
+
+
+@override_settings(AI_EDIT_FALLBACK_ENABLED=True)
 def test_ai_edit_call_is_quota_exempt(seam, monkeypatch):
     create_lunch_draft(seam)
     envelope = llm_envelope(intent="SET_SLOT", slot="BREAKFAST")
@@ -1871,6 +2211,7 @@ def test_ai_edit_call_is_quota_exempt(seam, monkeypatch):
     assert edit_events[0].countedToQuota is False
 
 
+@override_settings(AI_EDIT_FALLBACK_ENABLED=True)
 def test_ai_edit_does_not_escalate_to_t3_even_on_low_confidence(seam, monkeypatch):
     create_lunch_draft(seam)
     seam.foods["food-chicken"] = _chicken_food()
@@ -1970,6 +2311,7 @@ def test_resolve_estimated_dish_returns_none_for_an_unknown_category(seam):
     assert seam.food_misses == ["some mystery dish"]  # still files, even unresolved
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_log_new_with_dish_category_creates_an_estimated_dish_item(seam, monkeypatch):
     seam.dish_category_profiles["SPICED_CURRY"] = make_dish_profile()
     envelope = llm_envelope(
@@ -1993,6 +2335,7 @@ def test_send_message_log_new_with_dish_category_creates_an_estimated_dish_item(
     assert response["draft"]["totals"]["proteinG"] is None  # nothing else on the draft
 
 
+@override_settings(AI_EDIT_FALLBACK_ENABLED=True)
 def test_send_message_ai_edit_add_item_with_dish_category(seam, monkeypatch):
     create_lunch_draft(seam)  # 200g rice open draft
     seam.dish_category_profiles["FRIED_SNACK"] = make_dish_profile(
@@ -2159,6 +2502,7 @@ def test_nutrition_qa_deflects_on_no_catalog_match(seam):
     assert "couldn't find" in response["assistantText"].lower()
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t2_classifies_diary_query_when_t1_misses(seam, monkeypatch):
     seam.logged_meals.append(make_logged_meal_row(caloriesKcal=300.0))
     envelope = llm_envelope(intent="DIARY_QUERY", items=[])
@@ -2171,6 +2515,7 @@ def test_send_message_t2_classifies_diary_query_when_t1_misses(seam, monkeypatch
     assert "300" in response["assistantText"]
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t2_classifies_nutrition_qa_using_envelope_items(seam, monkeypatch):
     envelope = llm_envelope(
         intent="NUTRITION_QA", items=[llm_item("cooked white rice", confidence=0.8)]
@@ -2184,6 +2529,7 @@ def test_send_message_t2_classifies_nutrition_qa_using_envelope_items(seam, monk
     assert "Cooked White Rice" in response["assistantText"]
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_send_message_t2_non_logging_intent_does_not_refund_quota(seam, monkeypatch):
     envelope = llm_envelope(intent="OTHER", items=[])
     stub_call_small_model(monkeypatch, result=stub_llm_response(envelope))
@@ -2196,6 +2542,7 @@ def test_send_message_t2_non_logging_intent_does_not_refund_quota(seam, monkeypa
 # -- WELLBEING_FLAG (Chunk 6b, §5.6) -----------------------------------------
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True, AI_T3_ESCALATION_ENABLED=True)
 def test_send_message_wellbeing_flag_from_t2_is_confirmed_by_t3(seam, monkeypatch):
     t2_envelope = llm_envelope(intent="WELLBEING_FLAG", items=[])
     t3_envelope = llm_envelope(intent="LOG_NEW", items=[])  # T3 disagreeing shouldn't matter
@@ -2213,6 +2560,21 @@ def test_send_message_wellbeing_flag_from_t2_is_confirmed_by_t3(seam, monkeypatc
     assert seam.gamification_suppressed_sessions == ["session-1"]
 
 
+def test_send_message_ai_t3_escalation_disabled_still_flags_wellbeing_unverified(seam, monkeypatch):
+    t2_envelope = llm_envelope(intent="WELLBEING_FLAG", items=[])
+    stub_call_small_model(monkeypatch, result=stub_llm_response(t2_envelope))
+    large_calls = stub_call_large_model(monkeypatch, result=stub_llm_response(llm_envelope()))
+
+    with override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True, AI_T3_ESCALATION_ENABLED=False):
+        response = send(seam, "i've been skipping meals all week and feel awful")
+
+    assert large_calls == []  # never double-checked, but still honored (fail-safe, not fail-open)
+    assert response["tier"] == "LLM_SMALL"
+    assert response["intent"] == "WELLBEING_FLAG"
+    assert response["gamificationSuppressed"] is True
+
+
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True, AI_T3_ESCALATION_ENABLED=True)
 def test_send_message_wellbeing_flag_from_t2_survives_a_t3_call_failure(seam, monkeypatch):
     t2_envelope = llm_envelope(intent="WELLBEING_FLAG", items=[])
     stub_call_small_model(monkeypatch, result=stub_llm_response(t2_envelope))
@@ -2223,6 +2585,7 @@ def test_send_message_wellbeing_flag_from_t2_survives_a_t3_call_failure(seam, mo
     assert response["intent"] == "WELLBEING_FLAG"
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True, AI_T3_ESCALATION_ENABLED=True)
 def test_send_message_wellbeing_flag_surfaced_by_t3_after_low_confidence_t2(seam, monkeypatch):
     t2_envelope = llm_envelope(intent="LOG_NEW", items=[llm_item("something", confidence=0.1)])
     t3_envelope = llm_envelope(intent="WELLBEING_FLAG", items=[])
@@ -2234,6 +2597,7 @@ def test_send_message_wellbeing_flag_surfaced_by_t3_after_low_confidence_t2(seam
     assert response["intent"] == "WELLBEING_FLAG"
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True, AI_T3_ESCALATION_ENABLED=True)
 def test_send_message_wellbeing_flag_consumes_quota_only_once(seam, monkeypatch):
     t2_envelope = llm_envelope(intent="WELLBEING_FLAG", items=[])
     stub_call_small_model(monkeypatch, result=stub_llm_response(t2_envelope))
@@ -2497,6 +2861,7 @@ def test_send_message_records_no_request_id_outside_a_request(seam):
     assert all(m.requestId is None for m in seam.messages)
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_call_llm_records_the_request_id_on_a_successful_parse_event(seam, monkeypatch):
     monkeypatch.setattr(services, "current_request_id", lambda: "req-success")
     seam.foods["food-chicken"] = _chicken_food()
@@ -2511,6 +2876,7 @@ def test_call_llm_records_the_request_id_on_a_successful_parse_event(seam, monke
     assert seam.parse_events[0].requestId == "req-success"
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_call_llm_records_the_request_id_on_a_call_failure(seam, monkeypatch):
     monkeypatch.setattr(services, "current_request_id", lambda: "req-failure")
     stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
@@ -2521,6 +2887,7 @@ def test_call_llm_records_the_request_id_on_a_call_failure(seam, monkeypatch):
     assert seam.parse_events[0].requestId == "req-failure"
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_call_llm_records_the_request_id_on_a_validation_failure(seam, monkeypatch):
     monkeypatch.setattr(services, "current_request_id", lambda: "req-invalid")
     bad_envelope = llm_envelope(items=[llm_item("chicken", state="sizzling", confidence=0.5)])
@@ -2535,7 +2902,7 @@ def test_call_llm_records_the_request_id_on_a_validation_failure(seam, monkeypat
 # -- cost circuit breaker (Chunk 8d, §11, §12.8) ------------------------------
 
 
-@override_settings(AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD=3)
+@override_settings(AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD=3, AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_circuit_breaker_trips_after_the_threshold_and_skips_the_next_call(seam, monkeypatch):
     calls = stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
 
@@ -2554,7 +2921,11 @@ def test_circuit_breaker_trips_after_the_threshold_and_skips_the_next_call(seam,
     assert not hasattr(seam.parse_events[-1], "model")  # no real call was ever attempted
 
 
-@override_settings(AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD=3)
+@override_settings(
+    AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD=3,
+    AI_NEW_MEAL_FALLBACK_ENABLED=True,
+    AI_EDIT_FALLBACK_ENABLED=True,
+)
 def test_circuit_breaker_resets_on_a_successful_call_before_reaching_the_threshold(seam, monkeypatch):
     stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
     send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m1")
@@ -2579,6 +2950,7 @@ def test_circuit_breaker_resets_on_a_successful_call_before_reaching_the_thresho
     assert seam.circuit_breaker.openedAt is None  # still below threshold
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_llm_configuration_error_never_opens_the_circuit_breaker(seam, monkeypatch):
     def fake(system_prompt, user_content):
         raise LLMConfigurationError("OPENAI_API_KEY must be set to call the LLM provider.")
@@ -2592,7 +2964,9 @@ def test_llm_configuration_error_never_opens_the_circuit_breaker(seam, monkeypat
     assert seam.circuit_breaker.openedAt is None
 
 
-@override_settings(AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD=1, AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS=60)
+@override_settings(
+    AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD=1, AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS=60, AI_NEW_MEAL_FALLBACK_ENABLED=True
+)
 def test_circuit_breaker_reopens_on_a_failed_probe_after_cooldown(seam, monkeypatch):
     stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
     send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m1")
@@ -2609,7 +2983,9 @@ def test_circuit_breaker_reopens_on_a_failed_probe_after_cooldown(seam, monkeypa
     assert seam.circuit_breaker.openedAt > datetime.now(timezone.utc) - timedelta(seconds=5)
 
 
-@override_settings(AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD=1, AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS=60)
+@override_settings(
+    AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD=1, AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS=60, AI_NEW_MEAL_FALLBACK_ENABLED=True
+)
 def test_circuit_breaker_closes_on_a_successful_probe_after_cooldown(seam, monkeypatch):
     stub_call_small_model(monkeypatch, exc=LLMCallError("provider timeout"))
     send(seam, "grilled chicken salad with a tahini dressing", client_message_id="m1")
@@ -2629,6 +3005,7 @@ def test_circuit_breaker_closes_on_a_successful_probe_after_cooldown(seam, monke
     assert seam.circuit_breaker.openedAt is None
 
 
+@override_settings(AI_NEW_MEAL_FALLBACK_ENABLED=True)
 def test_validation_failure_neither_opens_nor_resets_the_circuit_breaker(seam, monkeypatch):
     bad_envelope = llm_envelope(items=[llm_item("chicken", state="sizzling", confidence=0.5)])
     stub_call_small_model(monkeypatch, result=stub_llm_response(bad_envelope))
@@ -2637,3 +3014,85 @@ def test_validation_failure_neither_opens_nor_resets_the_circuit_breaker(seam, m
 
     assert seam.circuit_breaker.consecutiveFailures == 0
     assert seam.circuit_breaker.openedAt is None
+
+
+# -- _resolve_food_by_name at bulk-catalog scale (USDA/INDB/OFF ingestion) ----
+
+
+def _stub_search(monkeypatch, foods):
+    queries = []
+
+    def search_foods(query, **kw):
+        queries.append((query, kw))
+        return foods
+
+    monkeypatch.setattr(meals_repository, "search_foods", search_foods)
+    return queries
+
+
+def test_resolve_food_by_name_searches_with_the_query_not_a_catalog_scan(monkeypatch):
+    queries = _stub_search(monkeypatch, [make_food()])
+    services._resolve_food_by_name("rice")
+    assert queries == [("rice", {"limit": services._RESOLVE_CANDIDATES})]
+
+
+def test_resolve_food_by_name_prefers_generic_over_branded_on_a_tie(monkeypatch):
+    branded = make_food(id="off-1", name="Hummus", source="OPEN_FOOD_FACTS", brand="Brand A")
+    generic = make_food(id="usda-1", name="Hummus, plain", source="USDA")
+    _stub_search(monkeypatch, [branded, generic])
+
+    food, score, band = services._resolve_food_by_name("hummus")
+
+    assert food.id == "usda-1"
+    assert (score, band) == (1.0, "HIGH")
+
+
+def test_resolve_food_by_name_prefers_a_whole_word_match_over_a_substring(monkeypatch):
+    licorice = make_food(id="usda-2", name="Licorice", source="USDA")
+    rice = make_food(id="usda-3", name="Rice, white, cooked", source="USDA")
+    _stub_search(monkeypatch, [licorice, rice])
+
+    food, _score, _band = services._resolve_food_by_name("rice")
+
+    assert food.id == "usda-3"
+
+
+def test_resolve_food_by_name_prefers_curated_then_shorter_names(monkeypatch):
+    usda = make_food(id="usda-4", name="Rice, white, cooked", source="USDA")
+    curated = make_food(id="food-rice", name="Cooked White Rice", source="CALORYX_CURATED")
+    long_usda = make_food(id="usda-5", name="Rice, white, long-grain, regular, cooked", source="USDA")
+    _stub_search(monkeypatch, [usda, long_usda, curated])
+    assert services._resolve_food_by_name("rice")[0].id == "food-rice"
+
+    _stub_search(monkeypatch, [long_usda, usda])
+    assert services._resolve_food_by_name("rice")[0].id == "usda-4"
+
+
+def test_resolve_food_by_name_score_still_outranks_tie_breaks(monkeypatch):
+    # A curated food that matches worse never beats a better-scoring branded one.
+    curated = make_food(id="food-rice", name="Cooked White Rice", source="CALORYX_CURATED")
+    branded = make_food(id="off-2", name="Hummus", source="OPEN_FOOD_FACTS", brand="Brand A")
+    _stub_search(monkeypatch, [curated, branded])
+    assert services._resolve_food_by_name("hummus")[0].id == "off-2"
+
+
+def test_resolve_food_by_name_prefers_the_food_itself_over_things_made_with_it(monkeypatch):
+    # Real USDA SR Legacy names - all exact-substring matches for "egg".
+    _stub_search(monkeypatch, [
+        make_food(id="u1", name="Bread, egg", source="USDA"),
+        make_food(id="u2", name="Egg, yolk, dried", source="USDA"),
+        make_food(id="u3", name="Egg, whole, raw, fresh", source="USDA"),
+    ])
+    assert services._resolve_food_by_name("egg")[0].id == "u3"
+
+
+def test_resolve_food_by_name_matches_reordered_words_and_plurals(monkeypatch):
+    _stub_search(monkeypatch, [
+        make_food(id="u1", name="Snacks, brown rice chips", source="USDA"),
+        make_food(id="u2", name="Rice, brown, long-grain, cooked", source="USDA"),
+        make_food(id="u3", name="Pepper, banana, raw", source="USDA"),
+        make_food(id="u4", name="Bananas, raw", source="USDA"),
+    ])
+    assert services._resolve_food_by_name("brown rice")[0].id == "u2"
+    food, _score, band = services._resolve_food_by_name("banana")
+    assert (food.id, band) == ("u4", "HIGH")

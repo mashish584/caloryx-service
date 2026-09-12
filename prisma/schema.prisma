@@ -5,11 +5,15 @@ generator client {
   provider             = "prisma-client-py"
   interface            = "sync"
   recursive_type_depth = 5
+  // pg_trgm backs Food's name search index - declared here rather than in
+  // raw SQL so `prisma db push` doesn't see the index as drift and drop it.
+  previewFeatures      = ["postgresqlExtensions"]
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pg_trgm]
 }
 
 enum SexAtBirth {
@@ -197,6 +201,10 @@ enum FoodSource {
   USDA
   OPEN_FOOD_FACTS
   CALORYX_CURATED
+  // Indian Nutrient Databank (Anuvaad, derived from ICMR-NIN IFCT 2017) -
+  // its own value, not CALORYX_CURATED, so the source sheet (§5.2.1) credits
+  // the right database.
+  INDB
 }
 
 /// Raw vs. cooked - the single largest accuracy risk in text-based logging
@@ -237,9 +245,12 @@ model Food {
   id     String     @id @default(cuid())
   name   String
   source FoodSource
-  // External id/name at the source - USDA FDC id, Open Food Facts barcode, or
-  // a curation note. Nullable for CALORYX_CURATED entries with no upstream ref.
+  // External id/name at the source - USDA FDC id, Open Food Facts barcode,
+  // INDB food code, or a curation note. Nullable for CALORYX_CURATED entries
+  // with no upstream ref.
   sourceRef        String?
+  // Open Food Facts only - generic sources (USDA/INDB/curated) have no brand.
+  brand            String?
   defaultState     FoodState @default(UNSPECIFIED)
   // Grams-cooked-per-gram-raw. Null when the food has no meaningful raw/cooked
   // distinction (a banana) or the factor isn't catalogued yet - logging this
@@ -277,7 +288,13 @@ model Food {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  // Idempotent re-ingest (`manage.py ingest_foods`). Curated rows with a null
+  // sourceRef never collide - Postgres treats every NULL as distinct.
+  @@unique([source, sourceRef])
   @@index([name])
+  // Trigram candidate retrieval for free-text search (meals.repository
+  // .search_foods) - serves both `ILIKE '%q%'` and `q <% name`.
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "Food_name_trgm_idx")
 }
 
 /// Ladder step 4's fallback bucket (§5.1.1a) - a coarse default for a food with

@@ -24,6 +24,7 @@ def make_food(**overrides):
         id="food-rice",
         name="Cooked White Rice",
         source="CALORYX_CURATED",
+        brand=None,
         defaultState="COOKED",
         rawToCookedYield=3.0,
         caloriesKcalPer100g=130.0,

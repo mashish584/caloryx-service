@@ -283,14 +283,14 @@ def try_consume_quota(user_id: str, limit: int, window: timedelta) -> Tuple[Any,
         where={"userId": user_id, "windowStart": {"gt": floor}, "count": {"lt": limit}},
         data={"count": {"increment": 1}},
     )
-    consumed = bumped.count == 1
+    consumed = bumped == 1
 
     if not consumed:
         reset = client.aiquotacounter.update_many(
             where={"userId": user_id, "windowStart": {"lte": floor}},
             data={"windowStart": now, "count": 1},
         )
-        consumed = reset.count == 1
+        consumed = reset == 1
 
     counter = client.aiquotacounter.find_unique(where={"userId": user_id})
     if counter is None:
