@@ -32,6 +32,10 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 # forgets to should degrade via `LLMConfigurationError`, not silently make a
 # real, paid network call using whatever's in a local .env.
 OPENAI_API_KEY = ""
+# Same reasoning one layer further: even with no key, a test that forgot to
+# patch `embed_batch` should fail on configuration rather than get as far as
+# constructing a request against whatever model a local .env happens to name.
+EMBEDDING_MODEL = ""
 
 MINIMUM_AGE_YEARS = 18
 MAXIMUM_AGE_YEARS = 100

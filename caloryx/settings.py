@@ -192,6 +192,49 @@ OPENAI_LARGE_MODEL_OUTPUT_COST_PER_1M_MICROS = int(
     env("OPENAI_LARGE_MODEL_OUTPUT_COST_PER_1M_MICROS", "10000000")
 )
 
+# --- Embeddings (semantic resolution, §7.2/§7.6/§12.6, Chunk 9a) -----------
+# The PRD specifies food matching as "lexical (trigram) + semantic
+# (embedding) similarity" (§7.2) and composite matching by the same machinery
+# (§7.6). Chunk 9a builds the infrastructure only: the columns exist and the
+# backfill command fills them, but nothing on the request path reads them
+# until Chunk 9b, which is what SEMANTIC_RESOLUTION_ENABLED below gates.
+EMBEDDING_MODEL = env("EMBEDDING_MODEL", "text-embedding-3-small")
+# MUST match the `vector(N)` width declared on Food.embedding /
+# CompositeFood.embedding in prisma/schema.prisma - Postgres rejects an
+# insert of any other width, and the schema cannot read this setting.
+# `backfill_food_embeddings` verifies the two agree before writing anything.
+EMBEDDING_DIMENSIONS = int(env("EMBEDDING_DIMENSIONS", "1536"))
+# Per-request batch size for the provider's embeddings endpoint. Well under
+# the API's own cap - the backfill is throughput-bound on the round trip, not
+# on how many strings fit in one body.
+EMBEDDING_MAX_BATCH = int(env("EMBEDDING_MAX_BATCH", "256"))
+EMBEDDING_TIMEOUT_SECONDS = float(env("EMBEDDING_TIMEOUT_SECONDS", "30"))
+# Same caveat as the completion pricing below: approximate list pricing, only
+# feeding ParseEvent.costMicros, never a charge. Embeddings have no output
+# tokens, so there is one constant here rather than an input/output pair.
+EMBEDDING_INPUT_COST_PER_1M_MICROS = int(env("EMBEDDING_INPUT_COST_PER_1M_MICROS", "20000"))
+# Kill switch for Chunk 9b's hybrid resolution, declared here in 9a so the
+# off-state is the one that ships first and 9b only has to flip a read.
+# Off means `_resolve_food_by_name` behaves exactly as it does today:
+# trigram candidates, `score_food_match` bands, no vector query at all.
+SEMANTIC_RESOLUTION_ENABLED = env_bool("SEMANTIC_RESOLUTION_ENABLED", False)
+# Cosine-similarity floor for accepting a food that the trigram window never
+# found. Uncalibrated - there is no production traffic here to fit it against,
+# and §7.4's only guidance ("gate this behind a high threshold") is not a
+# number. Deliberately conservative: below this, the item stays UNRESOLVED and
+# goes to FoodMissQueue, which §7.4 says is the better error of the two.
+SEMANTIC_MATCH_FLOOR = float(env("SEMANTIC_MATCH_FLOOR", "0.75"))
+# Higher still for composites, because the failure is worse: a wrong food is
+# one wrong row the user can see and fix, while a wrong *dish* silently
+# expands into several component rows they never asked for (§7.6).
+SEMANTIC_COMPOSITE_FLOOR = float(env("SEMANTIC_COMPOSITE_FLOOR", "0.85"))
+# ANN window sizes. Smaller than the trigram window (_RESOLVE_CANDIDATES=100)
+# on purpose: a vector index returns its nearest neighbours already ordered by
+# the thing being thresholded, so a wide window adds candidates that are by
+# construction worse than the ones already in it.
+SEMANTIC_CANDIDATE_LIMIT = int(env("SEMANTIC_CANDIDATE_LIMIT", "25"))
+SEMANTIC_COMPOSITE_CANDIDATE_LIMIT = int(env("SEMANTIC_COMPOSITE_CANDIDATE_LIMIT", "10"))
+
 # --- AI quota & T3 escalation (§5.1.4, §7.1, §12.8, Chunk 4c) --------------
 # 20 LOG_NEW AI parses per rolling 24h for free tier (§5.1.4) - a semi-rolling
 # window (see assistant.repository.try_consume_quota), not a true sliding

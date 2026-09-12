@@ -7,7 +7,7 @@ and writes. Mirrors onboarding/repository.py.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from common.db import get_client
 
@@ -133,6 +133,224 @@ def upsert_food(record: Any) -> Any:
             },
         )
     return food
+
+
+# -- embeddings (`manage.py backfill_food_embeddings`, §7.2/§7.6, Chunk 9a) ---
+#
+# `Food.embedding` / `CompositeFood.embedding` are `Unsupported("vector(N)")`
+# in the schema, so the generated Prisma client cannot see them at all - no
+# `find_many` returns them and no `update` writes them. Everything below is
+# therefore raw SQL, the same way `search_foods` reaches pg_trgm's operators.
+# A vector crosses this boundary as pgvector's text form ('[0.1,0.2,...]')
+# and is cast with `::vector`, which is the documented input format.
+
+# Selects rows that have no vector, or whose vector came from a different
+# model than the one being backfilled with. `IS DISTINCT FROM` (not `<>`)
+# matters: a NULL embeddingModel must count as stale, and `<>` yields NULL
+# there, which WHERE reads as false.
+_NEEDS_EMBEDDING_PREDICATE = '(embedding IS NULL OR "embeddingModel" IS DISTINCT FROM $1)'
+
+# An empty $2 means "every source". Otherwise a comma-joined whitelist, split
+# server-side - the command validates each value against the FoodSource enum
+# before it gets here, and this stays parameterized either way.
+_SOURCE_FILTER = "($2 = '' OR source::text = ANY(string_to_array($2, ',')))"
+
+_COUNT_FOODS_SQL = 'SELECT COUNT(*)::int AS n FROM "Food" WHERE {} AND {}'.format(
+    _NEEDS_EMBEDDING_PREDICATE, _SOURCE_FILTER
+)
+
+# ORDER BY id makes this a stable cursor: rows written by the previous batch
+# drop out of the predicate, so re-running with the same LIMIT walks forward
+# rather than re-reading. That is the whole resumability mechanism - there is
+# no offset to lose track of if the command dies mid-run.
+_FETCH_FOODS_SQL = 'SELECT id, name, brand FROM "Food" WHERE {} AND {} ORDER BY id LIMIT $3'.format(
+    _NEEDS_EMBEDDING_PREDICATE, _SOURCE_FILTER
+)
+
+_COUNT_COMPOSITES_SQL = 'SELECT COUNT(*)::int AS n FROM "CompositeFood" WHERE {}'.format(
+    _NEEDS_EMBEDDING_PREDICATE
+)
+_FETCH_COMPOSITES_SQL = (
+    'SELECT id, name, aliases FROM "CompositeFood" WHERE {} ORDER BY id LIMIT $2'.format(
+        _NEEDS_EMBEDDING_PREDICATE
+    )
+)
+
+_SET_EMBEDDING_SQL = (
+    'UPDATE "{}" SET embedding = $1::vector, "embeddingModel" = $2, "embeddedAt" = NOW() WHERE id = $3'
+)
+
+
+# ANN retrieval, the semantic half of §7.2's match score. `<=>` is pgvector's
+# cosine *distance*, so similarity is `1 - distance` and the ORDER BY is
+# ascending - the operator is what the HNSW index (vector_cosine_ops) serves,
+# so the expression must stay in this exact form or the index goes unused and
+# this silently becomes a sequential scan of the catalog.
+#
+# `embedding IS NOT NULL` excludes rows the backfill hasn't reached (or that
+# were deliberately skipped, e.g. Open Food Facts). Those stay reachable
+# through `search_foods`'s trigram window exactly as before.
+_SEMANTIC_SEARCH_SQL = """
+SELECT id, 1 - (embedding <=> $1::vector) AS similarity
+FROM "{}"
+WHERE embedding IS NOT NULL
+ORDER BY embedding <=> $1::vector
+LIMIT $2
+"""
+
+
+def _semantic_search(table: str, vector: List[float], limit: int) -> List[Dict[str, Any]]:
+    return get_client().query_raw(
+        _SEMANTIC_SEARCH_SQL.format(table), _to_vector_literal(vector), limit
+    )
+
+
+def search_foods_by_embedding(
+    vector: List[float], *, limit: int = 25
+) -> List[Tuple[Any, float]]:
+    """Nearest catalog foods to a query vector, as `(food, similarity)` pairs
+    in descending similarity. Similarity is cosine, in [-1, 1] - callers
+    compare it against `settings.SEMANTIC_MATCH_FLOOR`, never against the
+    lexical thresholds in `chatparser.confidence`, which are a different
+    scale entirely."""
+    rows = _semantic_search("Food", vector, limit)
+    if not rows:
+        return []
+    similarity = {row["id"]: row["similarity"] for row in rows}
+    foods = get_client().food.find_many(
+        where={"id": {"in": list(similarity)}}, include=_FOOD_WITH_UNITS
+    )
+    return sorted(
+        ((food, similarity[food.id]) for food in foods), key=lambda pair: pair[1], reverse=True
+    )
+
+
+def search_composites_by_embedding(
+    vector: List[float], *, limit: int = 10
+) -> List[Tuple[Any, float]]:
+    """Same for composite dishes (§7.6). Components are included, because
+    every caller expands the dish immediately after matching it."""
+    rows = _semantic_search("CompositeFood", vector, limit)
+    if not rows:
+        return []
+    similarity = {row["id"]: row["similarity"] for row in rows}
+    composites = get_client().compositefood.find_many(
+        where={"id": {"in": list(similarity)}}, include=_COMPOSITE_WITH_COMPONENTS
+    )
+    return sorted(
+        ((c, similarity[c.id]) for c in composites), key=lambda pair: pair[1], reverse=True
+    )
+
+
+def vector_extension_installed() -> bool:
+    """Whether `CREATE EXTENSION vector` has actually run on this database.
+    `prisma db push` does it via the datasource's `extensions` list, but a
+    database restored from elsewhere (or pushed before Chunk 9a) may not have
+    it - and every query below fails opaquely without it."""
+    rows = get_client().query_raw("SELECT 1 AS ok FROM pg_extension WHERE extname = 'vector'")
+    return bool(rows)
+
+
+def embedding_column_width(table: str) -> Optional[int]:
+    """The `vector(N)` width Postgres actually has for `table.embedding`, or
+    None if the column doesn't exist. pgvector stores the declared dimension
+    in `atttypmod` directly. The schema hardcodes N and `settings
+    .EMBEDDING_DIMENSIONS` is set independently, so the backfill compares the
+    two here rather than discovering the mismatch as an insert error a few
+    thousand paid embeddings later."""
+    rows = get_client().query_raw(
+        """
+        SELECT a.atttypmod AS width
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        WHERE c.relname = $1 AND a.attname = 'embedding' AND NOT a.attisdropped
+        """,
+        table,
+    )
+    if not rows:
+        return None
+    width = rows[0]["width"]
+    return width if width and width > 0 else None
+
+
+def count_foods_needing_embedding(model: str, sources: Optional[List[str]] = None) -> int:
+    rows = get_client().query_raw(_COUNT_FOODS_SQL, model, ",".join(sources or []))
+    return rows[0]["n"] if rows else 0
+
+
+def fetch_foods_needing_embedding(
+    model: str, sources: Optional[List[str]] = None, *, limit: int = 256
+) -> List[Dict[str, Any]]:
+    return get_client().query_raw(_FETCH_FOODS_SQL, model, ",".join(sources or []), limit)
+
+
+def count_composites_needing_embedding(model: str) -> int:
+    rows = get_client().query_raw(_COUNT_COMPOSITES_SQL, model)
+    return rows[0]["n"] if rows else 0
+
+
+def fetch_composites_needing_embedding(model: str, *, limit: int = 256) -> List[Dict[str, Any]]:
+    return get_client().query_raw(_FETCH_COMPOSITES_SQL, model, limit)
+
+
+def _to_vector_literal(vector: List[float]) -> str:
+    """pgvector's text input form. `repr`-free formatting keeps this stable
+    across Python versions and avoids scientific notation, which the parser
+    accepts but which makes a stored vector needlessly hard to eyeball."""
+    return "[{}]".format(",".join("{:.8f}".format(value) for value in vector))
+
+
+def _set_embeddings(table: str, updates: List[Tuple[str, List[float]]], model: str) -> int:
+    """One transaction per call, not one round trip per row: a backfill batch
+    is hundreds of updates and a pooled remote connection makes the round
+    trip, not the update, the cost. Returns the number of rows written."""
+    if not updates:
+        return 0
+    sql = _SET_EMBEDDING_SQL.format(table)
+    batcher = get_client().batch_()
+    for row_id, vector in updates:
+        batcher.execute_raw(sql, _to_vector_literal(vector), model, row_id)
+    batcher.commit()
+    return len(updates)
+
+
+def set_food_embeddings(updates: List[Tuple[str, List[float]]], model: str) -> int:
+    return _set_embeddings("Food", updates, model)
+
+
+def set_composite_embeddings(updates: List[Tuple[str, List[float]]], model: str) -> int:
+    return _set_embeddings("CompositeFood", updates, model)
+
+
+# HNSW rather than IVFFlat: it needs no training pass over existing data, so
+# it stays correct on an empty or half-backfilled column - which is exactly
+# the state Chunk 9a leaves the catalog in. Cosine ops to match the
+# similarity Chunk 9b scores with; a different operator class here would make
+# the index silently unusable for that query.
+_VECTOR_INDEXES = {
+    "Food_embedding_hnsw_idx": '"Food"',
+    "CompositeFood_embedding_hnsw_idx": '"CompositeFood"',
+}
+
+
+def ensure_vector_indexes() -> List[str]:
+    """Create the ANN indexes if absent (idempotent). Separate from `db push`
+    because Prisma has no Hnsw index type to declare - see the note in
+    schema.prisma - which also means a later `db push` can drop these as
+    drift. Re-running this is the fix. Returns the index names that exist
+    afterwards."""
+    client = get_client()
+    for index_name, table in _VECTOR_INDEXES.items():
+        client.execute_raw(
+            'CREATE INDEX IF NOT EXISTS "{}" ON {} USING hnsw (embedding vector_cosine_ops)'.format(
+                index_name, table
+            )
+        )
+    rows = client.query_raw(
+        "SELECT indexname FROM pg_indexes WHERE indexname = ANY(string_to_array($1, ','))",
+        ",".join(_VECTOR_INDEXES),
+    )
+    return [row["indexname"] for row in rows]
 
 
 # -- composite foods (Chunk 3, §7.6) -----------------------------------------

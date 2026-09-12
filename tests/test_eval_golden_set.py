@@ -36,6 +36,7 @@ from typing import Any, Dict, List
 from types import SimpleNamespace
 
 import pytest
+from django.test import override_settings
 
 import chatparser
 from assistant import services as assistant_services
@@ -168,6 +169,88 @@ def test_nutrition_mae_is_within_tolerance():
     mae = sum(errors) / len(errors)
     print("\ngolden-set nutrition MAE (kcal): {:.4f} over {} items".format(mae, len(errors)))
     assert mae <= 0.05
+
+
+# -- semantic-resolution invariance (§12.10 gate for Chunk 9b) ---------------
+#
+# §12.10 makes the eval set the gate for any change to resolution, and Chunk
+# 9b is one. What can be asserted here is narrower than what the chunk does,
+# and deliberately so: with no live embedding model, no case in this fixture
+# can demonstrate a *successful* semantic rescue. What these do assert is the
+# property that makes 9b safe to deploy - that turning the flag on cannot
+# change any answer the deterministic tiers already get right.
+
+
+def _run_whole_set():
+    return {case["id"]: _resolve(case["input"]) for case in _LOG_NEW_CASES}
+
+
+def _stub_semantic_arm(monkeypatch, neighbours=(), exc=None):
+    from assistant import repository as assistant_repository
+
+    monkeypatch.setattr(assistant_repository, "circuit_breaker_is_open", lambda cooldown: False)
+    monkeypatch.setattr(assistant_repository, "record_llm_call_success", lambda: None)
+    monkeypatch.setattr(assistant_repository, "record_llm_call_failure", lambda threshold: None)
+
+    def embed_text(text):
+        if exc is not None:
+            raise exc
+        return [0.1, 0.2]
+
+    monkeypatch.setattr(assistant_services, "embed_text", embed_text)
+    monkeypatch.setattr(
+        meals_repository, "search_foods_by_embedding", lambda vector, **kw: list(neighbours)
+    )
+    monkeypatch.setattr(
+        meals_repository, "search_composites_by_embedding", lambda vector, **kw: []
+    )
+
+
+def test_every_golden_case_is_unchanged_when_the_flag_is_on_but_the_provider_is_down(monkeypatch):
+    from llm import LLMCallError
+
+    baseline = _run_whole_set()  # flag off - tests/settings.py default
+
+    _stub_semantic_arm(monkeypatch, exc=LLMCallError("provider down"))
+    with override_settings(SEMANTIC_RESOLUTION_ENABLED=True):
+        degraded = _run_whole_set()
+
+    assert degraded == baseline
+
+
+def test_every_golden_case_is_unchanged_when_the_catalog_has_no_embeddings(monkeypatch):
+    # The state every deployment starts in: Chunk 9a ships the columns empty,
+    # so the ANN window comes back empty for every query.
+    baseline = _run_whole_set()
+
+    _stub_semantic_arm(monkeypatch, neighbours=[])
+    with override_settings(SEMANTIC_RESOLUTION_ENABLED=True):
+        unembedded = _run_whole_set()
+
+    assert unembedded == baseline
+
+
+def test_a_confidently_wrong_neighbour_cannot_displace_a_high_lexical_match(monkeypatch):
+    # The accuracy regression the chunk had to rule out: a semantic arm that
+    # returns something plausible-but-wrong at similarity 1.0 must not touch
+    # any case the trigram window already resolves HIGH.
+    baseline = _run_whole_set()
+    wrong = _food("wrong-food", "Completely Unrelated Food", 999, 0, 0, 0, 0)
+
+    _stub_semantic_arm(monkeypatch, neighbours=[(wrong, 1.0)])
+    with override_settings(SEMANTIC_RESOLUTION_ENABLED=True):
+        with_semantics = _run_whole_set()
+
+    high_confidence_cases = {
+        case_id: items
+        for case_id, items in baseline.items()
+        if all(item["resolution"] == "RESOLVED" for item in items) and items
+    }
+    # Guard against the assertion below passing vacuously if the fixture ever
+    # loses its fully-resolved cases.
+    assert len(high_confidence_cases) >= 10
+    for case_id, expected in high_confidence_cases.items():
+        assert with_semantics[case_id] == expected, "case {} changed".format(case_id)
 
 
 # -- edit-grammar extraction accuracy -----------------------------------------

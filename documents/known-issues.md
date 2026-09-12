@@ -13,8 +13,10 @@ conditions change · ⚪ blocked on infra/data this environment doesn't have.
 
 ## Cross-cutting
 
-- 🔴 **Nothing has ever run against a real Postgres database or a real OpenAI API call.** This
-  dev environment has no live DB and no working model budget. Every chunk's plan named specific
+- 🔴 **Nothing has ever *written* to a real Postgres database or made a real OpenAI API call.**
+  One exception, added in Chunk 9a: read-only probes (`pg_available_extensions`, `pg_extension`,
+  `version()`) were run against the configured Prisma Postgres to confirm pgvector availability.
+  No `prisma db push` has been run from here, and no write of any kind. Every chunk's plan named specific
   behaviors as "worth confirming by hand" once real infra exists — none of those manual checks
   have actually been performed. This is the single largest standing risk across the whole
   feature; treat every "verified" claim in the plan history as "verified against mocks," not
@@ -93,6 +95,59 @@ conditions change · ⚪ blocked on infra/data this environment doesn't have.
 - 🟡 `NORMALIZATION_VERSION`/`PARSER_VERSION`/`NUTRITION_ENGINE_VERSION`/`CatalogVersion` all
   require a human to remember to bump them after a relevant code or catalog change — nothing
   auto-detects the need for a bump.
+
+## Semantic resolution (Chunk 9a built the infrastructure; 9b reads it)
+
+- ⚪ **No embeddings exist yet.** Chunk 9a ships the columns, the provider wrapper and
+  `manage.py backfill_food_embeddings`, but the backfill has never been run — it costs real money
+  and needs a key this environment doesn't have. `SEMANTIC_RESOLUTION_ENABLED` is off, and Chunk
+  9b's resolution changes are meaningless until the catalog is actually embedded.
+- 🟡 **Open Food Facts is excluded from the backfill by default.** It is the largest source by
+  far and the least valuable to embed (`_SOURCE_PRIORITY` already ranks it last so plain text
+  lands on generic data). `--source open_food_facts` includes it. If branded-dish matching ever
+  becomes a goal (PRD §19 lists it as out of scope), this decision is the thing to revisit.
+- 🟡 **The HNSW indexes are not declared in `schema.prisma`.** Prisma's `@@index(type:)` supports
+  Hash/Gist/Gin/SpGist/Brin only — there is no Hnsw — so unlike `Food_name_trgm_idx` they are
+  created by `manage.py ensure_vector_index` in raw SQL, which means a later `prisma db push` can
+  see them as drift and drop them. Re-running the command is the fix; it is idempotent. Revisit
+  if/when the project adopts `prisma migrate`.
+- 🟡 **`EMBEDDING_DIMENSIONS` and the schema's `vector(1536)` are set independently** and cannot
+  read each other. `backfill_food_embeddings` compares them against `pg_attribute` before writing
+  anything, so a mismatch fails loudly rather than after thousands of paid embeddings — but the
+  duplication itself remains.
+- 🟡 **A semantic match can never auto-resolve.** `_semantic_band` caps the semantic arm at
+  MEDIUM (§12.6's "confirmable"), never HIGH, and a lexical MEDIUM is never displaced by a
+  semantic one. This is a deliberate ceiling, not a threshold to tune — revisit only with real
+  accuracy data, and only as a product decision about silent auto-resolution.
+- 🟡 **The "dal" / "Dal Chawal" property is enforced lexically, not by the floor.**
+  `_is_fragment_of` rejects a semantic composite match whose query is a strict word-subset of the
+  dish name. That keeps the property deterministic and testable without a real model, but it is a
+  blunt rule: a genuine dish whose common shorthand happens to be a strict subset of its own name
+  can only be reached by a curator adding it as an alias (which is the §7.6-sanctioned path, and
+  it correctly outranks the guard).
+- 🔴 **Every semantic similarity floor is uncalibrated** (food resolution, composite matching, and
+  Chunk 10's L3 cache). There is no production traffic in this environment to fit them against,
+  and §7.4's only guidance is "gate this behind a high threshold", which is not a number. Same
+  posture as the T1→T2 router and `T3_ESCALATION_CONFIDENCE_THRESHOLD` above.
+- 🟡 **`matchScore` is now band-source-dependent.** Chunk 9b returns the cosine similarity as the
+  score when the band came from the semantic arm, and the lexical score otherwise. The two are
+  different scales and no column distinguishes them, so any aggregate over `MealDraftItem
+  .matchScore` now mixes them. A nullable `matchSource` column (LEXICAL/SEMANTIC) would fix it and
+  would also make "how often does the semantic arm fire?" answerable — deliberately not added in
+  9b to keep it to one schema change (9a's), but it is the obvious next migration.
+- 🟡 **Query embeddings are not memoised.** One message naming three foods that all miss lexically
+  makes three embedding calls. Accepted because the semantic arm only runs when the lexical match
+  was *not* already HIGH, so the common path spends nothing — but a per-request memo (or Chunk
+  10's L3 cache) would remove the rest.
+- ⚪ **The golden set cannot demonstrate a successful semantic rescue.** With no live embedding
+  model, `tests/test_eval_golden_set.py` asserts only *invariance* — that turning the flag on
+  cannot change an answer the deterministic tiers already get right, whether the provider is down,
+  the catalog unembedded, or a confidently-wrong neighbour returned. The cases §12.6 cares about
+  most (misspellings, regional foods where several entries score closely) still have no passing
+  assertion behind them. Same scope boundary Chunk 8e drew for T2/T3.
+- 🟡 **The T-1 pre-classifier stays keyword-only.** §7's own diagram specifies "keyword +
+  embedding" there too, but `chatparser` is deliberately Django-free and cannot reach a provider
+  or the DB. Neither Chunk 9 nor 10 addresses it.
 
 ## Evaluation & CI
 

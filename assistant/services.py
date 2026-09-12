@@ -32,9 +32,10 @@ from common.exceptions import (
 )
 from chatparser.units import UNIT_WORDS
 from engine.rounding import round_int
-from llm import LLMCallError, LLMConfigurationError, call_large_model, call_small_model
+from llm import LLMCallError, LLMConfigurationError, call_large_model, call_small_model, embed_text
 from llm.prompts import SYSTEM_PROMPT
 from meals import repository as meals_repository
+from meals.embeddings import composite_embedding_text, food_embedding_text
 from meals import services as meals_services
 from meals.serializers import serialize_logged_meal
 from onboarding import repository as onboarding_repository
@@ -644,6 +645,51 @@ _SOURCE_PRIORITY = {"CALORYX_CURATED": 3, "INDB": 2, "USDA": 1, "OPEN_FOOD_FACTS
 _BAND_RANK = {"HIGH": 2, "MEDIUM": 1, "LOW": 0}
 
 
+def _query_embedding(query: str) -> Optional[List[float]]:
+    """Embed one query phrase, or return `None` if we shouldn't/can't.
+
+    Goes through the same cost circuit breaker `_call_llm` uses (§11, Chunk
+    8d) - this is the request-path embedding call the Chunk 9a plan deferred
+    to here, and the reason `llm/embeddings.py` deliberately holds no breaker
+    of its own: the policy belongs at the call site that can reach
+    `repository`. Every failure mode degrades to `None`, which puts the
+    caller back on exactly the trigram-only behaviour it had before this
+    chunk - a provider outage must cost accuracy, never availability (§11).
+
+    Not memoised across calls. One message with three weak phrases makes
+    three calls, which is accepted because `_resolve_food_by_name` only gets
+    here when the lexical match was *not* already HIGH - the common case
+    spends nothing. Caching query vectors is Chunk 10's L3, not this."""
+    cooldown = timedelta(seconds=settings.AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+    if repository.circuit_breaker_is_open(cooldown):
+        logger.warning("embedding skipped, circuit breaker open")
+        return None
+    try:
+        vector = embed_text(food_embedding_text(query))
+    except LLMConfigurationError as exc:
+        logger.error("embedding skipped, provider not configured: %s", exc)
+        return None
+    except LLMCallError as exc:
+        logger.warning("embedding call failed: %s", exc)
+        repository.record_llm_call_failure(settings.AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+        return None
+    repository.record_llm_call_success()
+    return vector
+
+
+def _semantic_band(similarity: float) -> str:
+    """A semantically-matched food is **never** auto-resolved silently.
+
+    §12.6 gives HIGH "auto-resolve silently" and MEDIUM "resolve to the top
+    candidate but show it as confirmable". A match found by meaning rather
+    than by name is exactly the case the user should get to see and correct,
+    so the best band this can return is MEDIUM - the ceiling is the point,
+    not a tuning artifact. Below the floor it stays LOW, i.e. an unresolved
+    row plus a `FoodMissQueue` entry, which §7.4 calls the better of the two
+    errors ("a wrong semantic hit is worse than a cache miss")."""
+    return "MEDIUM" if similarity >= settings.SEMANTIC_MATCH_FLOOR else "LOW"
+
+
 def _resolve_food_by_name(query: str) -> Tuple[Optional[Any], float, str]:
     """Best-matching catalog food for free text, with its score and band
     (§12.6). Postgres trigram search narrows the whole catalog to a candidate
@@ -654,10 +700,26 @@ def _resolve_food_by_name(query: str) -> Tuple[Optional[Any], float, str]:
     egg" and "Egg, whole, raw" alike - so within the best band the pick is
     by `chatparser.match_tie_breaks` (the query is the name's head, every
     query word present, fewest extra words), with raw score, source priority
-    and the shorter name as the final deterministic tie-breaks."""
+    and the shorter name as the final deterministic tie-breaks.
+
+    Chunk 9b adds §7.2's other half ("lexical (trigram) + semantic
+    (embedding) similarity"), behind `SEMANTIC_RESOLUTION_ENABLED`. Three
+    rules keep it from disturbing anything that already works:
+
+    1. **`score_food_match` is not touched.** Its output feeds
+       `band_for_score`, whose bands drive §12.6's whole behaviour contract,
+       and those thresholds are calibrated against a lexical score. Blending
+       a cosine similarity into that number would silently shift the medium
+       band - auto-resolving matches that today are correctly surfaced as
+       confirmable - with no test that would catch it. The semantic
+       similarity is banded separately, by `_semantic_band`.
+    2. **The semantic arm can only rescue a LOW.** A lexical HIGH returns
+       before any vector work happens (so the common case spends nothing),
+       and a lexical MEDIUM is never displaced by a semantic MEDIUM.
+    3. **A semantic match never reaches HIGH** - see `_semantic_band`.
+
+    The returned score is whichever number produced the returned band."""
     candidates = meals_repository.search_foods(query, limit=_RESOLVE_CANDIDATES)
-    if not candidates:
-        return None, 0.0, "LOW"
 
     def rank(pair: Tuple[Any, float]) -> Tuple[int, int, bool, float, int, int, bool, int]:
         food, score = pair
@@ -675,9 +737,52 @@ def _resolve_food_by_name(query: str) -> Tuple[Optional[Any], float, str]:
             -len(food.name),
         )
 
-    scored = [(food, chatparser.score_food_match(query, food.name)) for food in candidates]
-    best_food, best_score = max(scored, key=rank)
-    return best_food, best_score, chatparser.band_for_score(best_score)
+    if candidates:
+        scored = [(food, chatparser.score_food_match(query, food.name)) for food in candidates]
+        best_food, best_score = max(scored, key=rank)
+        best_band = chatparser.band_for_score(best_score)
+    else:
+        best_food, best_score, best_band = None, 0.0, "LOW"
+
+    if not settings.SEMANTIC_RESOLUTION_ENABLED or best_band == "HIGH":
+        # A HIGH lexical match is already §12.6's "auto-resolve silently" -
+        # there is nothing a vector query could add to it, and this is the
+        # common case, so it must not cost an embedding call. Everything
+        # below this line is unreachable with the flag off, which is what
+        # makes the off-state provably identical to pre-Chunk-9b behaviour.
+        return best_food, best_score, best_band
+
+    vector = _query_embedding(query)
+    if vector is None:
+        return best_food, best_score, best_band
+
+    neighbours = meals_repository.search_foods_by_embedding(
+        vector, limit=settings.SEMANTIC_CANDIDATE_LIMIT
+    )
+    if not neighbours:
+        return best_food, best_score, best_band
+
+    semantic_food, similarity = neighbours[0]
+    semantic_band = _semantic_band(similarity)
+    if _BAND_RANK[semantic_band] <= _BAND_RANK[best_band]:
+        # The lexical answer is at least as good. Crucially this covers the
+        # MEDIUM-vs-MEDIUM case: a lexical MEDIUM is never displaced by a
+        # semantic one, so the semantic arm can only ever *rescue* a LOW, not
+        # second-guess a match the trigram window already made.
+        return best_food, best_score, best_band
+
+    logger.info(
+        "semantic food match query=%s food=%s similarity=%.3f lexical_band=%s",
+        query,
+        semantic_food.name,
+        similarity,
+        best_band,
+    )
+    # `matchScore` now carries whichever score produced the band - the cosine
+    # similarity here, the lexical score everywhere else. The two are
+    # different scales and there is no column to tell them apart yet; see
+    # documents/known-issues.md.
+    return semantic_food, similarity, semantic_band
 
 
 def _unresolved_item(phrase: "chatparser.ParsedItemPhrase") -> Dict[str, Any]:
@@ -691,12 +796,71 @@ def _resolve_composite_by_name(query: str) -> Optional[Any]:
     genuinely part of a composite's name ("dal" in "Dal Chawal") scores a
     perfect partial-ratio match, which would wrongly expand a plain mention
     of the standalone food into the composite. A curator adds real shorthand
-    ("biryani") as an alias instead of the system guessing from fragments."""
+    ("biryani") as an alias instead of the system guessing from fragments.
+
+    Chunk 9b adds a semantic fallback *after* the exact pass (§7.6 asks for
+    "trigram + embedding, same machinery as food resolution"). The argument
+    above is specifically about trigram - a fragment scoring a perfect
+    partial ratio - so it survives as `_is_fragment_of`, a deterministic
+    guard, rather than being entrusted to a similarity threshold."""
     normalized_query = query.strip().lower()
     for composite in meals_repository.get_composite_foods():
         names = {composite.name.strip().lower()} | {a.strip().lower() for a in composite.aliases}
         if normalized_query in names:
             return composite
+
+    if not settings.SEMANTIC_RESOLUTION_ENABLED:
+        return None
+    return _resolve_composite_semantically(query)
+
+
+def _is_fragment_of(query: str, composite: Any) -> bool:
+    """Whether `query` is just a proper piece of the dish's name.
+
+    This is the docstring above's "dal" / "Dal Chawal" concern, kept as a
+    deterministic rule rather than left to a similarity threshold. "dal" is a
+    strict subset of {"dal", "chawal"} and must stay the standalone food;
+    "murgh biryani" is not a subset of {"chicken", "biryani"} and is a real
+    alternative name for the dish, so it passes. An alias match never reaches
+    here - that is the exact path above, and a curator adding "dal" as an
+    alias of a dish is a deliberate statement that outranks this guard."""
+    query_words = {w for w in query.strip().lower().split() if w}
+    name_words = {w for w in composite.name.strip().lower().split() if w}
+    return bool(query_words) and query_words < name_words
+
+
+def _resolve_composite_semantically(query: str) -> Optional[Any]:
+    """ANN over composite embeddings, at a floor of its own.
+
+    Held to `SEMANTIC_COMPOSITE_FLOOR` (higher than the per-food floor) and
+    guarded by `_is_fragment_of`, because the failure mode here is worse than
+    a wrong food: a wrong dish silently expands into several component rows
+    the user never named, where a wrong food is one visible row they can
+    fix."""
+    vector = _query_embedding(query)
+    if vector is None:
+        return None
+    neighbours = meals_repository.search_composites_by_embedding(
+        vector, limit=settings.SEMANTIC_COMPOSITE_CANDIDATE_LIMIT
+    )
+    for composite, similarity in neighbours:
+        if similarity < settings.SEMANTIC_COMPOSITE_FLOOR:
+            break  # sorted descending - nothing further can clear the floor
+        if _is_fragment_of(query, composite):
+            logger.info(
+                "semantic composite rejected as a name fragment query=%s dish=%s similarity=%.3f",
+                query,
+                composite.name,
+                similarity,
+            )
+            continue
+        logger.info(
+            "semantic composite match query=%s dish=%s similarity=%.3f",
+            query,
+            composite.name,
+            similarity,
+        )
+        return composite
     return None
 
 

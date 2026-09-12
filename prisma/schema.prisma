@@ -7,13 +7,15 @@ generator client {
   recursive_type_depth = 5
   // pg_trgm backs Food's name search index - declared here rather than in
   // raw SQL so `prisma db push` doesn't see the index as drift and drop it.
+  // vector (pgvector) backs the semantic half of food resolution (§7.2,
+  // §12.6) - Chunk 9a creates the columns; nothing reads them until 9b.
   previewFeatures      = ["postgresqlExtensions"]
 }
 
 datasource db {
   provider   = "postgresql"
   url        = env("DATABASE_URL")
-  extensions = [pg_trgm]
+  extensions = [pg_trgm, vector]
 }
 
 enum SexAtBirth {
@@ -279,6 +281,24 @@ model Food {
   defaultServingGrams Float?
   category            FoodCategory?
 
+  // Semantic half of §7.2's match score ("lexical (trigram) + semantic
+  // (embedding) similarity") and of §7.6's composite matching. Nullable, and
+  // a null is a real state - "not embedded yet", never a zero vector, which
+  // would sit at a fixed cosine distance from every query and match
+  // arbitrarily. Resolution falls back to trigram-only for a null, the same
+  // posture `defaultServingGrams`/`category` take in the §5.1.1a ladder.
+  //
+  // prisma-client-py has no vector type, so this column is invisible to the
+  // generated client: every read and write goes through `query_raw`/
+  // `execute_raw` in meals.repository, the pattern `_SEARCH_SQL` already set.
+  // `db push` still creates and keeps the column.
+  embedding Unsupported("vector(1536)")?
+  // Which model produced `embedding`, so a model swap is detectable per-row
+  // and `backfill_food_embeddings` can re-embed only what's stale instead of
+  // truncating the column and losing every vector at once.
+  embeddingModel String?
+  embeddedAt     DateTime?
+
   servingUnits             FoodServingUnit[]
   loggedMealItems          LoggedMealItem[]
   mealDraftItems           MealDraftItem[]
@@ -295,6 +315,11 @@ model Food {
   // Trigram candidate retrieval for free-text search (meals.repository
   // .search_foods) - serves both `ILIKE '%q%'` and `q <% name`.
   @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "Food_name_trgm_idx")
+  // NOTE: the pgvector ANN index is NOT declared here. Prisma's `type:`
+  // supports Hash/Gist/Gin/SpGist/Brin - there is no Hnsw - so it has to be
+  // raw SQL: `manage.py ensure_vector_index`. Unlike the trigram index
+  // above, that means `prisma db push` can see it as drift and drop it;
+  // re-run the command after a push (it is idempotent).
 }
 
 /// Ladder step 4's fallback bucket (§5.1.1a) - a coarse default for a food with
@@ -815,6 +840,13 @@ model CompositeFood {
   // Components are defined against ONE serving of this as-served size.
   servingGrams Float
   servingLabel String // "1 plate", "1 katori"
+
+  // Same machinery as Food.embedding above (§7.6: composite matching by
+  // "trigram + embedding, same machinery as food resolution"). Embedded from
+  // name + aliases, since a curator's shorthand is exactly what a user types.
+  embedding      Unsupported("vector(1536)")?
+  embeddingModel String?
+  embeddedAt     DateTime?
 
   components CompositeFoodComponent[]
   isCurated  Boolean @default(false)
